@@ -35,6 +35,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback  {
 
     private Rect blackRect;
     private Paint blackPaint;
+    private Paint debugPaint;
 
     boolean gameOver;
 
@@ -77,6 +78,10 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback  {
 
             blackPaint = new Paint();
             blackPaint.setColor(Color.BLACK);
+
+            debugPaint = new Paint();
+            debugPaint.setColor(Color.WHITE);
+            debugPaint.setTextSize(50);
 
             blackRect = new Rect(0,TOP_BORDER+boardHeight,canvasWidth,canvasHeight);
         }
@@ -135,6 +140,9 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback  {
                 a.draw(canvas);
             });
         }
+
+        canvas.drawText("AVG UPS "+gameLoop.getAverageUPS(), 50, 1800, debugPaint);
+        canvas.drawText("AVG FPS "+gameLoop.getAverageFPS(), 50, 1850, debugPaint);
 
         // buttons
 
