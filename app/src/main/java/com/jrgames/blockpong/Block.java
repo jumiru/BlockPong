@@ -13,6 +13,25 @@ public class Block {
     private int x;
     private int y;
 
+    public float getHitCornerX() {
+        return hitCornerX;
+    }
+
+    public float getHitCornerY() {
+        return hitCornerY;
+    }
+
+    public void setHitCornerX(float hitCornerX) {
+        this.hitCornerX = hitCornerX;
+    }
+
+    public void setHitCornerY(float hitCornerY) {
+        this.hitCornerY = hitCornerY;
+    }
+
+    private float hitCornerX;
+    private float hitCornerY;
+
     public int getX() {
         return x;
     }
