@@ -10,6 +10,7 @@ import java.util.Random;
 
 public class GameBoard {
 
+    private final float dirLineLength;
     private Ball ballAfterMoving;
     private Ball ballBeforeMoving;
     private String freezeReason = "";
@@ -233,11 +234,12 @@ public class GameBoard {
         this.offsetX = offsetX;
         this.offsetY = offsetY;
         maxNumBalls = 100;
-        normSpeed = 23;
-        numInitBalls = 1;
+        normSpeed = 25;
+        numInitBalls = 20;
         xDim = 11; //11
         yDim = 11; //11
         ballRadius = 23; // 20
+        dirLineLength = 1.3f*width;
         debugSupport = true;
 
         radiusSquare = ballRadius * ballRadius;
@@ -381,7 +383,7 @@ public class GameBoard {
         }
 
         if (dirLineActive || debugSupport) {
-            c.drawLine(newFirePosX,firePosY,dirLineX,dirLineY,dirLinePaint);
+            drawDirLine(c);
         }
 
 
@@ -433,6 +435,51 @@ public class GameBoard {
                 cross.draw(c);
             }
         }
+    }
+
+    private void drawDirLine(Canvas c) {
+        float x0 = newFirePosX;
+        float y0 = firePosY;
+        float x1 = dirLineX;
+        float y1 = dirLineY;
+
+        float lenOfSelection = (float)Math.sqrt((x1-x0)*(x1-x0) + (y1-y0)*(y1-y0));
+
+        float vx = (x1-x0)/lenOfSelection;
+        float vy = (y1-y0)/lenOfSelection;
+
+        x1 = x0+vx*dirLineLength;
+        y1 = y0+vy*dirLineLength;
+
+        float leftMirrorLine = offsetX+ballRadius;
+        float rightMirrorLine = offsetX+width-ballRadius;
+
+        if (x1 < leftMirrorLine) {
+            float y2 = y1;
+            float xDistToBorder = x0-leftMirrorLine;
+            float entireX = x0-x1;
+            float xDistBehindBorder = entireX-xDistToBorder;
+            float yDistToIntersection = y0+Math.signum(vx)*vy/vx*xDistToBorder;
+            x1 = leftMirrorLine;
+            y1 = yDistToIntersection;
+            float x2 = leftMirrorLine+xDistBehindBorder;
+
+            c.drawLine(x1,y1,x2,y2,dirLinePaint);
+
+        } else if (x1 > rightMirrorLine) {
+            float y2 = y1;
+            float xDistToBorder = rightMirrorLine-x0;
+            float entireX = x1-x0;
+            float xDistBehindBorder = entireX-xDistToBorder;
+            float yDistToIntersection = y0+Math.signum(vx)*vy/vx*xDistToBorder;
+            x1 = rightMirrorLine;
+            y1 = yDistToIntersection;
+            float x2 = rightMirrorLine-xDistBehindBorder;
+
+            c.drawLine(x1,y1,x2,y2,dirLinePaint);
+        }
+
+        c.drawLine(x0,y0,x1,y1,dirLinePaint);
     }
 
     void update() {
