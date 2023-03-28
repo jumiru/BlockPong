@@ -15,7 +15,6 @@ public class Ball {
     private Paint p;
 
     private int ballIndex;
-    private boolean postpone2ndMirroring;
     private boolean mhDataStored;
     private float mhPrevX;
     private float mhPrevY;
@@ -30,6 +29,26 @@ public class Ball {
 
     public Ball() {
 
+    }
+
+    public Ball(Ball b) {
+        this.x = b.x;
+        this.y = b.y;
+        this.radius = b.radius;
+        this.dx = b.dx;
+        this.dy = b.dy;
+        this.p = b.p;
+        this.ballIndex = b.ballIndex;
+        this.mhDataStored = b.mhDataStored;
+        this.mhPrevX = b.mhPrevX;
+        this.mhPrevY = b.mhPrevY;
+        this.mhHorizontalReflectionLine = b.mhHorizontalReflectionLine;
+        this.mhVerticalReflectionLine = b.mhVerticalReflectionLine;
+        this.mvDataStored = b.mvDataStored;
+        this.mvPrevX = b.mvPrevX;
+        this.mvPrevY = b.mvPrevY;
+        this.mvVerticalReflectionLine = b.mvVerticalReflectionLine;
+        this.mvHorizontalReflectionLine = b.mvHorizontalReflectionLine;
     }
 
     public Ball( float r, float x, float y, int ballIndex) {
@@ -120,30 +139,25 @@ public class Ball {
         mhVerticalReflectionLine = verticalReflectionLine;
     }
 
-    public void mirrorHorizontallyIntern( float prevX, float prevY, float horizontalReflectionLine, float verticalReflectionLine) {
+    public boolean mirrorHorizontallyIntern( float prevX, float prevY, float horizontalReflectionLine, float verticalReflectionLine) {
 
-        float yDistToHMirror = Math.abs(prevY - horizontalReflectionLine);
-        float xDistToVMirror = Math.abs(prevX - verticalReflectionLine);
-        float xDistToHMirror = Math.abs(yDistToHMirror*dx/dy);
-        float yDistToVMirror = Math.abs(xDistToVMirror*dy/dx);
-        if ( verticalReflectionLine!=Float.POSITIVE_INFINITY && xDistToVMirror < xDistToHMirror) {
-            postpone2ndMirroring = true;
-            return;
+        float yDistToHMirror = horizontalReflectionLine - prevY;
+        float xDistToVMirror = verticalReflectionLine - prevX;
+        float xDistToHMirror = yDistToHMirror*dx/dy;
+        float yDistToVMirror = xDistToVMirror*dy/dx;
+        if ( verticalReflectionLine!=Float.POSITIVE_INFINITY && Math.abs(xDistToVMirror) < Math.abs(xDistToHMirror)) {
+            return false;
         }
-        postpone2ndMirroring = false;
 
-        float distAfterHMirror = Math.abs(dy)-yDistToHMirror;
+        float distAfterHMirror = dy-yDistToHMirror;
 
         // intersection point with vertical mirror line
-        float nextX = prevX+Math.signum(dx)*xDistToHMirror;
-        float nextY = prevY+Math.signum(dy)*yDistToHMirror;
+        float nextX = prevX+xDistToHMirror;
+        float nextY = prevY+yDistToHMirror;
 
         dy = -dy;
-        y = horizontalReflectionLine + Math.signum(dy)*distAfterHMirror;
-
-        if (postpone2ndMirroring) {
-            mirrorVerticallyIntern(nextX, nextY, verticalReflectionLine, horizontalReflectionLine);
-        }
+        y = horizontalReflectionLine - distAfterHMirror;
+        return true;
     }
 
     public void mirrorVertically( float prevX, float prevY, float verticalReflectionLine, float horizontalReflectionLine) {
@@ -155,50 +169,52 @@ public class Ball {
     }
 
 
-    public void mirrorVerticallyIntern( float prevX, float prevY, float verticalReflectionLine, float horizontalReflectionLine) {
-        float xDistToVMirror = Math.abs(verticalReflectionLine-prevX);
-        float yDistToHMirror = Math.abs(prevY - horizontalReflectionLine);
-        float yDistToVMirror = Math.abs(xDistToVMirror*dy/dx);
-        float xDistToHMirror = Math.abs(yDistToHMirror*dx/dy);
+    public boolean mirrorVerticallyIntern( float prevX, float prevY, float verticalReflectionLine, float horizontalReflectionLine) {
+        float xDistToVMirror = verticalReflectionLine-prevX;
+        float yDistToHMirror = horizontalReflectionLine-prevY;
+        float yDistToVMirror = xDistToVMirror*dy/dx;
+        float xDistToHMirror = yDistToHMirror*dx/dy;
 
-        if ( horizontalReflectionLine!=Float.POSITIVE_INFINITY && xDistToVMirror < xDistToHMirror) {
-            postpone2ndMirroring = true;
-            return;
+        if ( horizontalReflectionLine!=Float.POSITIVE_INFINITY && Math.abs(xDistToHMirror) < Math.abs(xDistToVMirror)) {
+            return false;
         }
-        postpone2ndMirroring = false;
 
-        float distAfterVMirror = Math.abs(dx)-xDistToVMirror;
+        float distAfterVMirror = dx-xDistToVMirror;
 
         // intersection point with vertical mirror line
-        float nextX = prevX+Math.signum(dx)*xDistToVMirror;
-        float nextY = prevY+Math.signum(dy)*yDistToVMirror;
+        float nextX = prevX+xDistToHMirror;
+        float nextY = prevY+yDistToHMirror;
 
         dx = -dx;
-        x = verticalReflectionLine + Math.signum(dx)*distAfterVMirror;
-        if (postpone2ndMirroring) {
-            mirrorHorizontallyIntern(nextX, nextY, horizontalReflectionLine, verticalReflectionLine);
-        }
+        x = verticalReflectionLine - distAfterVMirror;
+        return true;
     }
 
     public void performMirroring() {
+        boolean vmp = false;
+        boolean hmp = false;
+
         if ( mvDataStored ) {
             if (!mhDataStored) {
                 mvHorizontalReflectionLine = Float.POSITIVE_INFINITY;
             }
-            mirrorVerticallyIntern( mvPrevX, mvPrevY, mvVerticalReflectionLine, mvHorizontalReflectionLine);
+            vmp = mirrorVerticallyIntern( mvPrevX, mvPrevY, mvVerticalReflectionLine, mvHorizontalReflectionLine);
         }
         if ( mhDataStored ) {
             if (!mvDataStored) {
                 mhVerticalReflectionLine = Float.POSITIVE_INFINITY;
             }
-            mirrorHorizontallyIntern( mhPrevX, mhPrevY, mhHorizontalReflectionLine, mhVerticalReflectionLine);
+            hmp = mirrorHorizontallyIntern( mhPrevX, mhPrevY, mhHorizontalReflectionLine, mhVerticalReflectionLine);
         }
-        postpone2ndMirroring = false;
-        mvDataStored = false;
-        mhDataStored = false;
+        if (vmp) mvDataStored = false;
+        if (hmp) mhDataStored = false;
     }
 
     public boolean scheduledMirroring() {
         return mvDataStored || mhDataStored;
+    }
+
+    public void resetMirrorings() {
+        mhDataStored = mvDataStored = false;
     }
 }

@@ -11,6 +11,7 @@ import java.util.Random;
 public class GameBoard {
 
     private final float dirLineLength;
+    private final Paint frozenBallPaint;
     private Ball ballAfterMoving;
     private Ball ballBeforeMoving;
     private String freezeReason = "";
@@ -18,6 +19,19 @@ public class GameBoard {
     private int updateCounter;
     private int updateCounterAtFreezeTime;
     private int freezeBall;
+    private float startPosXTouch;
+    private float startPosYTouch;
+    private boolean ballDropRunning;
+    private Ball frozenBall;
+    private float prevBallPosX;
+    private float prevBallPosY;
+    private float nextBallX;
+    private float nextBallY;
+    private boolean autoPlayMode;
+
+    public Block getBlock(int x, int y) {
+        return blocks[x][y];
+    }
 
 
     private class Cross {
@@ -145,19 +159,19 @@ public class GameBoard {
         }
 
         public boolean hitBlockOnTop() {
-            return (TL!=Content.NO_BLOCK  || T!=Content.NO_BLOCK || TR!=Content.NO_BLOCK);
+            return (TL!=Content.NO_BLOCK  || T!=Content.NO_BLOCK || TR!=Content.NO_BLOCK || C!=Content.NO_BLOCK);
         }
 
         public boolean hitBlockOnBottom() {
-            return (BL!=Content.NO_BLOCK || B!=Content.NO_BLOCK || BR!=Content.NO_BLOCK);
+            return (BL!=Content.NO_BLOCK || B!=Content.NO_BLOCK || BR!=Content.NO_BLOCK || C!=Content.NO_BLOCK);
         }
 
         public boolean hitBlockOnLeft() {
-            return (TL!=Content.NO_BLOCK || L!=Content.NO_BLOCK || BL!=Content.NO_BLOCK);
+            return (TL!=Content.NO_BLOCK || L!=Content.NO_BLOCK || BL!=Content.NO_BLOCK || C!=Content.NO_BLOCK);
         }
 
         public boolean hitBlockOnRight() {
-            return (TR!=Content.NO_BLOCK || R!=Content.NO_BLOCK || BR!=Content.NO_BLOCK);
+            return (TR!=Content.NO_BLOCK || R!=Content.NO_BLOCK || BR!=Content.NO_BLOCK || C!=Content.NO_BLOCK);
         }
 
 
@@ -234,14 +248,14 @@ public class GameBoard {
         this.offsetX = offsetX;
         this.offsetY = offsetY;
         maxNumBalls = 100;
-        normSpeed = 25;
-        numInitBalls = 20;
+        normSpeed = 50;
+        numInitBalls = 10;
         xDim = 11; //11
-        yDim = 11; //11
-        ballRadius = 23; // 20
+        yDim = 13; //11
+        ballRadius = 22; // 20
         dirLineLength = 1.3f*width;
         debugSupport = true;
-
+        autoPlayMode = true;
         radiusSquare = ballRadius * ballRadius;
 
         blockWidth = width / (float)xDim;
@@ -286,8 +300,11 @@ public class GameBoard {
         increment3 = (float)(Math.sin(6*rad)*ballRadius);
 
         rand = new Random();
-        blocks = new Block[xDim][yDim];
-        blocksCopy = new Block[xDim][yDim];
+        blocks = new Block4[xDim][yDim];
+        blocksCopy = new Block4[xDim][yDim];
+
+        frozenBallPaint = new Paint();
+        frozenBallPaint.setColor(Color.GREEN);
 
 
         initBoard();
@@ -314,7 +331,7 @@ public class GameBoard {
         if (game.getLevel() == -1 ) {
             for ( int y = 4; y < yDim; y++) {
                 for ( int x = 4; x < xDim-3; x++ ) {
-                    blocks[x][y] = new Block ( this, x,y, 42-2*(x+y));
+                    blocks[x][y] = new Block4 ( this, x,y, 42-2*(x+y));
                 }
             }
         } else {
@@ -327,7 +344,7 @@ public class GameBoard {
                 for ( int x = 0; x < xDim; x++ ) {
                     if (rand.nextInt(10) <= game.getLevel() )  {
                         int v = rand.nextInt(5*game.getLevel())+1;
-                        blocks[x][y] = new Block ( this, x,y, v);
+                        blocks[x][y] = new Block4 ( this, x,y, v);
                     }
                 }
             }
@@ -360,6 +377,7 @@ public class GameBoard {
         };
         endOfRollingPhase = true;
         newFirePosSet = false;
+        freezeBall = 0;
     }
 
 
@@ -412,22 +430,27 @@ public class GameBoard {
             for (int x = 0; x < xDim - 1; x++) {
                 c.drawLine(right(x), offsetY, right(x), height + offsetY, dirLinePaint);
             }
+            c.drawText("updateCycle: "+updateCounterAtFreezeTime, 50, 1200, debugTextPaint);
+            c.drawText("freeze ball: "+freezeBall, 50, 1250, debugTextPaint);
+            c.drawText("x1/y1 = " + roundedString(prevBallPosX, 1000) + " / " + roundedString(prevBallPosY, 1000), 50, 1300, debugTextPaint);
+            c.drawText("x2/y2 = " + roundedString(nextBallX, 1000) + " / " + roundedString(nextBallY, 1000), 50, 1350, debugTextPaint);
+            c.drawText("dx/dy = " + roundedString(balls[freezeBall].getDx(), 1000) + " / " + roundedString(balls[freezeBall].getDy(), 1000), 50, 1400, debugTextPaint);
+            if (frozenBall!=null) {
+                frozenBall.setPaint(frozenBallPaint);
+                frozenBall.draw(c);
+            }
 
-            c.drawText("x/y = " + roundedString(balls[0].getX(), 1000) + " / " + roundedString(balls[0].getY(), 1000), 50, 1200, debugTextPaint);
-            c.drawText("dx/dy = " + roundedString(balls[0].getDx(), 1000) + " / " + roundedString(balls[0].getDy(), 1000), 50, 1300, debugTextPaint);
 
-
-
-            float hy = horizontalReflectionLine(balls[0]);
-            float hx = verticalReflectionLine(balls[0]);
+            float hy = horizontalReflectionLine(balls[freezeBall]);
+            float hx = verticalReflectionLine(balls[freezeBall]);
 
             c.drawLine(offsetX, hy, offsetX + width, hy, dirLinePaint);
             c.drawLine(hx, offsetY, hx, offsetY + height, dirLinePaint);
 
-            debugRect.left = left(getMinXPos(balls[0]));
-            debugRect.top = top(getMinYPos(balls[0]));
-            debugRect.right = right(getMaxXPos(balls[0]));
-            debugRect.bottom = bottom(getMaxYPos(balls[0]));
+            debugRect.left = left(getMinXPos(balls[freezeBall]));
+            debugRect.top = top(getMinYPos(balls[freezeBall]));
+            debugRect.right = right(getMaxXPos(balls[freezeBall]));
+            debugRect.bottom = bottom(getMaxYPos(balls[freezeBall]));
             c.drawRect(debugRect, debugRectPaint);
 
 
@@ -484,6 +507,8 @@ public class GameBoard {
 
     void update() {
         if (freeze) return;
+        if (ballDropRunning()) return;
+
         updateCounter++;
 
         crosses.clear();
@@ -517,13 +542,13 @@ public class GameBoard {
                 int ballPrevXCell = getXPos(currBall);
                 int ballPrevYCell = getYPos(currBall);
 
-                float prevBallPosX = currBall.getX();
-                float prevBallPosY = currBall.getY();
+                prevBallPosX = currBall.getX();
+                prevBallPosY = currBall.getY();
 
                 currBall.update();
 
-                float nextBallX = currBall.getX();
-                float nextBallY = currBall.getY();
+                nextBallX = currBall.getX();
+                nextBallY = currBall.getY();
                 int ballNextXCell = getXPos(currBall);
                 int ballNextYCell = getYPos(currBall);
 
@@ -532,83 +557,40 @@ public class GameBoard {
                     System.out.println(updateCounter); // good location for debugger
                 }
 
-                boolean firstRound = true;
 
-                boolean updateRequired = true;
-                boolean collisionPerformed = false;
+                if (ballOnBlock(currBall)) {
+                    boolean firstRound = true;
+                    boolean updateRequired = true;
+                    boolean collisionPerformed = false;
 
+                    while (updateRequired) {
+                        // first round checks collision with border (not corner) for main direction (i.e. biggest dx/dy increment)
+                        // second round checks collision with border (not corner) for minor direction (i.e. smaller increment of dx/dy)
+                        updateRequired = false;
 
-                while (updateRequired) {
-                    updateRequired = false;
+                        boolean movingUp;
+                        boolean movingDown;
+                        boolean movingLeft;
+                        boolean movingRight;
 
-                    boolean movingUp;
-                    boolean movingDown;
-                    boolean movingLeft;
-                    boolean movingRight;
-
-                    if (firstRound) {
-                        movingUp = currBall.movingMainlyUpwards();
-                        movingDown = currBall.movingMainlyDownwards();
-                        movingLeft = currBall.movingMainlyLeft();
-                        movingRight = currBall.movingMainlyRight();
-                        if (currBall.scheduledMirroring()) {
-                            freeze("ball 0 has scheduled mirrorings", ballIndex);
-                            break;
-                        }
-                    } else {
-                        movingUp = currBall.movingUpwards() && !currBall.movingMainlyUpwards();
-                        movingDown = currBall.movingDownwards() && !currBall.movingMainlyDownwards();
-                        movingLeft = currBall.movingLeft() && !currBall.movingMainlyLeft();
-                        movingRight = currBall.movingRight() && !currBall.movingMainlyRight();
-                    }
-
-
-                    if (ballOnBlock(currBall)) {
                         if (firstRound) {
-                            boolean hitCornerOnBottomWhileMovingHorizontally = (ballNextXCell != ballPrevXCell) && (ballNextYCell == ballPrevYCell) && (prevBallPosY > horizontalReflectionLine) && (nextBallY > horizontalReflectionLine);
-                            boolean hitCornerOnTopWhileMovingHorizontally = (ballNextXCell != ballPrevXCell) && (ballNextYCell == ballPrevYCell) && (prevBallPosY < horizontalReflectionLine) && (nextBallY < horizontalReflectionLine);
-                            boolean hitCornerOnLeftWhileMovingVertically = (ballNextXCell == ballPrevXCell) && (ballNextYCell != ballPrevYCell) && (prevBallPosX < verticalReflectionLine) && (nextBallX < verticalReflectionLine);
-                            boolean hitCornerOnRightWhileMovingVertically = (ballNextXCell == ballPrevXCell) && (ballNextYCell != ballPrevYCell) && (prevBallPosX > verticalReflectionLine) && (nextBallX > verticalReflectionLine);
-
-                            if (hitCornerOnBottomWhileMovingHorizontally) {
-                                float cx = (ballPrevXCell < ballNextXCell) ? left(ballNextXCell) : right(ballNextXCell);
-                                float cy = bottom(ballNextYCell);
-                                hit(ballNextXCell, ballNextYCell + 1);
-                                //determine the position of the ball when hitting the cross point cx/cy
-                                ballCollisionWithCorner(currBall, cx, cy, prevBallPosX, prevBallPosY);
-                                collisionPerformed = true;
-                                continue;
-                            } else if (hitCornerOnTopWhileMovingHorizontally) {
-                                float cx = (ballPrevXCell < ballNextXCell) ? left(ballNextXCell) : right(ballNextXCell);
-                                float cy = top(ballNextYCell);
-                                hit(ballNextXCell, ballNextYCell - 1);
-                                //determine the position of the ball when hitting the cross point cx/cy
-                                ballCollisionWithCorner(currBall, cx, cy, prevBallPosX, prevBallPosY);
-                                collisionPerformed = true;
-                                continue;
-                            } else if (hitCornerOnLeftWhileMovingVertically) {
-                                float cx = left(ballNextXCell);
-                                float cy = (ballPrevYCell < ballNextYCell) ? top(ballNextYCell) : bottom(ballNextYCell);
-                                hit(ballNextXCell - 1, ballNextYCell);
-                                //determine the position of the ball when hitting the cross point cx/cy
-                                ballCollisionWithCorner(currBall, cx, cy, prevBallPosX, prevBallPosY);
-                                collisionPerformed = true;
-                                continue;
-                            } else if (hitCornerOnRightWhileMovingVertically) {
-                                float cx = right(ballNextXCell);
-                                float cy = (ballPrevYCell < ballNextYCell) ? top(ballNextYCell) : bottom(ballNextYCell);
-                                hit(ballNextXCell + 1, ballNextYCell);
-                                //determine the position of the ball when hitting the cross point cx/cy
-                                ballCollisionWithCorner(currBall, cx, cy, prevBallPosX, prevBallPosY);
-                                collisionPerformed = true;
-                                continue;
+                            movingUp = currBall.movingMainlyUpwards();
+                            movingDown = currBall.movingMainlyDownwards();
+                            movingLeft = currBall.movingMainlyLeft();
+                            movingRight = currBall.movingMainlyRight();
+                            if (currBall.scheduledMirroring()) {
+                                freeze("ball " + ballIndex + " has scheduled mirrorings", ballIndex);
+                                break;
                             }
+                        } else {
+                            movingUp = currBall.movingUpwards() && !currBall.movingMainlyUpwards();
+                            movingDown = currBall.movingDownwards() && !currBall.movingMainlyDownwards();
+                            movingLeft = currBall.movingLeft() && !currBall.movingMainlyLeft();
+                            movingRight = currBall.movingRight() && !currBall.movingMainlyRight();
                         }
 
-                        if (movingUp && bb.hitBlockOnTop()) {
-                            boolean currBallOnBlock = ballOnBlock(currBall);
-                            boolean ballCenterStillBeforeBlockBorder = (bb.C==Content.NO_BLOCK)
-                                    && (ballNextYCell == ballPrevYCell)
+                        if (movingUp && bb.hitBlockOnTop() && ballCrossedHorizontalReflectionLineUpwards(prevBallPosY, horizontalReflectionLine, nextBallY)) {
+                            boolean ballCenterStillBeforeBlockBorder = (ballNextYCell == ballPrevYCell)
                                     && (horizontalReflectionLine > nextBallY && nextBallY > top(ballNextYCell));
 
                             if (ballCenterStillBeforeBlockBorder) {
@@ -622,7 +604,7 @@ public class GameBoard {
                             int hitBlockY = bb.y;
                             int hitBlockX = hitBlockXOfCrossSection;
 
-                            if (cellType(hitBlockX, hitBlockY)!=Content.NO_BLOCK) {
+                            if (cellType(hitBlockX, hitBlockY) != Content.NO_BLOCK) {
                                 //hitting a block side, i.e. simple reflection is applied
                                 // case I: block on top of xPosCrossSection (xPCS)
                                 // block:     |XXXXXXXXXX|XXXXXXXXXX|      (the right block is optional)
@@ -639,35 +621,14 @@ public class GameBoard {
                                     }
                                 }
                                 currBall.mirrorHorizontally(prevBallPosX, prevBallPosY, horizontalReflectionLine, verticalReflectionLine);
-                            } else if (!currBall.scheduledMirroring()) {
-                                // hitting a block corner (intersection point of ball and horicontalReflectionLine lies next to a solid block
-                                // case I: block on top of xPosCrossSection (xPCS)
-                                // block:     XXXXXXXXXXXX
-                                //            XXXXXXXXXXXX
-                                //
-                                // HRL    -------------------+------------
-                                //                       xPCS
-                                //
-                                Block blk = getCornerHitBlock(prevBallPosX, prevBallPosY, nextBallX, nextBallY);
-                                if (blk != null ) {
-                                    hitBlockX = blk.getX();
-                                    hitBlockY = blk.getY();
-
-                                    if (cellOccupiedWithRealBlock(hitBlockX, hitBlockY)) {
-                                        hit(hitBlockX, hitBlockY);
-                                        //determine the position of the ball when hitting the cross point cx/cy
-                                        ballCollisionWithCorner(currBall, blk.getHitCornerX(), blk.getHitCornerY(), prevBallPosX, prevBallPosY);
-                                        collisionPerformed = true;
-                                    }
-                                }
+                            }
+                            if (ballCenterStillBeforeBlockBorder) {
+                                bb.shiftUp();
                             }
                         }
 
 
-
-
-
-                        if (movingDown && bb.hitBlockOnBottom()) {
+                        if (movingDown && bb.hitBlockOnBottom() && ballCrossedHorizontalReflectionLineDownwards(prevBallPosY, horizontalReflectionLine, nextBallY)) {
 
                             // it must be a corner hit if previous yPosition was already > horizontalReflectionLine, otherwise it would have been reflected in previous step already
                             //
@@ -676,7 +637,7 @@ public class GameBoard {
                             //                         |XXXXXXXXXXX
                             //                         |
 
-                            boolean ballCenterStillBeforeBlockBorder = (bb.C==Content.NO_BLOCK) && (ballNextYCell == ballPrevYCell)
+                            boolean ballCenterStillBeforeBlockBorder = (ballNextYCell == ballPrevYCell)
                                     && (horizontalReflectionLine < nextBallY && nextBallY < bottom(ballNextYCell));
 
                             if (ballCenterStillBeforeBlockBorder) {
@@ -689,7 +650,7 @@ public class GameBoard {
                             int hitBlockY = bb.y;
                             int hitBlockX = hitBlockXOfCrossSection;
 
-                            if (cellType(hitBlockX, hitBlockY)!=Content.NO_BLOCK) {
+                            if (cellType(hitBlockX, hitBlockY) != Content.NO_BLOCK) {
                                 if (bb.C != Content.HIT_BORDER) {
                                     hit(hitBlockX, hitBlockY);
                                     if (ballOverlapsWithLeftNeighbour(hitBlockX, hitBlockY, xPosCrossSection)) {
@@ -699,35 +660,16 @@ public class GameBoard {
                                     }
                                 }
                                 currBall.mirrorHorizontally(prevBallPosX, prevBallPosY, horizontalReflectionLine, verticalReflectionLine);
-                            } else if (!currBall.scheduledMirroring()) {
-                                Block blk = getCornerHitBlock(prevBallPosX, prevBallPosY, nextBallX, nextBallY);
-                                if (blk != null ) {
-                                    hitBlockX = blk.getX();
-                                    hitBlockY = blk.getY();
-                                    //                                float cx = right(hitBlockX);
-                                    //                                float cy = top(hitBlockY);
-                                    //                                if (ballTouchesBlockOnLeft(currBall) ||  currBall.movingLeft() && bottomRightCornerInRadius(currBall)) {
-                                    //                                    cx = left(hitBlockX);
-                                    //                                    hitBlockX--;
-                                    //                                } else {
-                                    //                                    hitBlockX++;
-                                    //                                }
-                                    if (cellOccupiedWithRealBlock(hitBlockX, hitBlockY)) {
-                                        hit(hitBlockX, hitBlockY);
-                                        //determine the position of the ball when hitting the cross point cx/cy
-                                        ballCollisionWithCorner(currBall, blk.getHitCornerX(), blk.getHitCornerY(), prevBallPosX, prevBallPosY);
-                                        collisionPerformed = true;
-                                    }
-                                }
+                            }
+                            if (ballCenterStillBeforeBlockBorder) {
+                                bb.shiftDown();
                             }
                         }
 
 
+                        if (movingLeft && bb.hitBlockOnLeft() && ballCrossedVerticalReflectionLineLeftwards(prevBallPosX, verticalReflectionLine, nextBallX)) {
 
-
-                        if (movingLeft && bb.hitBlockOnLeft()) {
-
-                            boolean ballCenterStillBeforeBlockBorder = (bb.C==Content.NO_BLOCK) && (ballNextXCell == ballPrevXCell)
+                            boolean ballCenterStillBeforeBlockBorder = (ballNextXCell == ballPrevXCell)
                                     && (verticalReflectionLine > nextBallX && nextBallX > left(ballNextXCell));
 
                             if (ballCenterStillBeforeBlockBorder) {
@@ -741,45 +683,26 @@ public class GameBoard {
                             int hitBlockY = hitBlockYOfCrossSection;
                             int hitBlockX = bb.x;
 
-                            if (cellType(hitBlockX, hitBlockY)!=Content.NO_BLOCK) {
+                            if (cellType(hitBlockX, hitBlockY) != Content.NO_BLOCK) {
                                 if (bb.C != Content.HIT_BORDER) {
                                     hit(hitBlockX, hitBlockY);
                                     if (ballOverlapsWithUpperNeighbour(hitBlockX, hitBlockY, yPosCrossSection)) {
-                                        hit(hitBlockX, hitBlockY-1);
+                                        hit(hitBlockX, hitBlockY - 1);
                                     } else if (ballOverlapsWithLowerNeighbour(hitBlockX, hitBlockY, yPosCrossSection)) {
-                                        hit(hitBlockX, hitBlockY+1);
+                                        hit(hitBlockX, hitBlockY + 1);
                                     }
                                 }
                                 currBall.mirrorVertically(prevBallPosX, prevBallPosY, verticalReflectionLine, horizontalReflectionLine);
-                            } else if (!currBall.scheduledMirroring()) {
-                                Block blk = getCornerHitBlock(prevBallPosX, prevBallPosY, nextBallX, nextBallY);
-                                if (blk != null ) {
-                                    hitBlockX = blk.getX();
-                                    hitBlockY = blk.getY();
-                                    //                                float cx = right(hitBlockX);
-                                    //                                float cy = bottom(hitBlockY);
-                                    //                                if (ballTouchesBlockOnTop(currBall) || currBall.movingUpwards() && topRightCornerInRadius(currBall)) {
-                                    //                                    cy = top(hitBlockY);
-                                    //                                    hitBlockY--;
-                                    //                                } else {
-                                    //                                    hitBlockY++;
-                                    //                                }
-                                    if (cellOccupiedWithRealBlock(hitBlockX, hitBlockY)) {
-                                        hit(hitBlockX, hitBlockY);
-                                        //determine the position of the ball when hitting the cross point cx/cy
-                                        ballCollisionWithCorner(currBall, blk.getHitCornerX(), blk.getHitCornerY(), prevBallPosX, prevBallPosY);
-                                        collisionPerformed = true;
-                                    }
-                                }
+                            }
+                            if (ballCenterStillBeforeBlockBorder) {
+                                bb.shiftLeft();
                             }
                         }
 
 
+                        if (movingRight && bb.hitBlockOnRight() && ballCrossedVerticalReflectionLineRightwards(prevBallPosX, verticalReflectionLine, nextBallX)) {
 
-
-                        if (movingRight && bb.hitBlockOnRight()) {
-
-                            boolean ballCenterStillBeforeBlockBorder = (bb.C==Content.NO_BLOCK) && (ballNextXCell == ballPrevXCell)
+                            boolean ballCenterStillBeforeBlockBorder = (ballNextXCell == ballPrevXCell)
                                     && (verticalReflectionLine < nextBallX && nextBallX < right(ballNextXCell));
 
                             if (ballCenterStillBeforeBlockBorder) {
@@ -792,56 +715,53 @@ public class GameBoard {
                             int hitBlockY = hitBlockYOfCrossSection;
                             int hitBlockX = bb.x;
 
-                            if (cellType(hitBlockX, hitBlockY)!=Content.NO_BLOCK) {
+                            if (cellType(hitBlockX, hitBlockY) != Content.NO_BLOCK) {
                                 if (bb.C != Content.HIT_BORDER) {
                                     hit(hitBlockX, hitBlockY);
                                     if (ballOverlapsWithUpperNeighbour(hitBlockX, hitBlockY, yPosCrossSection)) {
-                                        hit(hitBlockX, hitBlockY-1);
+                                        hit(hitBlockX, hitBlockY - 1);
                                     } else if (ballOverlapsWithLowerNeighbour(hitBlockX, hitBlockY, yPosCrossSection)) {
-                                        hit(hitBlockX, hitBlockY+1);
+                                        hit(hitBlockX, hitBlockY + 1);
                                     }
                                 }
-                                currBall.mirrorVertically(prevBallPosX, prevBallPosY,verticalReflectionLine, horizontalReflectionLine);
-                            } else if (!currBall.scheduledMirroring()) {
-                                Block blk = getCornerHitBlock(prevBallPosX, prevBallPosY, nextBallX, nextBallY);
-                                if (blk != null ) {
-                                    hitBlockX = blk.getX();
-                                    hitBlockY = blk.getY();
-                                    //                                float cx = left(hitBlockX);
-                                    //                                float cy = bottom(hitBlockY);
-                                    //                                if (ballTouchesBlockOnTop(currBall) || currBall.movingUpwards()&&bottomRightCornerInRadius(currBall) ){ //topRightCornerInRadius(currBall)) {
-                                    //                                    cy = top(hitBlockY);
-                                    //                                    hitBlockY--;
-                                    //                                } else if (ballTouchesBlockOnBottom(currBall)) {
-                                    //                                    hitBlockY++;
-                                    //                                }
-                                    if (cellOccupiedWithRealBlock(hitBlockX, hitBlockY)) {
-                                        hit(hitBlockX, hitBlockY);
-                                        //determine the position of the ball when hitting the cross point cx/cy
-                                        ballCollisionWithCorner(currBall, blk.getHitCornerX(), blk.getHitCornerY(), prevBallPosX, prevBallPosY);
-                                        collisionPerformed = true;
-                                    }
-                                }
+                                currBall.mirrorVertically(prevBallPosX, prevBallPosY, verticalReflectionLine, horizontalReflectionLine);
+                            }
+                            if (ballCenterStillBeforeBlockBorder) {
+                                bb.shiftRight();
                             }
                         }
 
                         // last resort
-                        if (!collisionPerformed && firstRound) {
+                        if (firstRound) {
                             updateRequired = true;
+                            firstRound = false;
+                        } else if (currBall.scheduledMirroring()) {
+                            // do the horizontal and vertical reflections now
+                            currBall.performMirroring();
+                            nextBallX = currBall.getX();
+                            nextBallY = currBall.getY();
+
+                            currBall.resetMirrorings();
+                            updateRequired = true;
+                            firstRound = true;
                         }
                     }
 
-                    if (currBall.scheduledMirroring()) {
-                        // do the horizontal and vertical reflections now
-                        currBall.performMirroring();
-                        collisionPerformed = true;
+
+                    // check collision with corner
+                    Block cornerHitBlock = getCornerHitBlock(prevBallPosX, prevBallPosY, nextBallX, nextBallY);
+                    if (cornerHitBlock != null) {
+                        int hitBlockX = cornerHitBlock.getX();
+                        int hitBlockY = cornerHitBlock.getY();
+                        if (cellOccupiedWithRealBlock(hitBlockX, hitBlockY)) {
+                            hit(hitBlockX, hitBlockY);
+                            //determine the position of the ball when hitting the cross point cx/cy
+                            ballCollisionWithCorner(currBall, cornerHitBlock.getHitCornerX(), cornerHitBlock.getHitCornerY(), prevBallPosX, prevBallPosY);
+                        }
                     }
-                    verticalReflectionLine = verticalReflectionLine(currBall);
-                    horizontalReflectionLine = horizontalReflectionLine(currBall);
-                    nextBallX = currBall.getX();
-                    nextBallY = currBall.getY();
-                    firstRound = false;
                 }
+
+                // ball back on start line
                 if (currBall.getY() > firePosY) {
                     if (!newFirePosSet) {
                         newFirePosX = currBall.getX();
@@ -852,9 +772,10 @@ public class GameBoard {
                 }
                 ballAfterMoving.copy(currBall);
 
+                // perform some sanity checks
                 if (debugSupport && !currBall.isStill()) {
                     float d = distance(ballBeforeMoving, ballAfterMoving);
-                    if (d > 2 * normSpeed) {
+                    if (d > 1.1 * normSpeed) {
                         freeze("ball "+ballIndex+" has been moved too far", ballIndex);
                     }
                     else if (ballOnBlock(currBall)) {
@@ -877,6 +798,121 @@ public class GameBoard {
             endOfRollingPhase = true;
             actionAfterBallRolling();
         }
+    }
+
+    private boolean ballCrossedHorizontalReflectionLineUpwards(float prevY, float hLine, float nextY) {
+        return prevY>hLine && hLine>=nextY;
+    }
+    private boolean ballCrossedHorizontalReflectionLineDownwards(float prevY, float hLine, float nextY) {
+        return prevY<hLine && hLine<=nextY;
+    }
+    private boolean ballCrossedVerticalReflectionLineLeftwards(float prevX, float vLine, float nextX) {
+        return prevX>vLine && vLine>=nextX;
+    }
+    private boolean ballCrossedVerticalReflectionLineRightwards(float prevX, float vLine, float nextX) {
+        return prevX<vLine && vLine<=nextX;
+    }
+
+    private boolean ballDropRunning() {
+        if (ballDropRunning) {
+            if (ballRolling()) return true;
+            else {
+                ballDropRunning = false;
+                actionAfterBallRolling();
+            }
+        }
+        return false;
+    }
+
+    private Block getBorderHitBlock(float x1, float y1, float x2, float y2) {
+        int cx1 = getXBlock(x1);
+        int cy1 = getYBlock(y1);
+        int cx2 = getXBlock(x2);
+        int cy2 = getYBlock(y2);
+
+        int xFrom = Math.min(cx1,cx2);
+        int xTo   = Math.max(cx1, cx2);
+        int yFrom = Math.min(cy1,cy2);
+        int yTo   = Math.max(cy1,cy2);
+
+        // widen the search area
+        xFrom = Math.max(0,xFrom-1);
+        xTo   = Math.min(xTo+1, xDim-1);
+        yFrom = Math.max(0,yFrom-1);
+        yTo   = Math.min(yTo+1, yDim-1);
+
+        float min = Float.POSITIVE_INFINITY;
+        Block result = null;
+
+        for (int cx=xFrom; cx<=xTo; cx++ ) {
+            for (int cy = yFrom; cy <= yTo; cy++) {
+                if (cellOccupiedWithRealBlock(cx, cy)) {
+                    // intersection with left side of the block
+                    float ax = left(cx);
+                    float ay = bottom(cy);
+                    float bx = ax;
+                    float by = top(cy);
+
+                    float distToLeft = linesIntersect(x1,y1,x2,y2,ax,ay,bx,by);
+                    if ( distToLeft < min) {
+                        min = distToLeft;
+                        result = blocks[cx][cy];
+                        result.setHitBorder(Block.tEdge.left);
+                    }
+                    // intersection with top line
+                    ax = left(cx);
+                    ay = top(cy);
+                    bx = right(cx);
+                    by = ay;
+                    float distToTop = linesIntersect(x1,y1,x2,y2,ax,ay,bx,by);
+                    if ( distToTop < min) {
+                        min = distToTop;
+                        result = blocks[cx][cy];
+                        result.setHitBorder(Block.tEdge.top);
+                    }
+                    // intersection with right line
+                    ax = right(cx);
+                    ay = top(cy);
+                    bx = ax;
+                    by = bottom(cy);
+                    float distToRight = linesIntersect(x1,y1,x2,y2,ax,ay,bx,by);
+                    if ( distToRight < min) {
+                        min = distToRight;
+                        result = blocks[cx][cy];
+                        result.setHitBorder(Block.tEdge.right);
+                    }
+                    // intersection with bottom line
+                    ax = left(cx);
+                    ay = bottom(cy);
+                    bx = right(cx);
+                    by = ay;
+                    float distToBottom = linesIntersect(x1,y1,x2,y2,ax,ay,bx,by);
+                    if ( distToBottom < min) {
+                        min = distToBottom;
+                        result = blocks[cx][cy];
+                        result.setHitBorder(Block.tEdge.bottom);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    private float linesIntersect(float x1, float y1, float x2, float y2, float ax, float ay, float bx, float by ) {
+        float r1x = x2-x1;
+        float r1y = y2-y1;
+        float r2x = bx-ax;
+        float r2y = by-ay;
+
+        //(x1/y1) + v1*r1 = (ax/ay) + v2*r2
+
+        float v2 = (r2x*(ay-y1)+r2y*(x1-ax))/(r1y*r2x-r2y*r1x);
+        float v1 = (ax+v2*r2x-x1)/r1x;
+
+        if ((0<=v1 && v1<=1) && (0<=v2 && v2<=1)) {
+            return v1;
+        }
+        return Float.POSITIVE_INFINITY;
     }
 
     private Block getCornerHitBlock(float prevBallPosX, float prevBallPosY, float nextBallX, float nextBallY) {
@@ -905,22 +941,34 @@ public class GameBoard {
         for (int cx=xFrom; cx<=xTo; cx++ ) {
             for ( int cy = yFrom; cy<=yTo; cy++) {
                 if (cellOccupiedWithRealBlock(cx,cy)) {
-                    if ( cornerInTrajectory(left(cx) ,top(cy)   , prevBallPosX, prevBallPosY, nextBallX, nextBallY)) {
+
+                    int nbc = numBlocksAtCorner(left(cx), top(cy));
+                    boolean cit = cornerInTrajectory(left(cx), top(cy), prevBallPosX, prevBallPosY, nextBallX, nextBallY);
+                    if (nbc==1 && cit) {
                         blocks[cx][cy].setHitCornerX(left(cx));
                         blocks[cx][cy].setHitCornerY(top(cy));
                         return blocks[cx][cy];
                     }
-                    if ( cornerInTrajectory(right(cx),top(cy)   , prevBallPosX, prevBallPosY, nextBallX, nextBallY)) {
+
+                    nbc = numBlocksAtCorner(right(cx), top(cy));
+                    cit = cornerInTrajectory(right(cx), top(cy), prevBallPosX, prevBallPosY, nextBallX, nextBallY);
+                    if (nbc==1 && cit) {
                         blocks[cx][cy].setHitCornerX(right(cx));
                         blocks[cx][cy].setHitCornerY(top(cy));
                         return blocks[cx][cy];
                     }
-                    if ( cornerInTrajectory(left(cx) ,bottom(cy), prevBallPosX, prevBallPosY, nextBallX, nextBallY)) {
+
+                    nbc = numBlocksAtCorner(left(cx), bottom(cy));
+                    cit = cornerInTrajectory(left(cx), bottom(cy), prevBallPosX, prevBallPosY, nextBallX, nextBallY);
+                    if (nbc==1 && cit) {
                         blocks[cx][cy].setHitCornerX(left(cx));
                         blocks[cx][cy].setHitCornerY(bottom(cy));
                         return blocks[cx][cy];
                     }
-                    if ( cornerInTrajectory(right(cx),bottom(cy), prevBallPosX, prevBallPosY, nextBallX, nextBallY)) {
+
+                    nbc = numBlocksAtCorner(right(cx), bottom(cy));
+                     cit = cornerInTrajectory(right(cx), bottom(cy), prevBallPosX, prevBallPosY, nextBallX, nextBallY);
+                    if (nbc==1 && cit) {
                         blocks[cx][cy].setHitCornerX(right(cx));
                         blocks[cx][cy].setHitCornerY(bottom(cy));
                         return blocks[cx][cy];
@@ -931,6 +979,25 @@ public class GameBoard {
         return null;
     }
 
+    private int numBlocksAtCorner(float cx, float cy) {
+        float d = blockWidth/10.0f;
+        int x1 = getXBlock(cx-d);
+        int y1 = getYBlock(cy-d);
+        int x2 = getXBlock(cx+d);
+        int y2 = getYBlock(cy-d);
+        int x3 = getXBlock(cx+d);
+        int y3 = getYBlock(cy+d);
+        int x4 = getXBlock(cx-d);
+        int y4 = getYBlock(cy+d);
+
+        return (cellOccupiedWithRealBlock(x1,y1)?1:0)+
+                (cellOccupiedWithRealBlock(x2,y2)?1:0)+
+                (cellOccupiedWithRealBlock(x3,y3)?1:0)+
+                (cellOccupiedWithRealBlock(x4,y4)?1:0);
+
+    }
+
+
     private boolean cornerInTrajectory(float qx, float qy, float x1, float y1, float x2, float y2) {
         if ( distanceSquare(qx,qy,x1,y1) <= radiusSquare) return true;
         if ( distanceSquare(qx,qy,x2,y2) <= radiusSquare) return true;
@@ -938,19 +1005,22 @@ public class GameBoard {
         float ry = y2 - y1;
         float nx = ry;
         float ny = -rx;
-        float w = (rx*(qy-y1) - ry*(qx-x1))/(nx*ry-ny*rx);
+        float w = -(rx*(qy-y1) - ry*(qx-x1))/(nx*ry-ny*rx);
+        float v = (qx-x1-w*nx)/rx;
 
         //alternative computation
-        //        float a1 = x2-x1;
-        //        float a2 = y2-y1;
-        //        float b1 = y2-y1;
-        //        float b2 = x1-x2;
-        //        float c1 = x1-qx;
-        //        float c2 = y1-qy;
+//        float w2 = (rx*(y1-qy) + ry*(qx-x1))/(nx*ry-ny*rx);
+//        float a1 = x2-x1;
+//        float a2 = y2-y1;
+//        float b1 = y2-y1;
+//        float b2 = x1-x2;
+//        float c1 = x1-qx;
+//        float c2 = y1-qy;
+//        float w3 = (c1*a2-c2*a1)/(b1*a2-b2*a1);
 
-        //float w2 = (c1*a2-c2*a1)/(b1*a2-b2*a1);
+        float dSquare = (w*nx)*(w*nx)+(w*ny)*(w*ny);
 
-        return distanceSquare(w*ny, w*ny, qx, qy) <= radiusSquare;
+        return (dSquare <= radiusSquare) && (0<=v && v <=1);
     }
 
     private boolean bottomLeftCornerInRadius(Ball currBall) {
@@ -1015,7 +1085,11 @@ return false;
         freeze = true;
         freezeReason = s;
         freezeBall = ball;
+
+        frozenBall = new Ball(balls[ball]);
+
         balls[ball].setPaint(dirLinePaint);
+        balls[ball].resetMirrorings();
         for ( int b = 0; b < numBalls; b++) {
             balls[b].setSpeed(0,0);
         }
@@ -1024,6 +1098,26 @@ return false;
         reusePreviousFireSpeed = true;
 
         System.out.println("updateCounter @freeze time="+updateCounter);
+        System.out.println("x1="+ prevBallPosX);
+        System.out.println("y1="+ prevBallPosY);
+        System.out.println("x2="+ nextBallX);
+        System.out.println("y2="+ nextBallY);
+        System.out.println("radius="+ ballRadius);
+        System.out.println("hl="+ horizontalReflectionLine(ballBeforeMoving));
+        System.out.println("vl="+ verticalReflectionLine(ballBeforeMoving));
+        Block block = getBorderHitBlock(prevBallPosX, prevBallPosY, nextBallX, nextBallY);
+        if (block == null) {
+            block = getCornerHitBlock(prevBallPosX, prevBallPosY, nextBallX, nextBallY);
+        }
+
+        if (block != null) {
+            int hitBlockX = block.getX();
+            int hitBlockY = block.getY();
+            System.out.println("left=" + left(hitBlockX));
+            System.out.println("top=" + top(hitBlockY));
+            System.out.println("right=" + right(hitBlockX));
+            System.out.println("bottom=" + bottom(hitBlockY));
+        }
         updateCounter = 0;
     }
 
@@ -1085,8 +1179,6 @@ return false;
         // the direction (speed) vector moved to the cross point
         float px = cx-dx;
         float py = cy-dy;
-        drawCross("startOfspeed:",px, py);
-
 
         // determine the intersection of the end of the direction vector to the normal line
         float v = (ny*py - ny*cy -nx*cx + nx*px)/(nx*nx+ny*ny);
@@ -1098,8 +1190,6 @@ return false;
         // shifting the distance vector by 2 yields in the end point of the new direction
         float ux = px+2*wx;
         float uy = py+2*wy;
-
-        //drawCross("endOfNewSpeed:",ux, uy);
 
 
         float newdx = ux-cx;
@@ -1144,20 +1234,6 @@ return false;
         return (0<=y && y < yDim);
     }
 
-    private boolean ballOverlapsWithUpperNeighbour(int x, int y, float yPosCrossSection) {
-        if ( hasATopNeighbour(x,y)) {
-            if (top(y)-yPosCrossSection <= section1) return true;
-        }
-        return false;
-    }
-
-    private boolean ballOverlapsWithLowerNeighbour(int x, int y, float yPosCrossSection) {
-        if ( hasABottomNeighbour(x,y)) {
-            if (yPosCrossSection-bottom(y) <= section1) return true;
-        }
-        return false;
-    }
-
     private String roundedString(float v, int r) {
         float v1 = v*r;
         float v2 = Math.round(v1);
@@ -1165,16 +1241,32 @@ return false;
         return Float.toString(Math.round(v*r)/(float)r);
     }
 
+    private boolean ballOverlapsWithUpperNeighbour(int x, int y, float yPosCrossSection) {
+        if ( hasATopNeighbour(x,y)) {
+            if (Math.abs(top(y)-yPosCrossSection) <= section1) return true;
+        }
+        return false;
+    }
+
+    private boolean ballOverlapsWithLowerNeighbour(int x, int y, float yPosCrossSection) {
+        if ( hasABottomNeighbour(x,y)) {
+            if (Math.abs(yPosCrossSection-bottom(y))<= section1) return true;
+        }
+        return false;
+    }
+
+
+
     private boolean ballOverlapsWithRightNeighbour(int x, int y, float xPosCrossSection) {
         if (hasARightNeighbour(x,y)) {
-            if (right(x)-xPosCrossSection <= section1 ) return true;
+            if (Math.abs(right(x)-xPosCrossSection) <= section1 ) return true;
         }
         return false;
     }
 
     private boolean ballOverlapsWithLeftNeighbour(int x, int y, float xPosCrossSection) {
         if (hasALeftNeighbour(x,y)) {
-            if (xPosCrossSection-left(x) <= section1 ) return true;
+            if (Math.abs(xPosCrossSection-left(x)) <= section1 ) return true;
         }
         return false;
     }
@@ -1214,8 +1306,8 @@ return false;
             }
             b.hit();
             if (b.getValue() == 0) {
-                blocks[b.getX()][b.getY()] = null;
                 game.addAnimation(new DissolveBlockAnimation(this, 10, b.getX(), b.getY()));
+                blocks[b.getX()][b.getY()] = null;
             } else {
                 game.addAnimation(new HitBlockAnimation(this, 20, b.getX(), b.getY()));
             }
@@ -1236,19 +1328,38 @@ return false;
         if (gameBoardEmpty()) {
             game.increaselevel();
             initBoard();
+            if (autoPlayMode) {
+                game.addAnimation(new TouchReleaseAnimation(this,100));
+            }
         } else {
             if ( hasBlocksInRow(yDim-1) ) {
                 game.setGameOver(false);
                 for (int i = 0; i < 5 ; i++) {
                     game.addAnimation(new GameOverAnimation(this, 20*i, false));
+                    if (autoPlayMode) {
+                        game.addAnimation(new TouchReleaseAnimation(this, 100));
+                    }
                 }
             } else {
                 // shift all blocks downwards
-                game.addAnimation(new BoardDropAnimation(this, 60));
-                //float x = rand.nextFloat()*width+offsetX;
-                //float y = rand.nextFloat()*height+offsetY;
-                //touchDown(x,y);
-                //touchRelease(x,y);
+                game.addAnimation(new BoardDropAnimation(this, 30));
+                if (autoPlayMode) {
+                    game.addAnimation(new TouchReleaseAnimation(this,50));
+                }
+            }
+        }
+    }
+
+    private void createBoardCopy() {
+        for (int x=0; x < xDim; x++) {
+            for (int y = 0; y < yDim; y++) {
+                if (blocks[x][y] != null) {
+                    if (blocks[x][y] instanceof Block3) {
+                        blocksCopy[x][y] = new Block3((Block3) blocks[x][y]);
+                    } else if (blocks[x][y] instanceof Block4) {
+                        blocksCopy[x][y] = new Block4((Block4) blocks[x][y]);
+                    }
+                } else blocksCopy[x][y] = null;
             }
         }
     }
@@ -1281,14 +1392,8 @@ return false;
         newFirePosSet = false;
 
         // store game board for later debugging
-        for (int x=0; x < xDim; x++) {
-            for ( int y=0; y <yDim; y++ ) {
-                if ( blocks[x][y]!=null)
-                    blocksCopy[x][y] = new Block(blocks[x][y]);
-                else
-                    blocksCopy[x][y] = null;
-            }
-        }
+        createBoardCopy();
+
     }
 
 
@@ -1332,6 +1437,9 @@ return false;
             dirLineActive = true;
             dirLineX = x;
             dirLineY = y;
+        } else {
+            startPosXTouch = x;
+            startPosYTouch = y;
         }
     }
 
@@ -1362,6 +1470,17 @@ return false;
             fire();
             dirLineActive = false;
             endOfRollingPhase = false;
+        }
+
+        if (ballRolling() && !ballDropRunning) {
+            if ((startPosXTouch-100 <= x && x <= startPosXTouch+100) &&
+                    ( y>= 200 + startPosYTouch )) {
+                ballDropRunning = true;
+                fire = false;
+                for (int i = 0; i <numBalls; i++) {
+                    game.addAnimation(new BallDropAnimation(this, 30, balls[i], newFirePosX, firePosY));
+                }
+            }
         }
     }
 
@@ -1417,6 +1536,7 @@ return false;
         for (int x = 0; x < xDim; x++) {
             blocks[x][0] = null;
         }
+        createBoardCopy();
     }
 
     public float getHeight() {
@@ -1436,105 +1556,43 @@ return false;
 
 
     public int getXPos(Ball b) {
-        return (int)((b.getX()-offsetX)/blockWidth);
+        return (int)Math.floor((b.getX()-offsetX)/blockWidth);
     }
 
     public int getYPos(Ball b) {
-        return (int)((b.getY()-offsetY)/blockHeight);
+        return (int)Math.floor((b.getY()-offsetY)/blockHeight);
     }
     public int getMinXPos(Ball b) {
         float minX = b.getX()-ballRadius;
-        int x = 0;
-        if (minX < offsetX ) x = -1;
-        else x = (int)((minX-offsetX)/blockWidth);
-        return x;
+        return (int)Math.floor((minX-offsetX)/blockWidth);
     }
 
     public int getMaxXPos(Ball b) {
         float maxX = b.getX()+ballRadius;
-        int x = (int)((maxX-offsetX)/blockWidth);
+        int x = (int)Math.floor((maxX-offsetX)/blockWidth);
         return x;
     }
 
     public int getMinYPos(Ball b) {
         float minY = b.getY()-ballRadius;
-        int y = 0;
-        if (minY < offsetY) y = -1;
-        else y = (int)((minY-offsetY)/blockHeight);
-        return y;
+        return (int)Math.floor((minY-offsetY)/blockHeight);
     }
 
     public int getMaxYPos(Ball b) {
         float maxY = b.getY()+ballRadius;
-        int y = (int)((maxY-offsetY)/blockHeight);
+        int y = (int)Math.floor((maxY-offsetY)/blockHeight);
 
         return y;
     }
 
-    private boolean hasBlock(int x, int y) {
-        if (x<0 || y<0 || x>=xDim) return true;
-        return (inXRange(x) && inXRange(y) && blocks[x][y]!=null);
-    }
 
-    public boolean ballTouchesBlockOnTop(Ball ball) {
-        float x = ball.getX()-offsetX;
-        float y = ball.getY()-offsetY;
-        int centerX = (int)(x/blockWidth);
-        int centerY = (int)(y/blockHeight);
-
-        if ( cellOccupied(centerX,centerY-1) && (ball.getY()-ballRadius<top(centerY)))    return true;
-        if ( cellOccupied(centerX+1, centerY-1) && distanceSquare(ball,right(centerX),top(centerY)) <= radiusSquare) return true;
-        if ( cellOccupied(centerX-1, centerY-1) && distanceSquare(ball,left(centerX), top(centerY)) <= radiusSquare) return true;
-
-        return false;
-    }
-
-
-    public boolean ballTouchesBlockOnBottom(Ball ball) {
-        float x = ball.getX()-offsetX;
-        float y = ball.getY()-offsetY;
-        int centerX = (int)(x/blockWidth);
-        int centerY = (int)(y/blockHeight);
-
-        if ( cellOccupied(centerX,centerY+1) && (ball.getY()+ballRadius>bottom(centerY))) return true;
-        if ( cellOccupied(centerX+1, centerY+1) && distanceSquare(ball,right(centerX),bottom(centerY)) <= radiusSquare) return true;
-        if ( cellOccupied(centerX-1, centerY+1) && distanceSquare(ball,left(centerX), bottom(centerY)) <= radiusSquare) return true;
-
-        return false;
-    }
-
-    public boolean ballTouchesBlockOnLeft(Ball ball) {
-        float x = ball.getX()-offsetX;
-        float y = ball.getY()-offsetY;
-        int centerX = (int)(x/blockWidth);
-        int centerY = (int)(y/blockHeight);
-
-        if ( cellOccupied(centerX-1, centerY) && (ball.getX()-ballRadius)<left(centerX))   return true;
-        if ( cellOccupied(centerX-1, centerY+1) && distanceSquare(ball,left(centerX), bottom(centerY)) <= radiusSquare) return true;
-        if ( cellOccupied(centerX-1, centerY-1) && distanceSquare(ball,left(centerX), top(centerY)) <= radiusSquare) return true;
-
-        return false;
-    }
-
-    public boolean ballTouchesBlockOnRight(Ball ball) {
-        float x = ball.getX()-offsetX;
-        float y = ball.getY()-offsetY;
-        int centerX = (int)(x/blockWidth);
-        int centerY = (int)(y/blockHeight);
-
-        if ( cellOccupied(centerX+1, centerY) && (ball.getX()+ballRadius)>right(centerX))  return true;
-        if ( cellOccupied(centerX+1, centerY-1) && distanceSquare(ball,right(centerX),top(centerY)) <= radiusSquare) return true;
-        if ( cellOccupied(centerX+1, centerY+1) && distanceSquare(ball,right(centerX),bottom(centerY)) <= radiusSquare) return true;
-
-        return false;
-    }
 
     public boolean ballOnBlock(Ball ball) {
 
         float x = ball.getX()-offsetX;
         float y = ball.getY()-offsetY;
-        int cx = (int)(x/blockWidth);
-        int cy = (int)(y/blockHeight);
+        int cx = (int)Math.floor(x/blockWidth);
+        int cy = (int)Math.floor(y/blockHeight);
 
         bb.clear();
         bb.setCenter(cx,cy);
@@ -1622,10 +1680,10 @@ return false;
     }
 
     private int getXBlock(float x) {
-        return (int)((x-offsetX)/blockWidth);
+        return (int)Math.floor((x-offsetX)/blockWidth);
     }
     private int getYBlock(float y) {
-        return (int)((y-offsetY)/blockHeight);
+        return (int)Math.floor((y-offsetY)/blockHeight);
     }
 
 

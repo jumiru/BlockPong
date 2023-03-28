@@ -187,6 +187,10 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback  {
         gameWon = win;
     }
 
+    public void resetGameOver() {
+        gameOver = false;
+    }
+
     public void increaselevel() {
         level++;
     }

@@ -13,7 +13,16 @@ public class DissolveBlockAnimation extends Animation {
 
     public DissolveBlockAnimation(GameBoard gb, int dur, int x, int y) {
         super(gb, dur);
-        block = new Block(gb, x, y, 0);
+        block = gb.getBlock(x,y);
+        System.out.println("dissolve block: "+x+"/"+y);
+        if ( block instanceof Block3 ) {
+            block = new Block3((Block3)block);
+        } else if (block instanceof Block4) {
+            block = new Block4((Block4) block);
+        } else {
+            System.out.println("STOP: "+x+"/"+y);
+        }
+
 
         alpha = 255f;
         da = alpha / animationDuration;
