@@ -10,6 +10,10 @@ public class Block4 extends Block {
 
     private RectF rect;
 
+    public GameBoard.Content blockHitType() {
+        return GameBoard.Content.HIT_BLOCK4;
+    }
+
     public float getLeft() {return rect.left;}
     public float getTop() {return rect.top;}
     public float getRight() {return rect.right;}
@@ -37,9 +41,6 @@ public class Block4 extends Block {
 
         rect = new RectF(gb.getBlockX(x),gb.getBlockY(y),
                 gb.getBlockX(x)+gb.getBlockWidth(),gb.getBlockY(y)+gb.getBlockHeight());
-
-        textPaint = new Paint();
-        textPaint.setTextSize(rect.height()*.5f);
 
     }
 

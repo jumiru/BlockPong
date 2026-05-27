@@ -7,6 +7,8 @@ import android.graphics.RectF;
 
 public abstract class Block {
 
+    public abstract GameBoard.Content blockHitType();
+
     public enum tEdge { left, right, top, bottom , none };
 
     protected Paint strokePaint;
