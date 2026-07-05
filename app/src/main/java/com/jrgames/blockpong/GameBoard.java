@@ -34,6 +34,10 @@ public class GameBoard {
     private float startPosYTouch;
     private boolean ballDropRunning;
     private Ball frozenBall;
+    // Tracks the cell hit earlier in the current step so the end-of-step safety nets
+    // (enforceTriangleClearance, enforceSquareClearance) don't double-credit the same block
+    // when they reposition the ball away from a block that already registered a hit this step.
+    private int stepHitCellX = -1, stepHitCellY = -1;
     private float prevBallPosX;
     private float prevBallPosY;
     private float nextBallX;
@@ -607,6 +611,8 @@ public class GameBoard {
 
                 prevBallPosX = currBall.getX();
                 prevBallPosY = currBall.getY();
+                stepHitCellX = -1;
+                stepHitCellY = -1;
 
                 currBall.update();
 
@@ -671,17 +677,21 @@ public class GameBoard {
                     }
                 }
 
-                // Corner hits are checked even when the ball center does not enter a block cell
-                // (important for triangle tips where only the corner is touched).
-                Block cornerHitBlock = getCornerHitBlock(prevBallPosX, prevBallPosY, nextBallX, nextBallY);
-                if (cornerHitBlock != null) {
-                    int hitBlockX = cornerHitBlock.getX();
-                    int hitBlockY = cornerHitBlock.getY();
-                    if (cellOccupiedWithRealBlock(hitBlockX, hitBlockY)) {
-                        hit(hitBlockX, hitBlockY);
-                        ballCollisionWithCorner(currBall, cornerHitBlock.getHitCornerX(), cornerHitBlock.getHitCornerY(), prevBallPosX, prevBallPosY);
+                // Hypotenuse and corner hits are checked even when the ball center does not enter
+                // a block cell (important for triangle hypotenuses and isolated tips).
+                boolean hypHit = checkTriangleHypotenuses(prevBallPosX, prevBallPosY, currBall);
+                if (!hypHit) {
+                    Block cornerHitBlock = getCornerHitBlock(prevBallPosX, prevBallPosY, nextBallX, nextBallY);
+                    if (cornerHitBlock != null) {
+                        int hitBlockX = cornerHitBlock.getX();
+                        int hitBlockY = cornerHitBlock.getY();
+                        if (cellOccupiedWithRealBlock(hitBlockX, hitBlockY)) {
+                            hit(hitBlockX, hitBlockY);
+                            ballCollisionWithCorner(currBall, cornerHitBlock.getHitCornerX(), cornerHitBlock.getHitCornerY(), prevBallPosX, prevBallPosY);
+                        }
                     }
                 }
+                enforceCollisionInvariants(currBall);
 
                 // ball back on start line
                 if (currBall.getY() > firePosY) {
@@ -1004,22 +1014,234 @@ public class GameBoard {
         return null;
     }
 
+    // Checks all Block3 triangles near the ball's path for hypotenuse collisions and reflects
+    // the ball off the first hypotenuse hit.  Returns true if a hit was processed.
+    // The hypotenuse of every Block3 is a 45-degree line, so the reflection simply swaps (or
+    // negates+swaps) dx/dy.
+    // Whether the ball's center cell (cx, cy) actually constitutes solid contact.
+    // A triangle only fills half its cell, so being in the cell isn't enough by itself:
+    // the ball must be on the solid side of the hypotenuse, or within radius of it.
+    private boolean centerCellHasSolidOverlap(Ball ball, int cx, int cy, Content ct) {
+        if (ct == Content.NO_BLOCK) return false;
+        if (ct != Content.HIT_BLOCK3_BL && ct != Content.HIT_BLOCK3_TL
+                && ct != Content.HIT_BLOCK3_TR && ct != Content.HIT_BLOCK3_BR) {
+            return true; // HIT_BLOCK4 or HIT_BORDER
+        }
+        Block b = blocks[cx][cy];
+        if (!(b instanceof Block3)) return true;
+        return ballOverlapsTriangleSolid(ball, (Block3) b, cx, cy);
+    }
+
+    private boolean ballOverlapsTriangleSolid(Ball ball, Block3 b, int cx, int cy) {
+        Block3.tTriangle type = b.getType();
+        float lx = left(cx), rx = right(cx), ty = top(cy), by = bottom(cy);
+        boolean isBLorTR = (type == Block3.tTriangle.BL || type == Block3.tTriangle.TR);
+
+        float lineVal = isBLorTR
+                ? ball.getX() - ball.getY() + (by - rx)
+                : ball.getX() + ball.getY() - (rx + ty);
+
+        boolean emptyIsNeg = (type == Block3.tTriangle.TR || type == Block3.tTriangle.BR);
+        boolean onEmptySide = emptyIsNeg ? (lineVal < 0) : (lineVal > 0);
+        if (!onEmptySide) return true; // on/over the solid side already
+
+        // On the empty side: only a hit if the ball's edge reaches the hypotenuse segment.
+        float dist = Math.abs(lineVal) / (float) Math.sqrt(2.0);
+        if (dist > ballRadius) return false;
+
+        float sx1, sy1, sx2, sy2;
+        if (isBLorTR) { sx1 = lx; sy1 = ty; sx2 = rx; sy2 = by; }
+        else          { sx1 = rx; sy1 = ty; sx2 = lx; sy2 = by; }
+        float sdx = sx2 - sx1, sdy = sy2 - sy1;
+        float t = ((ball.getX() - sx1) * sdx + (ball.getY() - sy1) * sdy) / (sdx * sdx + sdy * sdy);
+        return t >= -EPSILON && t <= 1 + EPSILON;
+    }
+
+    private boolean checkTriangleHypotenuses(float prevX, float prevY, Ball ball) {
+        float dx = ball.getDx(), dy = ball.getDy();
+        int cx1 = getXBlock(prevX),      cy1 = getYBlock(prevY);
+        int cx2 = getXBlock(ball.getX()), cy2 = getYBlock(ball.getY());
+        int xFrom = Math.max(0,      Math.min(cx1, cx2) - 1);
+        int xTo   = Math.min(xDim-1, Math.max(cx1, cx2) + 1);
+        int yFrom = Math.max(0,      Math.min(cy1, cy2) - 1);
+        int yTo   = Math.min(yDim-1, Math.max(cy1, cy2) + 1);
+
+        // Trigger: ball center at distance ballRadius from the hypotenuse line.
+        // For a 45-deg line the perpendicular distance is |lineVal| / sqrt(2),
+        // so we hit when |lineVal| == ballRadius * sqrt(2).
+        float triggerDist = ballRadius * (float) Math.sqrt(2.0);
+
+        float minT  = Float.POSITIVE_INFINITY;
+        int   minCx = -1, minCy = -1;
+        float minNewDx = 0, minNewDy = 0, minHx = 0, minHy = 0;
+
+        for (int cx = xFrom; cx <= xTo; cx++) {
+            for (int cy = yFrom; cy <= yTo; cy++) {
+                if (!cellOccupiedWithRealBlock(cx, cy)) continue;
+                Block b = blocks[cx][cy];
+                if (!(b instanceof Block3)) continue;
+                Block3.tTriangle type = ((Block3) b).getType();
+
+                float lx = left(cx), rx = right(cx), ty = top(cy), by = bottom(cy);
+                boolean isBLorTR = (type == Block3.tTriangle.BL || type == Block3.tTriangle.TR);
+
+                // Signed-distance value for the ball's starting position.
+                // BL/TR line: x - y + (bottom - right) = 0
+                // TL/BR line: x + y - (right  + top)   = 0
+                float lineVal, lineDot;
+                if (isBLorTR) {
+                    lineVal = prevX - prevY + (by - rx);
+                    lineDot = dx - dy;
+                } else {
+                    lineVal = prevX + prevY - (rx + ty);
+                    lineDot = dx + dy;
+                }
+
+                if (Math.abs(lineDot) < EPSILON) continue;
+
+                // Empty sides: TR and BR have lineVal < 0; BL and TL have lineVal > 0.
+                boolean emptyIsNeg = (type == Block3.tTriangle.TR || type == Block3.tTriangle.BR);
+                if (emptyIsNeg ? lineVal >= 0 : lineVal <= 0) continue; // ball on solid side
+
+                // Must genuinely be approaching from outside the trigger radius. Without this,
+                // a ball that already starts within the trigger zone but is moving AWAY from the
+                // hypotenuse (e.g. right after a previous bounce) would still solve for a t in
+                // [0,1] where |lineVal| grows back out to triggerDist, registering a bogus hit.
+                if (emptyIsNeg ? (lineVal > -triggerDist) : (lineVal < triggerDist)) continue;
+
+                // t at which |lineVal + t*lineDot| == triggerDist (first hit from empty side)
+                float targetVal = emptyIsNeg ? -triggerDist : triggerDist;
+                float t = (targetVal - lineVal) / lineDot;
+                if (t < 0 || t > 1) continue;
+
+                // Centre position at the moment of contact
+                float hx = prevX + t * dx;
+                float hy = prevY + t * dy;
+
+                // Verify the contact lies within the hypotenuse segment
+                float sx1, sy1, sx2, sy2;
+                if (isBLorTR) { sx1=lx; sy1=ty; sx2=rx; sy2=by; }
+                else          { sx1=rx; sy1=ty; sx2=lx; sy2=by; }
+                float sdx = sx2-sx1, sdy = sy2-sy1;
+                float tSeg = ((hx-sx1)*sdx + (hy-sy1)*sdy) / (sdx*sdx + sdy*sdy);
+                if (tSeg < -EPSILON || tSeg > 1+EPSILON) {
+                    // The perpendicular contact point falls off the finite hypotenuse segment.
+                    // The ball can still clip the nearer endpoint directly -- this is common where
+                    // two triangles' hypotenuses share a vertex (e.g. a TL and a TR side by side),
+                    // which getCornerHitBlock intentionally ignores because more than one block
+                    // touches that point (it assumes that means a flat interior wall, not a tip).
+                    float ex = tSeg < 0 ? sx1 : sx2;
+                    float ey = tSeg < 0 ? sy1 : sy2;
+                    float tc = timeToReachCorner(prevX, prevY, dx, dy, ex, ey);
+                    if (tc < minT) {
+                        minT = tc;
+                        minCx = cx; minCy = cy;
+                        float cHitX = prevX + tc * dx;
+                        float cHitY = prevY + tc * dy;
+                        float[] newVel = reflectVelocityOffCorner(dx, dy, cHitX, cHitY, ex, ey);
+                        minNewDx = newVel[0];
+                        minNewDy = newVel[1];
+                        minHx = cHitX; minHy = cHitY;
+                    }
+                    continue;
+                }
+
+                if (t < minT) {
+                    minT = t;
+                    minCx = cx; minCy = cy;
+                    // Reflection: BL/TR swaps components; TL/BR negates and swaps.
+                    if (isBLorTR) { minNewDx = dy;  minNewDy = dx;  }
+                    else          { minNewDx = -dy; minNewDy = -dx; }
+                    minHx = hx; minHy = hy;
+                }
+            }
+        }
+
+        if (minCx < 0) return false;
+
+        float frac = 1f - minT;
+        ball.setSpeed(minNewDx, minNewDy);
+        ball.setPos(minHx + frac * minNewDx, minHy + frac * minNewDy);
+        hit(minCx, minCy);
+        return true;
+    }
+
+    // Time (as a fraction of the step, in [0,1]) at which a ball moving from (prevX,prevY) with
+    // velocity (dx,dy) first comes within ballRadius of point (cx,cy). POSITIVE_INFINITY if it
+    // never does within this step. Same quadratic as ballCollisionWithCorner, factored out so
+    // checkTriangleHypotenuses can use it without going through getCornerHitBlock's nbc==1 gate.
+    private float timeToReachCorner(float prevX, float prevY, float dx, float dy, float cx, float cy) {
+        float t1 = prevX - cx;
+        float t2 = prevY - cy;
+        float a = dx * dx + dy * dy;
+        float b = 2 * t1 * dx + 2 * t2 * dy;
+        float c = t1 * t1 + t2 * t2 - radiusSquare;
+        float disc = b * b - 4 * a * c;
+        if (disc < 0) return Float.POSITIVE_INFINITY;
+        float q = (float) Math.sqrt(disc);
+        float v1 = (-b + q) / (2 * a);
+        float v2 = (-b - q) / (2 * a);
+        float t = Math.min(v1, v2);
+        if (t < 0) t = Math.max(v1, v2);
+        if (t < 0 || t > 1) return Float.POSITIVE_INFINITY;
+        return t;
+    }
+
+    // Reflects velocity (dx,dy) off a point-corner at (cx,cy), given the ball center is at
+    // (hitX,hitY) at the moment of contact. Same normal-reflection math as ballCollisionWithCorner.
+    private float[] reflectVelocityOffCorner(float dx, float dy, float hitX, float hitY, float cx, float cy) {
+        float nx = cx - hitX;
+        float ny = cy - hitY;
+        float px = cx - dx;
+        float py = cy - dy;
+        float v = (ny * py - ny * cy - nx * cx + nx * px) / (nx * nx + ny * ny);
+        float sx = cx + v * nx;
+        float sy = cy + v * ny;
+        float wx = sx - px;
+        float wy = sy - py;
+        float ux = px + 2 * wx;
+        float uy = py + 2 * wy;
+        return new float[] { ux - cx, uy - cy };
+    }
+
+    // Returns true if the block in cell (cellX, cellY) geometrically covers corner (cx, cy).
+    // Block4 (square) covers all four cell corners.
+    // Block3 triangles each omit one corner — the one opposite the right angle.
+    private boolean blockCoversCorner(int cellX, int cellY, float cx, float cy) {
+        if (!cellOccupiedWithRealBlock(cellX, cellY)) return false;
+        Block b = blocks[cellX][cellY];
+        if (!(b instanceof Block3)) return true;
+        switch (((Block3) b).getType()) {
+            case BL: return !(Math.abs(cx - right(cellX)) < EPSILON && Math.abs(cy - top(cellY))    < EPSILON);
+            case TL: return !(Math.abs(cx - right(cellX)) < EPSILON && Math.abs(cy - bottom(cellY)) < EPSILON);
+            case TR: return !(Math.abs(cx - left(cellX))  < EPSILON && Math.abs(cy - bottom(cellY)) < EPSILON);
+            case BR: return !(Math.abs(cx - left(cellX))  < EPSILON && Math.abs(cy - top(cellY))    < EPSILON);
+        }
+        return true;
+    }
+
+    // Used by ballOnBlock: a neighbour cell only counts as a real hit at (cornerX, cornerY) if
+    // it's the world border (always solid) or an actual block whose own geometry covers that
+    // corner. Without the blockCoversCorner check, being merely adjacent to a triangle that
+    // points away from the corner would be wrongly treated as touching solid material there.
+    private boolean cornerCoveredByNeighbour(int x, int y, float cornerX, float cornerY) {
+        Content ct = cellType(x, y);
+        if (ct == Content.NO_BLOCK) return false;
+        if (ct == Content.HIT_BORDER) return true;
+        return blockCoversCorner(x, y, cornerX, cornerY);
+    }
+
     private int numBlocksAtCorner(float cx, float cy) {
         float d = blockWidth/10.0f;
-        int x1 = getXBlock(cx-d);
-        int y1 = getYBlock(cy-d);
-        int x2 = getXBlock(cx+d);
-        int y2 = getYBlock(cy-d);
-        int x3 = getXBlock(cx+d);
-        int y3 = getYBlock(cy+d);
-        int x4 = getXBlock(cx-d);
-        int y4 = getYBlock(cy+d);
+        int x1 = getXBlock(cx-d), y1 = getYBlock(cy-d);
+        int x2 = getXBlock(cx+d), y2 = getYBlock(cy-d);
+        int x3 = getXBlock(cx+d), y3 = getYBlock(cy+d);
+        int x4 = getXBlock(cx-d), y4 = getYBlock(cy+d);
 
-        return (cellOccupiedWithRealBlock(x1,y1)?1:0)+
-                (cellOccupiedWithRealBlock(x2,y2)?1:0)+
-                (cellOccupiedWithRealBlock(x3,y3)?1:0)+
-                (cellOccupiedWithRealBlock(x4,y4)?1:0);
-
+        return (blockCoversCorner(x1,y1,cx,cy)?1:0) +
+               (blockCoversCorner(x2,y2,cx,cy)?1:0) +
+               (blockCoversCorner(x3,y3,cx,cy)?1:0) +
+               (blockCoversCorner(x4,y4,cx,cy)?1:0);
     }
 
 
@@ -1145,6 +1367,128 @@ return false;
         return (float)Math.sqrt(v1*v1+v2*v2);
     }
 
+    // Runs all end-of-step corrective safety nets, repeating until a pass makes no further change
+    // (or a small iteration cap is hit). A single pass can create a new overlap of its own -- e.g.
+    // pushing out of one triangle can land the ball in a diagonally-adjacent block's solid area --
+    // so it takes a few rounds for cascading same-step collisions to settle.
+    private void enforceCollisionInvariants(Ball ball) {
+        for (int i = 0; i < 4; i++) {
+            float x = ball.getX(), y = ball.getY();
+            enforceBoardBounds(ball);
+            enforceTriangleClearance(ball);
+            enforceSquareClearance(ball);
+            if (ball.getX() == x && ball.getY() == y) break;
+        }
+    }
+
+    // Safety net: a corner/hypotenuse bounce only checks the border/block collision for the
+    // *pre-bounce* portion of the step, then moves the ball for the remaining fraction of the
+    // step in the new direction without re-checking for a wall. That can push the ball past the
+    // left/right/top playfield border within the same step. Reflect it back if that happened.
+    // (Bottom is deliberately excluded: the ball is meant to fall past it into the fire zone.)
+    private void enforceBoardBounds(Ball ball) {
+        float minX = left(0) + ballRadius;
+        float maxX = right(xDim - 1) - ballRadius;
+        float minY = top(0) + ballRadius;
+
+        if (ball.getX() < minX) {
+            ball.setPos(2 * minX - ball.getX(), ball.getY());
+            ball.setSpeed(-ball.getDx(), ball.getDy());
+        } else if (ball.getX() > maxX) {
+            ball.setPos(2 * maxX - ball.getX(), ball.getY());
+            ball.setSpeed(-ball.getDx(), ball.getDy());
+        }
+        if (ball.getY() < minY) {
+            ball.setPos(ball.getX(), 2 * minY - ball.getY());
+            ball.setSpeed(ball.getDx(), -ball.getDy());
+        }
+    }
+
+    // Safety net, same rationale as enforceBoardBounds: some collision paths (e.g. a generic
+    // wall/face bounce that happens to coincide with a triangle's edge) can leave the ball just
+    // barely overlapping a triangle's solid side without ever running the hypotenuse reflection.
+    // If the ball ends a step there, push it back out to the trigger distance along the
+    // hypotenuse's normal and reflect, using the same convention as checkTriangleHypotenuses.
+    private void enforceTriangleClearance(Ball ball) {
+        int cx = getXBlock(ball.getX());
+        int cy = getYBlock(ball.getY());
+        if (!cellOccupiedWithRealBlock(cx, cy)) return;
+        Block b = blocks[cx][cy];
+        if (!(b instanceof Block3)) return;
+        if (!ballOverlapsTriangleSolid(ball, (Block3) b, cx, cy)) return;
+
+        Block3.tTriangle type = ((Block3) b).getType();
+        float rx = right(cx), ty = top(cy), by = bottom(cy);
+        boolean isBLorTR = (type == Block3.tTriangle.BL || type == Block3.tTriangle.TR);
+        boolean emptyIsNeg = (type == Block3.tTriangle.TR || type == Block3.tTriangle.BR);
+        float triggerDist = ballRadius * (float) Math.sqrt(2.0);
+
+        float lineVal = isBLorTR
+                ? ball.getX() - ball.getY() + (by - rx)
+                : ball.getX() + ball.getY() - (rx + ty);
+        // Push slightly past the exact trigger distance so the ball ends up clearly clear of the
+        // hypotenuse rather than sitting exactly at the boundary (which the overlap check, using
+        // a non-strict "<=", would still count as touching).
+        float targetVal = emptyIsNeg ? -(triggerDist + 0.5f) : (triggerDist + 0.5f);
+        float delta = targetVal - lineVal;
+
+        // The line-value gradient is (1,-1) for BL/TR and (1,1) for TL/BR; move delta/2 along
+        // each axis, equivalent to moving purely along the line's normal by the needed amount.
+        if (isBLorTR) ball.setPos(ball.getX() + delta / 2f, ball.getY() - delta / 2f);
+        else          ball.setPos(ball.getX() + delta / 2f, ball.getY() + delta / 2f);
+
+        float dx = ball.getDx(), dy = ball.getDy();
+        if (isBLorTR) ball.setSpeed(dy, dx);
+        else          ball.setSpeed(-dy, -dx);
+        // Don't double-credit a block that was already hit earlier this same step (e.g. a
+        // corner bounce that leaves the ball marginally within this same triangle's trigger zone).
+        if (cx != stepHitCellX || cy != stepHitCellY) hit(cx, cy);
+    }
+
+    // Safety net, same rationale as enforceTriangleClearance: a face bounce resolved for one
+    // block can leave the ball's remaining same-step motion tunnel straight into a second,
+    // diagonally-adjacent square (e.g. bouncing off one block's left face while already past the
+    // top edge of a different block in the next column). Push back out to the nearest edge.
+    private void enforceSquareClearance(Ball ball) {
+        int cx = getXBlock(ball.getX());
+        int cy = getYBlock(ball.getY());
+        if (!cellOccupiedWithRealBlock(cx, cy)) return;
+        if (!(blocks[cx][cy] instanceof Block4)) return;
+
+        float l = left(cx), r = right(cx), t = top(cy), bo = bottom(cy);
+        float distLeft = ball.getX() - l;
+        float distRight = r - ball.getX();
+        float distTop = ball.getY() - t;
+        float distBottom = bo - ball.getY();
+
+        // Exclude directions that would push the ball past the world border -- pushing a block
+        // in the last column out to its right edge, for instance, would land the ball off-board,
+        // which enforceBoardBounds would then have to shove all the way back, overshooting badly.
+        float boardMinX = left(0) + ballRadius, boardMaxX = right(xDim - 1) - ballRadius;
+        float boardMinY = top(0) + ballRadius;
+        if (l - ballRadius < boardMinX) distLeft = Float.POSITIVE_INFINITY;
+        if (r + ballRadius > boardMaxX) distRight = Float.POSITIVE_INFINITY;
+        if (t - ballRadius < boardMinY) distTop = Float.POSITIVE_INFINITY;
+
+        float minDist = Math.min(Math.min(distLeft, distRight), Math.min(distTop, distBottom));
+
+        if (minDist == distLeft) {
+            ball.setPos(l - ballRadius, ball.getY());
+            ball.setSpeed(-Math.abs(ball.getDx()), ball.getDy());
+        } else if (minDist == distRight) {
+            ball.setPos(r + ballRadius, ball.getY());
+            ball.setSpeed(Math.abs(ball.getDx()), ball.getDy());
+        } else if (minDist == distTop) {
+            ball.setPos(ball.getX(), t - ballRadius);
+            ball.setSpeed(ball.getDx(), -Math.abs(ball.getDy()));
+        } else {
+            ball.setPos(ball.getX(), bo + ballRadius);
+            ball.setSpeed(ball.getDx(), Math.abs(ball.getDy()));
+        }
+        // Don't double-credit a block that was already hit earlier this same step.
+        if (cx != stepHitCellX || cy != stepHitCellY) hit(cx, cy);
+    }
+
     private boolean ballCollisionWithCorner(Ball currBall, float cx, float cy, float prevBallPosX, float prevBallPosY) {
         // determine the x1/y1 position of the ball where it hits the corner cx/cy
         // (or x2/y2, its quadratic and has 2 solutions)
@@ -1222,27 +1566,33 @@ return false;
 
 
     private float horizontalReflectionLine(Ball currBall) {
-        float horizontalReflectionLine = 0;
         int y = getYPos(currBall);
-
         if (currBall.movingUpwards()) {
-            horizontalReflectionLine = top(y) + ballRadius;
+            float line = top(y) + ballRadius;
+            // Ball already above the trigger line (passed it without bouncing last step) —
+            // advance one cell so the check can fire against the next row up.
+            if (currBall.getY() < line) line = top(y - 1) + ballRadius;
+            return line;
         } else {
-            horizontalReflectionLine = bottom(y) - ballRadius;
+            float line = bottom(y) - ballRadius;
+            if (currBall.getY() > line) line = bottom(y + 1) - ballRadius;
+            return line;
         }
-        return horizontalReflectionLine;
     }
 
     private float verticalReflectionLine(Ball currBall) {
-        float verticalReflectionLine = 0;
         int x = getXPos(currBall);
-
         if (currBall.movingRight()) {
-            verticalReflectionLine = right(x) - ballRadius;
+            float line = right(x) - ballRadius;
+            // Ball already past the trigger line — advance one cell to the right.
+            if (currBall.getX() > line) line = right(x + 1) - ballRadius;
+            return line;
         } else {
-            verticalReflectionLine = left(x) + ballRadius;
+            float line = left(x) + ballRadius;
+            // Ball already past the trigger line — advance one cell to the left.
+            if (currBall.getX() < line) line = left(x - 1) + ballRadius;
+            return line;
         }
-        return verticalReflectionLine;
     }
 
     private boolean inXRange(int x) {
@@ -1458,6 +1808,8 @@ return false;
 
     private void hit(int x, int y) {
         if (freeze) return;
+        stepHitCellX = x;
+        stepHitCellY = y;
         if (inXRange(x) && inYRange(y)) {
             Block b = blocks[x][y];
             if (b==null) {
@@ -1773,15 +2125,16 @@ return false;
 
         // check corners
         // top-left
+        boolean neighboursHit = false;
 
         if ((bb.C==Content.HIT_BLOCK4
                 || bb.C==Content.HIT_BLOCK3_TL
                 || bb.C==Content.HIT_BLOCK3_BL
                 || bb.C==Content.HIT_BLOCK3_TR)
                 && distanceSquare(ball, left, top) <= radiusSquare) {
-            bb.L = cellType(cx - 1, cy);
-            bb.TL = cellType(cx - 1, cy - 1);
-            bb.T = cellType(cx, cy - 1);
+            neighboursHit |= cornerCoveredByNeighbour(cx - 1, cy,     left, top)
+                    || cornerCoveredByNeighbour(cx - 1, cy - 1, left, top)
+                    || cornerCoveredByNeighbour(cx,     cy - 1, left, top);
         }
 
         // top-right corner
@@ -1790,9 +2143,9 @@ return false;
                 || bb.C==Content.HIT_BLOCK3_BL
                 || bb.C==Content.HIT_BLOCK3_BR)
                 && distanceSquare(ball, right, top) <= radiusSquare) {
-            bb.T = cellType(cx, cy - 1);
-            bb.TR = cellType(cx + 1, cy - 1);
-            bb.R = cellType(cx + 1, cy);
+            neighboursHit |= cornerCoveredByNeighbour(cx,     cy - 1, right, top)
+                    || cornerCoveredByNeighbour(cx + 1, cy - 1, right, top)
+                    || cornerCoveredByNeighbour(cx + 1, cy,     right, top);
         }
 
         // bottom-right
@@ -1801,9 +2154,9 @@ return false;
                 || bb.C==Content.HIT_BLOCK3_BL
                 || bb.C==Content.HIT_BLOCK3_TR)
                 && distanceSquare(ball, right, bot) <= radiusSquare) {
-            bb.R = cellType(cx + 1, cy);
-            bb.BR = cellType(cx + 1, cy + 1);
-            bb.B = cellType(cx, cy + 1);
+            neighboursHit |= cornerCoveredByNeighbour(cx + 1, cy,     right, bot)
+                    || cornerCoveredByNeighbour(cx + 1, cy + 1, right, bot)
+                    || cornerCoveredByNeighbour(cx,     cy + 1, right, bot);
         }
 
         //bot-left
@@ -1812,9 +2165,9 @@ return false;
                 || bb.C==Content.HIT_BLOCK3_BR
                 || bb.C==Content.HIT_BLOCK3_TR)
                 && distanceSquare(ball, left, bot) <= radiusSquare) {
-            bb.B = cellType(cx, cy + 1);
-            bb.BL = cellType(cx - 1, cy + 1);
-            bb.L = cellType(cx - 1, cy);
+            neighboursHit |= cornerCoveredByNeighbour(cx,     cy + 1, left, bot)
+                    || cornerCoveredByNeighbour(cx - 1, cy + 1, left, bot)
+                    || cornerCoveredByNeighbour(cx - 1, cy,     left, bot);
         }
 
         // check borders
@@ -1822,19 +2175,19 @@ return false;
         if ((bb.C==Content.HIT_BLOCK4
                 || bb.C==Content.HIT_BLOCK3_TL
                 || bb.C==Content.HIT_BLOCK3_BL) && (ball.getX() - ballRadius <= left))
-            bb.L = cellType(cx - 1, cy);
+            neighboursHit |= cellType(cx - 1, cy) != Content.NO_BLOCK;
         if ((bb.C==Content.HIT_BLOCK4
                 || bb.C==Content.HIT_BLOCK3_TR
                 || bb.C==Content.HIT_BLOCK3_BR) && (ball.getX() + ballRadius >= right))
-            bb.R = cellType(cx + 1, cy);
+            neighboursHit |= cellType(cx + 1, cy) != Content.NO_BLOCK;
         if ((bb.C==Content.HIT_BLOCK4
                 || bb.C==Content.HIT_BLOCK3_TL
                 || bb.C==Content.HIT_BLOCK3_TR) && (ball.getY() - ballRadius <= top))
-            bb.T = cellType(cx, cy - 1);
+            neighboursHit |= cellType(cx, cy - 1) != Content.NO_BLOCK;
         if ((bb.C==Content.HIT_BLOCK4
                 || bb.C==Content.HIT_BLOCK3_BR
                 || bb.C==Content.HIT_BLOCK3_BL) && (ball.getY() + ballRadius >= bot))
-            bb.B = cellType(cx, cy + 1);
+            neighboursHit |= cellType(cx, cy + 1) != Content.NO_BLOCK;
 
         // check diagonals
         if ( bb.C==Content.HIT_BLOCK3_BL || bb.C==Content.HIT_BLOCK3_TR ) {
@@ -1863,7 +2216,9 @@ return false;
 
 
 
-        if (bb.anyHit()) {
+        boolean centerHit = centerCellHasSolidOverlap(ball, cx, cy, bb.C);
+
+        if (centerHit || neighboursHit) {
             return true;
         }
 
@@ -1936,6 +2291,10 @@ return false;
     boolean stepBallOnceForTests(Ball ball) {
         float prevX = ball.getX();
         float prevY = ball.getY();
+        prevBallPosX = prevX;
+        prevBallPosY = prevY;
+        stepHitCellX = -1;
+        stepHitCellY = -1;
         float vLine = verticalReflectionLine(ball);
         float hLine = horizontalReflectionLine(ball);
 
@@ -1993,16 +2352,22 @@ return false;
             }
         }
 
-        Block cornerHitBlock = getCornerHitBlock(prevX, prevY, nextBallX, nextBallY);
-        if (cornerHitBlock != null) {
-            int hitBlockX = cornerHitBlock.getX();
-            int hitBlockY = cornerHitBlock.getY();
-            if (cellOccupiedWithRealBlock(hitBlockX, hitBlockY)) {
-                hit(hitBlockX, hitBlockY);
-                ballCollisionWithCorner(ball, cornerHitBlock.getHitCornerX(), cornerHitBlock.getHitCornerY(), prevX, prevY);
-                collisionResolved = true;
+        boolean hypHit = checkTriangleHypotenuses(prevX, prevY, ball);
+        if (hypHit) {
+            collisionResolved = true;
+        } else {
+            Block cornerHitBlock = getCornerHitBlock(prevX, prevY, nextBallX, nextBallY);
+            if (cornerHitBlock != null) {
+                int hitBlockX = cornerHitBlock.getX();
+                int hitBlockY = cornerHitBlock.getY();
+                if (cellOccupiedWithRealBlock(hitBlockX, hitBlockY)) {
+                    hit(hitBlockX, hitBlockY);
+                    ballCollisionWithCorner(ball, cornerHitBlock.getHitCornerX(), cornerHitBlock.getHitCornerY(), prevX, prevY);
+                    collisionResolved = true;
+                }
             }
         }
+        enforceCollisionInvariants(ball);
 
         return collisionResolved;
     }
