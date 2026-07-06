@@ -32,6 +32,12 @@ public class MainActivity extends AppCompatActivity {
                 WindowManager.LayoutParams.FLAG_FULLSCREEN
         );
 
+        // The game draws its own header (level/score/best); the system action bar would just
+        // eat screen space and visually collide with it.
+        if (getSupportActionBar() != null) {
+            getSupportActionBar().hide();
+        }
+
         // set content view to game so that objects of the game can be rendered to the screen
         SharedPreferences p = getPreferences(MODE_PRIVATE);
         game = new Game(this, p);

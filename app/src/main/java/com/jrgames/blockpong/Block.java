@@ -19,6 +19,10 @@ public abstract class Block {
     protected int y;
 
     protected int value;
+    // The value the block was created with. Kept separate from `value` (which counts down as the
+    // block is hit) so the block's color stays stable for its whole lifetime instead of drifting
+    // as it takes damage.
+    protected final int initialValue;
 
     private tEdge hitBorder;
     private float hitCornerX;
@@ -62,6 +66,7 @@ public abstract class Block {
         this.x = x;
         this.y = y;
         this.value = value;
+        this.initialValue = value;
 
 
         // fill
@@ -88,6 +93,7 @@ public abstract class Block {
         x = b.x;
         y = b.y;
         value = b.value;
+        initialValue = b.initialValue;
     }
 
     public void setCoords(int x, int y) {
@@ -108,14 +114,28 @@ public abstract class Block {
 
 
     protected int getTextColorFromValue() {
-        return Color.WHITE;
+        // Pick black or white text, whichever contrasts better against this block's fill color.
+        return perceivedLuminance(getRectColorFromValue()) > 0.6f ? Color.BLACK : Color.WHITE;
     }
 
+    private static float perceivedLuminance(int color) {
+        return (0.299f * Color.red(color) + 0.587f * Color.green(color) + 0.114f * Color.blue(color)) / 255f;
+    }
+
+    // Colored by the block's starting value (not its current, decreasing value) so a block's
+    // color stays put for its whole lifetime instead of drifting hit by hit. The hue cycles
+    // through the color wheel as the starting value grows, giving tougher blocks visibly
+    // different (and, past 15, repeating) colors rather than everything reading as "greenish".
     protected int getRectColorFromValue() {
-        return Color.rgb(20+value/2,90-value,value*3);
+        float hue = (initialValue * 24f) % 360f;
+        return Color.HSVToColor(new float[]{ hue, 0.65f, 0.90f });
     }
     public int getValue() {
         return value;
+    }
+
+    public int getInitialValue() {
+        return initialValue;
     }
 
     abstract public void draw(Canvas c);

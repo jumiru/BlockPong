@@ -89,6 +89,98 @@ public class GameBoardCollisionTest {
     }
 
     @Test
+    public void aimStraightUp_isUnaffectedByClamp() {
+        GameBoard gameBoard = createTestBoard();
+        float fx = gameBoard.getFirePosXForTests();
+        float fy = gameBoard.getFirePosYForTests();
+
+        gameBoard.touchDown(fx, fy - 300f);
+        gameBoard.touchRelease(fx, fy - 300f);
+
+        assertEquals(0f, gameBoard.getFireSpeedXForTests(), 0.5f);
+        assertTrue(gameBoard.getFireSpeedYForTests() < 0f);
+    }
+
+    @Test
+    public void aimBelowFireLine_getsClampedToUpwardMinimumAngle() {
+        GameBoard gameBoard = createTestBoard();
+        float fx = gameBoard.getFirePosXForTests();
+        float fy = gameBoard.getFirePosYForTests();
+
+        // Dragged down and to the right -- straight down toward/past the fire line, which must
+        // not be allowed to aim the ball away from the board.
+        gameBoard.touchDown(fx + 50f, fy + 50f);
+        gameBoard.touchRelease(fx + 300f, fy + 300f);
+
+        float dx = gameBoard.getFireSpeedXForTests();
+        float dy = gameBoard.getFireSpeedYForTests();
+        assertTrue("expected an upward shot, got dy=" + dy, dy < 0f);
+
+        double angleFromHorizontalDeg = Math.toDegrees(Math.atan2(-dy, Math.abs(dx)));
+        assertEquals(10.0, angleFromHorizontalDeg, 0.5);
+        assertTrue("expected a rightward shot, got dx=" + dx, dx > 0f);
+    }
+
+    @Test
+    public void aimBelowFireLineToTheLeft_getsClampedToUpwardMinimumAngle() {
+        GameBoard gameBoard = createTestBoard();
+        float fx = gameBoard.getFirePosXForTests();
+        float fy = gameBoard.getFirePosYForTests();
+
+        gameBoard.touchDown(fx - 50f, fy + 50f);
+        gameBoard.touchRelease(fx - 300f, fy + 300f);
+
+        float dx = gameBoard.getFireSpeedXForTests();
+        float dy = gameBoard.getFireSpeedYForTests();
+        assertTrue("expected an upward shot, got dy=" + dy, dy < 0f);
+
+        double angleFromHorizontalDeg = Math.toDegrees(Math.atan2(-dy, Math.abs(dx)));
+        assertEquals(10.0, angleFromHorizontalDeg, 0.5);
+        assertTrue("expected a leftward shot, got dx=" + dx, dx < 0f);
+    }
+
+    @Test
+    public void aimNearlyHorizontal_getsClampedToMinimumAngle() {
+        GameBoard gameBoard = createTestBoard();
+        float fx = gameBoard.getFirePosXForTests();
+        float fy = gameBoard.getFirePosYForTests();
+
+        // Just barely above the fire line -- an almost-flat shot that's still technically
+        // "upward" but shallower than the 10 degree floor.
+        gameBoard.touchDown(fx + 300f, fy - 5f);
+        gameBoard.touchRelease(fx + 300f, fy - 5f);
+
+        float dx = gameBoard.getFireSpeedXForTests();
+        float dy = gameBoard.getFireSpeedYForTests();
+        double angleFromHorizontalDeg = Math.toDegrees(Math.atan2(-dy, Math.abs(dx)));
+        assertEquals(10.0, angleFromHorizontalDeg, 0.5);
+    }
+
+    @Test
+    public void initBoard_loadsPredefinedLevelJsonWhenAvailable() {
+        String json = "{\"blocks\":["
+                + "{\"x\":2,\"y\":3,\"type\":\"square\",\"value\":7},"
+                + "{\"x\":5,\"y\":1,\"type\":\"tl\",\"value\":4}"
+                + "]}";
+        GameBoard gameBoard = new GameBoard(new FixedLevelCallbacks(json), 660f, 900f, 0f, 0f);
+
+        Block square = gameBoard.getBlock(2, 3);
+        assertNotNull(square);
+        assertEquals(7, square.getValue());
+
+        Block triangle = gameBoard.getBlock(5, 1);
+        assertNotNull(triangle);
+        assertTrue(triangle instanceof Block3);
+        assertEquals(Block3.tTriangle.TL, ((Block3) triangle).getType());
+    }
+
+    @Test
+    public void initBoard_fallsBackWithoutCrashingOnMalformedLevelJson() {
+        GameBoard gameBoard = new GameBoard(new FixedLevelCallbacks("not valid json"), 660f, 900f, 0f, 0f);
+        assertNotNull(gameBoard);
+    }
+
+    @Test
     public void debugReport_containsTemplateAndNearbyBlockSection() {
         GameBoard gameBoard = createTestBoard();
         gameBoard.placeSquareBlockForTests(4, 4, 7);
@@ -141,6 +233,51 @@ public class GameBoardCollisionTest {
         public void resetGameOver() {
             // Not needed for collision-only unit tests.
         }
+
+        @Override
+        public void addScore(int points) {
+            // Not needed for collision-only unit tests.
+        }
+
+        @Override
+        public String loadLevelJson(int level) {
+            return null;
+        }
+
+        @Override
+        public void onRoundEnd() {
+            // Not needed for collision-only unit tests.
+        }
+
+        @Override
+        public Bonus getArmedBonus() {
+            return null;
+        }
+
+        @Override
+        public Bonus consumeArmedBonus() {
+            return null;
+        }
+    }
+
+    private static final class FixedLevelCallbacks implements GameBoard.GameCallbacks {
+        private final String levelJson;
+
+        FixedLevelCallbacks(String levelJson) {
+            this.levelJson = levelJson;
+        }
+
+        @Override public int getLevel() { return 1; }
+        @Override public void addAnimation(Animation animation) {}
+        @Override public void increaselevel() {}
+        @Override public void setGameOver(boolean win) {}
+        @Override public boolean isGameOver() { return false; }
+        @Override public void resetGameOver() {}
+        @Override public void addScore(int points) {}
+        @Override public String loadLevelJson(int level) { return levelJson; }
+        @Override public void onRoundEnd() {}
+        @Override public Bonus getArmedBonus() { return null; }
+        @Override public Bonus consumeArmedBonus() { return null; }
     }
 }
 

@@ -188,5 +188,10 @@ public class FuzzCollisionTest {
         @Override public void setGameOver(boolean win) {}
         @Override public boolean isGameOver() { return false; }
         @Override public void resetGameOver() {}
+        @Override public void addScore(int points) {}
+        @Override public String loadLevelJson(int level) { return null; }
+        @Override public void onRoundEnd() {}
+        @Override public Bonus getArmedBonus() { return null; }
+        @Override public Bonus consumeArmedBonus() { return null; }
     }
 }

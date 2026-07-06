@@ -5,6 +5,10 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.util.HashMap;
 import java.util.Random;
 
@@ -17,9 +21,35 @@ public class GameBoard {
         void setGameOver(boolean win);
         boolean isGameOver();
         void resetGameOver();
+        void addScore(int points);
+        // Returns the predefined layout JSON for this level number, or null if none exists
+        // (in which case GameBoard falls back to its random layout generator).
+        String loadLevelJson(int level);
+        // Called once when a move (all balls back at rest) ends, so the round's score can be
+        // checked against the bonus-award threshold. See Game.onRoundEnd().
+        void onRoundEnd();
+        // The bonus currently armed via the bonus row (or null). EXTENDED_PATH and
+        // MOVE_START_POINT apply continuously while armed (aim preview / fire position), so
+        // GameBoard needs to read this without spending it.
+        Bonus getArmedBonus();
+        // Called right as a shot is launched; spends whichever bonus the player armed via the
+        // bonus row (decrementing its count and clearing the armed state), returning it (or null
+        // if none was armed) so GameBoard can apply its one-off effect.
+        Bonus consumeArmedBonus();
     }
 
     private static final float EPSILON = 1e-6f;
+    // Points awarded per hit = the block's starting value times this factor. Tougher blocks
+    // (higher starting value) are worth more per hit, and every hit counts, not just the kill.
+    private static final int POINTS_PER_VALUE = 1;
+    // EXTENDED_PATH bonus: how much longer the aim preview line gets while armed.
+    private static final float EXTENDED_PATH_LENGTH_MULTIPLIER = 1.6f;
+    // EXTRA_BALLS bonus: ball count is bumped up to this (permanently, if not already there)
+    // when spent.
+    private static final int EXTRA_BALLS_TARGET_COUNT = 20;
+    // MOVE_STOPPER bonus: set when spent, consumed (and cleared) by the next board-drop check in
+    // actionAfterBallRolling() so that one drop is skipped.
+    private boolean skipNextBoardDrop;
 
     private final float dirLineLength;
     private final Paint frozenBallPaint;
@@ -231,6 +261,8 @@ public class GameBoard {
 
     private Paint dirLinePaint;
 
+    private Paint gameOverLinePaint;
+
     private Paint debugTextPaint;
 
     private Block[][] blocks;
@@ -277,7 +309,7 @@ public class GameBoard {
         normSpeed = 50;
         numInitBalls = 10;
         xDim = 11; //11
-        yDim = 13; //11
+        yDim = 18; // game-over row moved further down so blocks have more room before it triggers
         ballRadius = 22; // 20
         dirLineLength = 1.3f*width;
         // Keep production gameplay clean; debug overlays can be enabled explicitly.
@@ -304,6 +336,10 @@ public class GameBoard {
 
         dirLinePaint = new Paint();
         dirLinePaint.setColor(Color.WHITE);
+
+        gameOverLinePaint = new Paint();
+        gameOverLinePaint.setColor(Color.rgb(200, 200, 200));
+        gameOverLinePaint.setStrokeWidth(1.5f);
 
         debugTextPaint = new Paint();
         debugTextPaint.setColor(Color.WHITE);
@@ -378,32 +414,11 @@ public class GameBoard {
                     blocks[x][y] = null;
                 }
             }
-            for ( int y = 0; y < yDim-2; y++) {
-                for ( int x = 0; x < xDim; x++ ) {
-                    if (rand.nextInt(10) <= game.getLevel() )  {
-                        int v = rand.nextInt(5*game.getLevel())+1;
-                        if (rand.nextBoolean()) {
-                            blocks[x][y] = new Block4(this, x, y, v);
-                        } else {
-                            Block3.tTriangle type = Block3.tTriangle.BL;
-                            switch (rand.nextInt(4)) {
-                                case 0:
-                                    type = Block3.tTriangle.BL;
-                                    break;
-                                case 1:
-                                    type = Block3.tTriangle.BR;
-                                    break;
-                                case 2:
-                                    type = Block3.tTriangle.TL;
-                                    break;
-                                case 3:
-                                    type = Block3.tTriangle.TR;
-                                    break;
-                            }
-                            blocks[x][y] = new Block3(this, x, y, type, v);
-                        }
-                    }
-                }
+            String levelJson = game.loadLevelJson(game.getLevel());
+            if (levelJson != null) {
+                loadBlocksFromJson(levelJson);
+            } else {
+                randomBoard();
             }
         }
 
@@ -437,7 +452,110 @@ public class GameBoard {
         freezeBall = 0;
     }
 
+    // Same random layout the game always used, kept as the fallback for levels without a
+    // predefined layout file (see loadBlocksFromJson).
+    private void randomBoard() {
+        int lastRow = yDim - 3;
+        for ( int y = 0; y < yDim-2; y++) {
+            // Lower rows (closer to the paddle) get less weight so the board is easier to clear:
+            // both block density and block toughness taper off towards the bottom.
+            double rowFactor = 1.0 - 0.5 * y / lastRow;
+            int rowLevel = Math.max(1, (int) Math.round(game.getLevel() * rowFactor));
+            for ( int x = 0; x < xDim; x++ ) {
+                if (rand.nextInt(10) <= rowLevel )  {
+                    int v = rand.nextInt(5*rowLevel)+1;
+                    if (rand.nextBoolean()) {
+                        blocks[x][y] = new Block4(this, x, y, v);
+                    } else {
+                        Block3.tTriangle type = Block3.tTriangle.BL;
+                        switch (rand.nextInt(4)) {
+                            case 0:
+                                type = Block3.tTriangle.BL;
+                                break;
+                            case 1:
+                                type = Block3.tTriangle.BR;
+                                break;
+                            case 2:
+                                type = Block3.tTriangle.TL;
+                                break;
+                            case 3:
+                                type = Block3.tTriangle.TR;
+                                break;
+                        }
+                        blocks[x][y] = new Block3(this, x, y, type, v);
+                    }
+                }
+            }
+        }
+    }
 
+    // Loads a predefined level layout, as produced by tools/level_editor.py. Format:
+    // {"blocks": [{"x":0,"y":0,"type":"square","value":5}, {"x":1,"y":2,"type":"tl","value":3}, ...]}
+    // "type" is "square" for a Block4, or one of "bl"/"tl"/"tr"/"br" for a Block3 triangle
+    // (matching Block3.tTriangle, lowercased). Cells outside the playable area (the bottom two
+    // rows are reserved, same as randomBoard()) are ignored. Falls back to a random board if the
+    // JSON is malformed, so a broken level file can't leave the board empty.
+    private void loadBlocksFromJson(String json) {
+        try {
+            JSONObject root = new JSONObject(json);
+            JSONArray blockArray = root.getJSONArray("blocks");
+            for (int i = 0; i < blockArray.length(); i++) {
+                JSONObject b = blockArray.getJSONObject(i);
+                int x = b.getInt("x");
+                int y = b.getInt("y");
+                int value = b.getInt("value");
+                String type = b.getString("type");
+                if (!inXRange(x) || y < 0 || y >= yDim - 2) continue;
+
+                if ("square".equals(type)) {
+                    blocks[x][y] = new Block4(this, x, y, value);
+                } else {
+                    Block3.tTriangle triangleType = Block3.tTriangle.valueOf(type.toUpperCase());
+                    blocks[x][y] = new Block3(this, x, y, triangleType, value);
+                }
+            }
+        } catch (JSONException | IllegalArgumentException e) {
+            System.out.println("Malformed level JSON for level " + game.getLevel() + ": " + e.getMessage());
+            randomBoard();
+        }
+    }
+
+    // Serializes the current board -- including blocks already partially worn down by hits --
+    // into the same JSON shape loadBlocksFromJson() reads, so an in-progress game can be
+    // restored verbatim after the process was killed (see Game.saveState()/restoreState()).
+    public String exportBlocksJson() {
+        try {
+            JSONArray blockArray = new JSONArray();
+            for (int y = 0; y < yDim - 2; y++) {
+                for (int x = 0; x < xDim; x++) {
+                    Block b = blocks[x][y];
+                    if (b == null) continue;
+                    JSONObject o = new JSONObject();
+                    o.put("x", x);
+                    o.put("y", y);
+                    o.put("value", b.getValue());
+                    o.put("type", (b instanceof Block3) ? ((Block3) b).getType().name().toLowerCase() : "square");
+                    blockArray.put(o);
+                }
+            }
+            JSONObject root = new JSONObject();
+            root.put("blocks", blockArray);
+            return root.toString();
+        } catch (JSONException e) {
+            return null;
+        }
+    }
+
+    // Counterpart to exportBlocksJson(): clears the board initBoard() just generated and
+    // replaces it with the previously saved layout.
+    public void restoreBlocksFromJson(String json) {
+        for (int y = 0; y < yDim; y++) {
+            for (int x = 0; x < xDim; x++) {
+                blocks[x][y] = null;
+            }
+        }
+        loadBlocksFromJson(json);
+    }
 
     private void addBall(int index) {
         assert( numBalls < maxNumBalls);
@@ -467,6 +585,10 @@ public class GameBoard {
             balls[b].draw(c);
         }
 
+
+        // game-over line: marks the bottom of the row that ends the game if it holds a block
+        float gameOverLineY = bottom(yDim - 1);
+        c.drawLine(offsetX, gameOverLineY, offsetX + width, gameOverLineY, gameOverLinePaint);
 
         // draw boundaries
         //left border
@@ -538,8 +660,13 @@ public class GameBoard {
         float vx = (x1-x0)/lenOfSelection;
         float vy = (y1-y0)/lenOfSelection;
 
-        x1 = x0+vx*dirLineLength;
-        y1 = y0+vy*dirLineLength;
+        // EXTENDED_PATH bonus: longer preview while armed, to help aim at higher rows.
+        float effectiveDirLineLength = (game.getArmedBonus() == Bonus.EXTENDED_PATH)
+                ? dirLineLength * EXTENDED_PATH_LENGTH_MULTIPLIER
+                : dirLineLength;
+
+        x1 = x0+vx*effectiveDirLineLength;
+        y1 = y0+vy*effectiveDirLineLength;
 
         float leftMirrorLine = offsetX+ballRadius;
         float rightMirrorLine = offsetX+width-ballRadius;
@@ -725,6 +852,11 @@ public class GameBoard {
                         }
                     }
                 }
+
+                // Stop processing further balls this tick once one of them has frozen the game --
+                // otherwise later balls in the loop keep moving physically and overwrite the
+                // shared prevBallPosX/nextBallX diagnostic fields, corrupting the freeze report.
+                if (freeze) break;
             }
         } else if (!endOfRollingPhase) {
             endOfRollingPhase = true;
@@ -841,6 +973,11 @@ public class GameBoard {
             if (ballRolling()) return true;
             else {
                 ballDropRunning = false;
+                // Mark the round as already handled so the main update() loop below doesn't see
+                // endOfRollingPhase still false and call actionAfterBallRolling() a second time
+                // this same tick (that used to double the BoardDropAnimation, dropping the board
+                // by two rows instead of one).
+                endOfRollingPhase = true;
                 actionAfterBallRolling();
             }
         }
@@ -1718,11 +1855,14 @@ return false;
         sb.append("Prev pos (x,y): ").append(prevBallPosX).append(", ").append(prevBallPosY).append('\n');
         sb.append("Next pos (x,y): ").append(nextBallX).append(", ").append(nextBallY).append('\n');
 
-        if (freezeBall >= 0 && freezeBall < numBalls && balls[freezeBall] != null) {
+        if (frozenBall != null) {
+            // frozenBall is a snapshot taken before freeze() zeroes every ball's speed, so it
+            // still holds the actual velocity at the moment of the freeze (unlike balls[freezeBall],
+            // which would always read back (0,0) here).
             sb.append("Velocity (dx,dy): ")
-                    .append(balls[freezeBall].getDx())
+                    .append(frozenBall.getDx())
                     .append(", ")
-                    .append(balls[freezeBall].getDy())
+                    .append(frozenBall.getDy())
                     .append('\n');
         } else {
             sb.append("Velocity (dx,dy): n/a\n");
@@ -1817,6 +1957,9 @@ return false;
                 return;
             }
             b.hit();
+            int points = b.getInitialValue() * POINTS_PER_VALUE;
+            game.addScore(points);
+            game.addAnimation(new ScorePopupAnimation(this, 25, b.getX(), b.getY(), points));
             if (b.getValue() == 0) {
                 game.addAnimation(new DissolveBlockAnimation(this, 10, b.getX(), b.getY()));
                 blocks[b.getX()][b.getY()] = null;
@@ -1836,6 +1979,10 @@ return false;
         //freeze("ballAtEnd",0);
         if (freeze) return;
 
+        // Award a bonus if this move's score cleared the threshold, regardless of whether the
+        // move also ended the level, ended the game, or just triggered the normal board drop.
+        game.onRoundEnd();
+
         // check for game win
         if (gameBoardEmpty()) {
             game.increaselevel();
@@ -1851,6 +1998,12 @@ return false;
                     if (autoPlayMode) {
                         game.addAnimation(new TouchReleaseAnimation(this, 100));
                     }
+                }
+            } else if (skipNextBoardDrop) {
+                // MOVE_STOPPER bonus: skip exactly one automatic board drop.
+                skipNextBoardDrop = false;
+                if (autoPlayMode) {
+                    game.addAnimation(new TouchReleaseAnimation(this,50));
                 }
             } else {
                 // shift all blocks downwards
@@ -1909,6 +2062,31 @@ return false;
     }
 
 
+    // The aim direction must always point up into the board and stay at least this many degrees
+    // away from the horizontal on either side (an all but flat shot would be unplayable, and one
+    // pointing below horizontal would send the ball away from the board entirely).
+    private static final float MIN_LAUNCH_ANGLE_DEG = 10f;
+    // Same bound expressed as the max deviation from straight up, which is what the atan2 below
+    // is measured against.
+    private static final float MAX_AIM_ANGLE_FROM_UP_DEG = 90f - MIN_LAUNCH_ANGLE_DEG;
+
+    // Clamps a raw (dx,dy) aim vector (screen coords, y grows downward) so its angle from
+    // straight up never exceeds MAX_AIM_ANGLE_FROM_UP_DEG on either side. This is applied to
+    // every touch point that feeds the aim line or the launch velocity, so a drag toward or past
+    // the bottom of the screen can't select a downward or unplayably shallow shot -- it just
+    // clamps at the steepest angle still allowed, same as dragging past a joystick's edge.
+    private float[] clampAimVector(float dx, float dy) {
+        float len = (float) Math.sqrt(dx * dx + dy * dy);
+        if (len <= EPSILON) {
+            return new float[]{0f, -1f};
+        }
+        double phiDeg = Math.toDegrees(Math.atan2(dx, -dy)); // 0 = straight up, +-90 = horizontal
+        if (phiDeg > MAX_AIM_ANGLE_FROM_UP_DEG) phiDeg = MAX_AIM_ANGLE_FROM_UP_DEG;
+        if (phiDeg < -MAX_AIM_ANGLE_FROM_UP_DEG) phiDeg = -MAX_AIM_ANGLE_FROM_UP_DEG;
+        double rad = Math.toRadians(phiDeg);
+        return new float[]{ len * (float) Math.sin(rad), -len * (float) Math.cos(rad) };
+    }
+
     private void setFireSpeed(float dx, float dy) {
         float len = (float)Math.sqrt((dx*dx) + (dy*dy));
         if (len <= EPSILON) {
@@ -1927,6 +2105,30 @@ return false;
             if (!balls[b].isStill()) return true;
         }
         return result;
+    }
+
+    // Applies the one-off effect of whichever bonus was just spent on this shot (or does nothing
+    // if none was armed). EXTENDED_PATH and MOVE_START_POINT aren't handled here -- they act
+    // continuously while armed (see drawDirLine() and touchDown()), so there's nothing left to do
+    // once the shot fires.
+    private void applyConsumedBonus(Bonus bonus) {
+        if (bonus == null) return;
+        switch (bonus) {
+            case MOVE_STOPPER:
+                skipNextBoardDrop = true;
+                break;
+            case LINE_DELETE:
+                game.addAnimation(new LineDeleteAnimation(this, 30));
+                break;
+            case EXTRA_BALLS:
+                while (numBalls < EXTRA_BALLS_TARGET_COUNT && numBalls < maxNumBalls) {
+                    addBall(numBalls);
+                }
+                break;
+            case EXTENDED_PATH:
+            case MOVE_START_POINT:
+                break;
+        }
     }
 
     public void touchDown(float x, float y) {
@@ -1948,12 +2150,17 @@ return false;
         }
 
         if (!ballRolling()) {
-            if (y>0.9f*height+offsetY) {
-                y = 0.9f*height+offsetY;
+            // MOVE_START_POINT bonus: while armed, the initial touch-down x position plants the
+            // fire point there instead of the usual auto-follow position (see fire() callers).
+            if (game.getArmedBonus() == Bonus.MOVE_START_POINT) {
+                float minX = offsetX + ballRadius;
+                float maxX = offsetX + width - ballRadius;
+                newFirePosX = Math.max(minX, Math.min(maxX, x));
             }
             dirLineActive = true;
-            dirLineX = x;
-            dirLineY = y;
+            float[] v = clampAimVector(x - newFirePosX, y - firePosY);
+            dirLineX = newFirePosX + v[0];
+            dirLineY = firePosY + v[1];
         } else {
             startPosXTouch = x;
             startPosYTouch = y;
@@ -1962,28 +2169,23 @@ return false;
 
     public void touchMove(float x, float y) {
         if (dirLineActive) {
-            if (y>0.9f*height+offsetY) {
-                y = 0.9f*height+offsetY;
-            }
-            dirLineX = x;
-            dirLineY = y;
+            float[] v = clampAimVector(x - newFirePosX, y - firePosY);
+            dirLineX = newFirePosX + v[0];
+            dirLineY = firePosY + v[1];
         }
     }
 
     public void touchRelease(float x, float y) {
         if (dirLineActive) {
-            if (y>0.9f*height+offsetY) {
-                y = 0.9f*height+offsetY;
-            }
-
             if ( !reusePreviousFireSpeed) {
                 firePosX = newFirePosX;
 
-                float dx = x - firePosX;
-                float dy = y - firePosY;
-
-                setFireSpeed(dx, dy);
+                float[] v = clampAimVector(x - firePosX, y - firePosY);
+                setFireSpeed(v[0], v[1]);
             }
+            // Applied before fire() so EXTRA_BALLS' extra balls are already in place for this
+            // shot's launch sequence.
+            applyConsumedBonus(game.consumeArmedBonus());
             fire();
             dirLineActive = false;
             endOfRollingPhase = false;
@@ -2052,6 +2254,34 @@ return false;
         }
         for (int x = 0; x < xDim; x++) {
             blocks[x][0] = null;
+        }
+        createBoardCopy();
+    }
+
+    // LINE_DELETE bonus: removes the topmost non-empty row and shifts every row below it up by
+    // one cell (the inverse of dropAllBlocksByOneCell()), clearing the last playable row that's
+    // now vacated. No-op if the board is empty.
+    public void deleteLineAndShiftUp() {
+        int lastPlayableRow = yDim - 3;
+        int rowToDelete = -1;
+        for (int y = 0; y <= lastPlayableRow; y++) {
+            if (hasBlocksInRow(y)) {
+                rowToDelete = y;
+                break;
+            }
+        }
+        if (rowToDelete == -1) return;
+
+        for (int y = rowToDelete; y < lastPlayableRow; y++) {
+            for (int x = 0; x < xDim; x++) {
+                blocks[x][y] = blocks[x][y + 1];
+                if (blocks[x][y] != null) {
+                    blocks[x][y].setCoords(x, y);
+                }
+            }
+        }
+        for (int x = 0; x < xDim; x++) {
+            blocks[x][lastPlayableRow] = null;
         }
         createBoardCopy();
     }
@@ -2286,6 +2516,22 @@ return false;
 
     float getBallRadiusForTests() {
         return ballRadius;
+    }
+
+    float getFirePosXForTests() {
+        return firePosX;
+    }
+
+    float getFirePosYForTests() {
+        return firePosY;
+    }
+
+    float getFireSpeedXForTests() {
+        return fireSpeedX;
+    }
+
+    float getFireSpeedYForTests() {
+        return fireSpeedY;
     }
 
     boolean stepBallOnceForTests(Ball ball) {
