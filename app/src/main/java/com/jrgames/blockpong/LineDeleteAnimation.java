@@ -2,15 +2,17 @@ package com.jrgames.blockpong;
 
 import android.graphics.Canvas;
 
-// LINE_DELETE bonus: mirrors BoardDropAnimation but slides the board up by one cell instead of
-// down (see GameBoard.deleteLineAndShiftUp()).
+// LINE_DELETE bonus: mirrors BoardDropAnimation but slides rowToDelete and everything below it
+// up by one cell instead of dropping the whole board down (see GameBoard.deleteLineAndShiftUp()).
 public class LineDeleteAnimation extends Animation {
 
     private final float dy;
+    private final int rowToDelete;
 
-    public LineDeleteAnimation(GameBoard gb, int dur) {
+    public LineDeleteAnimation(GameBoard gb, int dur, int rowToDelete) {
         super(gb, dur);
 
+        this.rowToDelete = rowToDelete;
         dy = -gb.getBlockHeight() / dur;
     }
 
@@ -21,10 +23,10 @@ public class LineDeleteAnimation extends Animation {
 
     @Override
     public boolean update() {
-        gb.moveAllBlocks(dy);
+        gb.moveBlocksFromRow(rowToDelete, dy);
         animationCycle++;
         if (animationCycle >= animationDuration) {
-            gb.deleteLineAndShiftUp();
+            gb.deleteLineAndShiftUp(rowToDelete);
             return true;
         }
         return false;

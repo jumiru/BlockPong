@@ -9,7 +9,10 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Random;
 
 public class GameBoard {
@@ -25,17 +28,20 @@ public class GameBoard {
         // Returns the predefined layout JSON for this level number, or null if none exists
         // (in which case GameBoard falls back to its random layout generator).
         String loadLevelJson(int level);
-        // Called once when a move (all balls back at rest) ends, so the round's score can be
-        // checked against the bonus-award threshold. See Game.onRoundEnd().
-        void onRoundEnd();
-        // The bonus currently armed via the bonus row (or null). EXTENDED_PATH and
-        // MOVE_START_POINT apply continuously while armed (aim preview / fire position), so
-        // GameBoard needs to read this without spending it.
-        Bonus getArmedBonus();
-        // Called right as a shot is launched; spends whichever bonus the player armed via the
-        // bonus row (decrementing its count and clearing the armed state), returning it (or null
-        // if none was armed) so GameBoard can apply its one-off effect.
-        Bonus consumeArmedBonus();
+        // Called once when a move (all balls back at rest) ends, reporting how many blocks this
+        // shot destroyed (see GameBoard.hit()) and how many balls it was fired with, so the
+        // shot-statistics histogram can be updated and the bonus-award threshold checked. See
+        // Game.onRoundEnd().
+        void onRoundEnd(int blocksCleared, int ballsUsed);
+        // Whether the given bonus is currently armed via the bonus row -- several can be armed at
+        // once (see Game.armedBonuses). EXTENDED_PATH and MOVE_START_POINT apply continuously
+        // while armed (aim preview / fire position), so GameBoard needs to read this without
+        // spending them.
+        boolean isBonusArmed(Bonus bonus);
+        // Called right as a shot is launched; spends every bonus the player armed via the bonus
+        // row (decrementing each one's count and clearing the armed state), returning them (empty
+        // if none were armed) so GameBoard can apply each one's one-off effect.
+        List<Bonus> consumeArmedBonuses();
     }
 
     private static final float EPSILON = 1e-6f;
@@ -258,6 +264,9 @@ public class GameBoard {
     private boolean dirLineActive;
     private float dirLineX;
     private float dirLineY;
+    // MOVE_START_POINT bonus: true while the current drag is still relocating the start ball
+    // (see touchDown()/touchMove()); goes false once the touch crosses into the playing field.
+    private boolean movingStartPoint;
 
     private Paint dirLinePaint;
 
@@ -293,6 +302,43 @@ public class GameBoard {
     private boolean debugSupport;
 
     private BB bb;
+
+    // Recording of the currently in-flight move, and the last completed move, for the "Replay in
+    // slow motion" and "Letzten Zug exportieren" burger-menu actions. A move runs from fire() to
+    // actionAfterBallRolling(); each tick records ball positions plus every block's remaining
+    // value (-1 = destroyed) so the replay can show both balls flying and blocks disappearing
+    // without re-simulating physics.
+    private boolean recordingMove;
+    private List<ReplayFrame> recordingFrames;
+    private Block[][] recordingBlockSnapshot;
+    private int recordingNumBalls;
+    private float recordingFirePosX;
+    private float recordingFireSpeedX;
+    private float recordingFireSpeedY;
+    private List<Bonus> recordingBonuses = Collections.emptyList();
+
+    private List<ReplayFrame> lastMoveFrames;
+    private Block[][] lastMoveBlockSnapshot;
+    private float lastMoveFirePosX;
+    private float lastMoveFireSpeedX;
+    private float lastMoveFireSpeedY;
+    private List<Bonus> lastMoveBonuses = Collections.emptyList();
+
+    // Count of blocks fully destroyed (see hit()) during the currently in-flight move, reset in
+    // fire() and reported to Game.onRoundEnd() once the move ends (see actionAfterBallRolling()).
+    private int blocksClearedThisMove;
+
+    private static class ReplayFrame {
+        final float[] ballX;
+        final float[] ballY;
+        final int[] blockValues; // flattened index x*yDim+y; -1 = block absent at this tick
+
+        ReplayFrame(float[] ballX, float[] ballY, int[] blockValues) {
+            this.ballX = ballX;
+            this.ballY = ballY;
+            this.blockValues = blockValues;
+        }
+    }
 
 
     public GameBoard(Game game, float width, float height, float offsetX, float offsetY) {
@@ -452,18 +498,24 @@ public class GameBoard {
         freezeBall = 0;
     }
 
-    // Same random layout the game always used, kept as the fallback for levels without a
-    // predefined layout file (see loadBlocksFromJson).
+    // Fallback for levels beyond the last predefined layout (see loadBlocksFromJson and the
+    // level*.json files under assets/levels/, authored up to level 40). Continues that curve
+    // gently instead of scaling density/value linearly with the raw level number the way this
+    // used to -- that reached max-value, near-solid boards within about 20 levels.
     private void randomBoard() {
         int lastRow = yDim - 3;
+        int level = game.getLevel();
+        double maxValueAtTop = 27.0 + 0.15 * Math.max(0, level - 40);
+        double densityAtTop = Math.min(0.7, 0.5 + 0.001 * Math.max(0, level - 40));
         for ( int y = 0; y < yDim-2; y++) {
             // Lower rows (closer to the paddle) get less weight so the board is easier to clear:
             // both block density and block toughness taper off towards the bottom.
             double rowFactor = 1.0 - 0.5 * y / lastRow;
-            int rowLevel = Math.max(1, (int) Math.round(game.getLevel() * rowFactor));
+            int rowMaxValue = Math.max(1, (int) Math.round(maxValueAtTop * rowFactor));
+            double rowDensity = densityAtTop * rowFactor;
             for ( int x = 0; x < xDim; x++ ) {
-                if (rand.nextInt(10) <= rowLevel )  {
-                    int v = rand.nextInt(5*rowLevel)+1;
+                if (rand.nextDouble() < rowDensity)  {
+                    int v = rand.nextInt(rowMaxValue)+1;
                     if (rand.nextBoolean()) {
                         blocks[x][y] = new Block4(this, x, y, v);
                     } else {
@@ -524,11 +576,18 @@ public class GameBoard {
     // into the same JSON shape loadBlocksFromJson() reads, so an in-progress game can be
     // restored verbatim after the process was killed (see Game.saveState()/restoreState()).
     public String exportBlocksJson() {
+        return exportBlocksJson(blocks);
+    }
+
+    // grid variant of the above, so other block-grid snapshots (e.g. lastMoveBlockSnapshot, for
+    // getLastMoveReport()) can be exported in the same reproducible, tools/level_editor.py
+    // compatible format without duplicating the serialization logic.
+    private String exportBlocksJson(Block[][] grid) {
         try {
             JSONArray blockArray = new JSONArray();
             for (int y = 0; y < yDim - 2; y++) {
                 for (int x = 0; x < xDim; x++) {
-                    Block b = blocks[x][y];
+                    Block b = grid[x][y];
                     if (b == null) continue;
                     JSONObject o = new JSONObject();
                     o.put("x", x);
@@ -575,7 +634,7 @@ public class GameBoard {
             }
         }
 
-        if (dirLineActive || debugSupport) {
+        if ((dirLineActive && !movingStartPoint) || debugSupport) {
             drawDirLine(c);
         }
 
@@ -587,7 +646,7 @@ public class GameBoard {
 
 
         // game-over line: marks the bottom of the row that ends the game if it holds a block
-        float gameOverLineY = bottom(yDim - 1);
+        float gameOverLineY = gameOverLineY();
         c.drawLine(offsetX, gameOverLineY, offsetX + width, gameOverLineY, gameOverLinePaint);
 
         // draw boundaries
@@ -661,7 +720,7 @@ public class GameBoard {
         float vy = (y1-y0)/lenOfSelection;
 
         // EXTENDED_PATH bonus: longer preview while armed, to help aim at higher rows.
-        float effectiveDirLineLength = (game.getArmedBonus() == Bonus.EXTENDED_PATH)
+        float effectiveDirLineLength = game.isBonusArmed(Bonus.EXTENDED_PATH)
                 ? dirLineLength * EXTENDED_PATH_LENGTH_MULTIPLIER
                 : dirLineLength;
 
@@ -857,6 +916,10 @@ public class GameBoard {
                 // otherwise later balls in the loop keep moving physically and overwrite the
                 // shared prevBallPosX/nextBallX diagnostic fields, corrupting the freeze report.
                 if (freeze) break;
+            }
+
+            if (recordingMove && !freeze) {
+                captureReplayFrame();
             }
         } else if (!endOfRollingPhase) {
             endOfRollingPhase = true;
@@ -1194,10 +1257,25 @@ public class GameBoard {
         return t >= -EPSILON && t <= 1 + EPSILON;
     }
 
-    private boolean checkTriangleHypotenuses(float prevX, float prevY, Ball ball) {
-        float dx = ball.getDx(), dy = ball.getDy();
-        int cx1 = getXBlock(prevX),      cy1 = getYBlock(prevY);
-        int cx2 = getXBlock(ball.getX()), cy2 = getYBlock(ball.getY());
+    // One hypotenuse (or shared-vertex tip) hit found by findNearestTriangleHit: the block at
+    // (cx,cy), the time t (in [0, maxT] of the search segment) at which the ball's center first
+    // reaches trigger distance, the contact point (hx,hy), and the post-bounce velocity.
+    private static final class TriangleHit {
+        final int cx, cy;
+        final float t, hx, hy, newDx, newDy;
+        TriangleHit(int cx, int cy, float t, float hx, float hy, float newDx, float newDy) {
+            this.cx = cx; this.cy = cy; this.t = t;
+            this.hx = hx; this.hy = hy; this.newDx = newDx; this.newDy = newDy;
+        }
+    }
+
+    // Finds the nearest triangle-hypotenuse (or shared-vertex tip) hit along the segment from
+    // (startX,startY) to (startX + maxT*dx, startY + maxT*dy), i.e. t restricted to [0, maxT]
+    // instead of the fixed [0,1] of a full step. Used by checkTriangleHypotenuses to resolve
+    // every bounce within a step, not just the first.
+    private TriangleHit findNearestTriangleHit(float startX, float startY, float dx, float dy, float maxT) {
+        int cx1 = getXBlock(startX), cy1 = getYBlock(startY);
+        int cx2 = getXBlock(startX + maxT * dx), cy2 = getYBlock(startY + maxT * dy);
         int xFrom = Math.max(0,      Math.min(cx1, cx2) - 1);
         int xTo   = Math.min(xDim-1, Math.max(cx1, cx2) + 1);
         int yFrom = Math.max(0,      Math.min(cy1, cy2) - 1);
@@ -1227,10 +1305,10 @@ public class GameBoard {
                 // TL/BR line: x + y - (right  + top)   = 0
                 float lineVal, lineDot;
                 if (isBLorTR) {
-                    lineVal = prevX - prevY + (by - rx);
+                    lineVal = startX - startY + (by - rx);
                     lineDot = dx - dy;
                 } else {
-                    lineVal = prevX + prevY - (rx + ty);
+                    lineVal = startX + startY - (rx + ty);
                     lineDot = dx + dy;
                 }
 
@@ -1243,17 +1321,17 @@ public class GameBoard {
                 // Must genuinely be approaching from outside the trigger radius. Without this,
                 // a ball that already starts within the trigger zone but is moving AWAY from the
                 // hypotenuse (e.g. right after a previous bounce) would still solve for a t in
-                // [0,1] where |lineVal| grows back out to triggerDist, registering a bogus hit.
+                // [0,maxT] where |lineVal| grows back out to triggerDist, registering a bogus hit.
                 if (emptyIsNeg ? (lineVal > -triggerDist) : (lineVal < triggerDist)) continue;
 
                 // t at which |lineVal + t*lineDot| == triggerDist (first hit from empty side)
                 float targetVal = emptyIsNeg ? -triggerDist : triggerDist;
                 float t = (targetVal - lineVal) / lineDot;
-                if (t < 0 || t > 1) continue;
+                if (t < 0 || t > maxT) continue;
 
                 // Centre position at the moment of contact
-                float hx = prevX + t * dx;
-                float hy = prevY + t * dy;
+                float hx = startX + t * dx;
+                float hy = startY + t * dy;
 
                 // Verify the contact lies within the hypotenuse segment
                 float sx1, sy1, sx2, sy2;
@@ -1269,12 +1347,12 @@ public class GameBoard {
                     // touches that point (it assumes that means a flat interior wall, not a tip).
                     float ex = tSeg < 0 ? sx1 : sx2;
                     float ey = tSeg < 0 ? sy1 : sy2;
-                    float tc = timeToReachCorner(prevX, prevY, dx, dy, ex, ey);
-                    if (tc < minT) {
+                    float tc = timeToReachCorner(startX, startY, dx, dy, ex, ey);
+                    if (tc <= maxT && tc < minT) {
                         minT = tc;
                         minCx = cx; minCy = cy;
-                        float cHitX = prevX + tc * dx;
-                        float cHitY = prevY + tc * dy;
+                        float cHitX = startX + tc * dx;
+                        float cHitY = startY + tc * dy;
                         float[] newVel = reflectVelocityOffCorner(dx, dy, cHitX, cHitY, ex, ey);
                         minNewDx = newVel[0];
                         minNewDy = newVel[1];
@@ -1294,13 +1372,81 @@ public class GameBoard {
             }
         }
 
-        if (minCx < 0) return false;
+        if (minCx < 0) return null;
+        return new TriangleHit(minCx, minCy, minT, minHx, minHy, minNewDx, minNewDy);
+    }
 
-        float frac = 1f - minT;
-        ball.setSpeed(minNewDx, minNewDy);
-        ball.setPos(minHx + frac * minNewDx, minHy + frac * minNewDy);
-        hit(minCx, minCy);
-        return true;
+    // Number of same-step triangle bounces to resolve before giving up. Only matters for
+    // geometrically-impossible cases like two adjacent same-orientation triangles forming a
+    // corridor narrower than the ball (see enforceTriangleClearance/-SquareClearance): the ball
+    // keeps bouncing between them and never escapes, so the cap stops the search rather than
+    // looping until the step's whole time budget is exhausted mid-bounce.
+    private static final int MAX_TRIANGLE_BOUNCES_PER_STEP = 8;
+
+    private boolean checkTriangleHypotenuses(float prevX, float prevY, Ball ball) {
+        float curX = prevX, curY = prevY;
+        float remaining = 1f;
+        boolean anyHit = false;
+        // Cells already credited with a hit this call, so a ball bouncing back and forth between
+        // two blocks within one step (the narrow-corridor case) doesn't double-hit either one.
+        int[] hitCx = new int[MAX_TRIANGLE_BOUNCES_PER_STEP];
+        int[] hitCy = new int[MAX_TRIANGLE_BOUNCES_PER_STEP];
+        int hitCount = 0;
+
+        // A single tick can involve more than one hypotenuse bounce -- e.g. two adjacent
+        // same-orientation triangles forming a narrow zigzag corridor. Resolving only the first
+        // bounce and extrapolating the rest of the step unchecked used to let the ball tunnel
+        // into the next triangle's solid area, which enforceTriangleClearance/-SquareClearance
+        // would then shove it back out of on the *next* tick -- producing a large net jump and
+        // tripping the "moved too far" sanity check. Keep resolving bounces against whatever's
+        // left of the step instead.
+        for (int bounce = 0; bounce < MAX_TRIANGLE_BOUNCES_PER_STEP && remaining > EPSILON; bounce++) {
+            TriangleHit hitResult = findNearestTriangleHit(curX, curY, ball.getDx(), ball.getDy(), remaining);
+            if (hitResult == null) {
+                // Nothing more to hit in what's left of the step -- cover it in a straight line,
+                // unless that lands the ball inside another block's solid area. That happens when
+                // two adjacent same-orientation triangles form a corridor narrower than the ball:
+                // the block just bounced off correctly reflects the ball, but its hypotenuse line,
+                // extended past its own finite segment, already reads as "solid" for the next
+                // block's line well before the ball geometrically reaches it -- so
+                // findNearestTriangleHit can't see that second collision coming (see
+                // enforceTriangleClearance/-SquareClearance for the same corridor case handled
+                // after the fact). Rather than tunnel into it, stay at the bounce point this tick;
+                // the next tick starts the search fresh from a position that's actually clear.
+                if (anyHit) {
+                    float endX = curX + remaining * ball.getDx();
+                    float endY = curY + remaining * ball.getDy();
+                    ball.setPos(endX, endY);
+                    if (ballOnBlock(ball)) {
+                        ball.setPos(curX, curY);
+                    }
+                }
+                return anyHit;
+            }
+
+            anyHit = true;
+            remaining -= hitResult.t;
+            ball.setSpeed(hitResult.newDx, hitResult.newDy);
+            curX = hitResult.hx;
+            curY = hitResult.hy;
+            ball.setPos(curX, curY);
+
+            boolean alreadyCredited = false;
+            for (int i = 0; i < hitCount; i++) {
+                if (hitCx[i] == hitResult.cx && hitCy[i] == hitResult.cy) { alreadyCredited = true; break; }
+            }
+            if (!alreadyCredited) {
+                hit(hitResult.cx, hitResult.cy);
+                hitCx[hitCount] = hitResult.cx;
+                hitCy[hitCount] = hitResult.cy;
+                hitCount++;
+            }
+        }
+
+        // Either the step's remaining distance was fully consumed by bounces, or the bounce cap
+        // was hit. Either way, leave the ball at its last bounce point rather than extrapolating
+        // further into geometry that just kept bouncing it back.
+        return anyHit;
     }
 
     // Time (as a fraction of the step, in [0,1]) at which a ball moving from (prevX,prevY) with
@@ -1544,8 +1690,54 @@ return false;
     // Safety net, same rationale as enforceBoardBounds: some collision paths (e.g. a generic
     // wall/face bounce that happens to coincide with a triangle's edge) can leave the ball just
     // barely overlapping a triangle's solid side without ever running the hypotenuse reflection.
-    // If the ball ends a step there, push it back out to the trigger distance along the
-    // hypotenuse's normal and reflect, using the same convention as checkTriangleHypotenuses.
+    // Binary-searches the straight segment from (x0,y0) -- the ball's position at the start of
+    // this step -- to the ball's current (embedded) position, for the point closest to the
+    // current position at which the ball no longer overlaps any block, and moves it there.
+    //
+    // enforceTriangleClearance/-SquareClearance only run when a collision was *missed* by the
+    // fast-path checks (reflection lines, checkTriangleHypotenuses) and the ball ended the step
+    // embedded in solid material -- notably when two adjacent same-orientation triangles form a
+    // corridor narrower than the ball (see the class comment on that known case). Pushing the
+    // ball out along the single overlapped block's own local normal, by a fixed clearance
+    // distance, doesn't know about that second block and can overshoot straight into it, and on
+    // the next step's correction back the other way, again into the first -- a net step distance
+    // well beyond one step's speed budget, tripping the "moved too far" invariant.
+    //
+    // Walking back along the step's own path instead can never move the ball further than this
+    // step's own travel already did, however many blocks are involved, so the corrected position
+    // is always within budget. It also generalizes: it doesn't need to know why the fast-path
+    // checks missed the collision, just that undoing part of this step's motion resolves it.
+    private void pullBackToLastSafePoint(Ball ball, float x0, float y0) {
+        float x1 = ball.getX(), y1 = ball.getY();
+
+        ball.setPos(x0, y0);
+        if (ballOnBlock(ball)) {
+            // The step's own start was already embedded (shouldn't normally happen) -- nothing
+            // better to do than leave the ball there rather than searching a segment that's
+            // embedded at both ends.
+            return;
+        }
+
+        float loT = 0f, hiT = 1f; // lo: known clear, hi: known embedded
+        for (int i = 0; i < 20; i++) {
+            float midT = (loT + hiT) / 2f;
+            ball.setPos(x0 + midT * (x1 - x0), y0 + midT * (y1 - y0));
+            if (ballOnBlock(ball)) {
+                hiT = midT;
+            } else {
+                loT = midT;
+            }
+        }
+        ball.setPos(x0 + loT * (x1 - x0), y0 + loT * (y1 - y0));
+    }
+
+    // Safety net: a corner/hypotenuse bounce only checks the border/block collision for the
+    // *pre-bounce* portion of the step, then moves the ball for the remaining fraction of the
+    // step in the new direction without re-checking for a wall. That, or a missed collision
+    // elsewhere, can leave the ball a step ending up overlapping a triangle's solid side without
+    // ever running the hypotenuse reflection. If the ball ends a step there, pull it back to the
+    // last point along this step's path that's clear (see pullBackToLastSafePoint) and reflect,
+    // using the same convention as checkTriangleHypotenuses.
     private void enforceTriangleClearance(Ball ball) {
         int cx = getXBlock(ball.getX());
         int cy = getYBlock(ball.getY());
@@ -1555,24 +1747,9 @@ return false;
         if (!ballOverlapsTriangleSolid(ball, (Block3) b, cx, cy)) return;
 
         Block3.tTriangle type = ((Block3) b).getType();
-        float rx = right(cx), ty = top(cy), by = bottom(cy);
         boolean isBLorTR = (type == Block3.tTriangle.BL || type == Block3.tTriangle.TR);
-        boolean emptyIsNeg = (type == Block3.tTriangle.TR || type == Block3.tTriangle.BR);
-        float triggerDist = ballRadius * (float) Math.sqrt(2.0);
 
-        float lineVal = isBLorTR
-                ? ball.getX() - ball.getY() + (by - rx)
-                : ball.getX() + ball.getY() - (rx + ty);
-        // Push slightly past the exact trigger distance so the ball ends up clearly clear of the
-        // hypotenuse rather than sitting exactly at the boundary (which the overlap check, using
-        // a non-strict "<=", would still count as touching).
-        float targetVal = emptyIsNeg ? -(triggerDist + 0.5f) : (triggerDist + 0.5f);
-        float delta = targetVal - lineVal;
-
-        // The line-value gradient is (1,-1) for BL/TR and (1,1) for TL/BR; move delta/2 along
-        // each axis, equivalent to moving purely along the line's normal by the needed amount.
-        if (isBLorTR) ball.setPos(ball.getX() + delta / 2f, ball.getY() - delta / 2f);
-        else          ball.setPos(ball.getX() + delta / 2f, ball.getY() + delta / 2f);
+        pullBackToLastSafePoint(ball, prevBallPosX, prevBallPosY);
 
         float dx = ball.getDx(), dy = ball.getDy();
         if (isBLorTR) ball.setSpeed(dy, dx);
@@ -1585,7 +1762,8 @@ return false;
     // Safety net, same rationale as enforceTriangleClearance: a face bounce resolved for one
     // block can leave the ball's remaining same-step motion tunnel straight into a second,
     // diagonally-adjacent square (e.g. bouncing off one block's left face while already past the
-    // top edge of a different block in the next column). Push back out to the nearest edge.
+    // top edge of a different block in the next column). Pull back to the last clear point along
+    // this step's path (see pullBackToLastSafePoint) and reflect off whichever face is nearest.
     private void enforceSquareClearance(Ball ball) {
         int cx = getXBlock(ball.getX());
         int cy = getYBlock(ball.getY());
@@ -1609,17 +1787,15 @@ return false;
 
         float minDist = Math.min(Math.min(distLeft, distRight), Math.min(distTop, distBottom));
 
+        pullBackToLastSafePoint(ball, prevBallPosX, prevBallPosY);
+
         if (minDist == distLeft) {
-            ball.setPos(l - ballRadius, ball.getY());
             ball.setSpeed(-Math.abs(ball.getDx()), ball.getDy());
         } else if (minDist == distRight) {
-            ball.setPos(r + ballRadius, ball.getY());
             ball.setSpeed(Math.abs(ball.getDx()), ball.getDy());
         } else if (minDist == distTop) {
-            ball.setPos(ball.getX(), t - ballRadius);
             ball.setSpeed(ball.getDx(), -Math.abs(ball.getDy()));
         } else {
-            ball.setPos(ball.getX(), bo + ballRadius);
             ball.setSpeed(ball.getDx(), Math.abs(ball.getDy()));
         }
         // Don't double-credit a block that was already hit earlier this same step.
@@ -1961,6 +2137,7 @@ return false;
             game.addScore(points);
             game.addAnimation(new ScorePopupAnimation(this, 25, b.getX(), b.getY(), points));
             if (b.getValue() == 0) {
+                blocksClearedThisMove++;
                 game.addAnimation(new DissolveBlockAnimation(this, 10, b.getX(), b.getY()));
                 blocks[b.getX()][b.getY()] = null;
             } else {
@@ -1979,9 +2156,12 @@ return false;
         //freeze("ballAtEnd",0);
         if (freeze) return;
 
-        // Award a bonus if this move's score cleared the threshold, regardless of whether the
-        // move also ended the level, ended the game, or just triggered the normal board drop.
-        game.onRoundEnd();
+        finishMoveRecording();
+
+        // Report this move's shot statistics (and let Game check the bonus-award threshold),
+        // regardless of whether the move also ended the level, ended the game, or just triggered
+        // the normal board drop.
+        game.onRoundEnd(blocksClearedThisMove, recordingNumBalls);
 
         // check for game win
         if (gameBoardEmpty()) {
@@ -2016,17 +2196,134 @@ return false;
     }
 
     private void createBoardCopy() {
-        for (int x=0; x < xDim; x++) {
+        blocksCopy = copyBlocksGrid();
+    }
+
+    private Block[][] copyBlocksGrid() {
+        Block[][] copy = new Block[xDim][yDim];
+        for (int x = 0; x < xDim; x++) {
             for (int y = 0; y < yDim; y++) {
-                if (blocks[x][y] != null) {
-                    if (blocks[x][y] instanceof Block3) {
-                        blocksCopy[x][y] = new Block3((Block3) blocks[x][y]);
-                    } else if (blocks[x][y] instanceof Block4) {
-                        blocksCopy[x][y] = new Block4((Block4) blocks[x][y]);
-                    }
-                } else blocksCopy[x][y] = null;
+                Block b = blocks[x][y];
+                if (b instanceof Block3) {
+                    copy[x][y] = new Block3((Block3) b);
+                } else if (b instanceof Block4) {
+                    copy[x][y] = new Block4((Block4) b);
+                } else {
+                    copy[x][y] = null;
+                }
             }
         }
+        return copy;
+    }
+
+    // Starts recording the shot that is about to launch (see the recordingMove field comment).
+    private void startMoveRecording(List<Bonus> consumedBonuses) {
+        recordingBlockSnapshot = copyBlocksGrid();
+        recordingFrames = new ArrayList<>();
+        recordingNumBalls = numBalls;
+        recordingFirePosX = firePosX;
+        recordingFireSpeedX = fireSpeedX;
+        recordingFireSpeedY = fireSpeedY;
+        recordingBonuses = consumedBonuses;
+        recordingMove = true;
+    }
+
+    // Captures one tick of the in-flight move; called once per update() while balls are rolling.
+    private void captureReplayFrame() {
+        float[] bx = new float[recordingNumBalls];
+        float[] by = new float[recordingNumBalls];
+        for (int i = 0; i < recordingNumBalls; i++) {
+            bx[i] = balls[i].getX();
+            by[i] = balls[i].getY();
+        }
+        int[] blockValues = new int[xDim * yDim];
+        for (int x = 0; x < xDim; x++) {
+            for (int y = 0; y < yDim; y++) {
+                Block b = blocks[x][y];
+                blockValues[x * yDim + y] = (b != null) ? b.getValue() : -1;
+            }
+        }
+        recordingFrames.add(new ReplayFrame(bx, by, blockValues));
+    }
+
+    // Finalizes the recording once the move ends, so it becomes available for replay/export.
+    private void finishMoveRecording() {
+        if (!recordingMove) return;
+        lastMoveFrames = recordingFrames;
+        lastMoveBlockSnapshot = recordingBlockSnapshot;
+        lastMoveFirePosX = recordingFirePosX;
+        lastMoveFireSpeedX = recordingFireSpeedX;
+        lastMoveFireSpeedY = recordingFireSpeedY;
+        lastMoveBonuses = recordingBonuses;
+        recordingMove = false;
+        recordingFrames = null;
+        recordingBlockSnapshot = null;
+    }
+
+    public boolean hasLastMoveRecording() {
+        return lastMoveFrames != null && !lastMoveFrames.isEmpty();
+    }
+
+    // Text report of the last completed shot (board layout right before it, start x, launch
+    // angle, bonuses spent on it) for the burger menu's "Letzten Zug exportieren" action -- meant
+    // to be pasted into a debugging conversation. Null if no shot has completed yet.
+    public String getLastMoveReport() {
+        if (!hasLastMoveRecording()) return null;
+
+        float dx = lastMoveFireSpeedX;
+        float dy = lastMoveFireSpeedY;
+        // Same convention as clampAimVector(): 0 = straight up, positive = tilted right.
+        float angleFromUpDeg = (float) Math.toDegrees(Math.atan2(dx, -dy));
+
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("BlockPong - Letzter Zug (Debug-Export)\n");
+        sb.append("Level: ").append(game.getLevel()).append('\n');
+        sb.append("Baelle: ").append(recordingNumBalls).append('\n');
+        sb.append("Angewendete Boni: ")
+                .append(lastMoveBonuses.isEmpty() ? "keine" : lastMoveBonuses.toString())
+                .append('\n');
+        sb.append("Startpunkt x: ").append(lastMoveFirePosX)
+                .append(" (Feldbreite: ").append(width).append(", offsetX: ").append(offsetX).append(")\n");
+        sb.append("Wurfrichtung (dx,dy): ").append(dx).append(", ").append(dy).append('\n');
+        sb.append("Winkel (Grad, 0=gerade nach oben, + nach rechts): ").append(angleFromUpDeg).append('\n');
+        sb.append("Spielfeld vor dem Zug (JSON, kompatibel mit tools/level_editor.py):\n");
+        sb.append(exportBlocksJson(lastMoveBlockSnapshot));
+        return sb.toString();
+    }
+
+    public int getLastMoveFrameCount() {
+        return lastMoveFrames == null ? 0 : lastMoveFrames.size();
+    }
+
+    // Renders one recorded frame of the last move: the frozen block snapshot (skipping cells
+    // already destroyed by this frame, with each remaining block's value updated to match) plus
+    // the recorded ball positions -- used by the burger menu's "Replay in slow motion" action
+    // instead of the live board while gameplay itself is paused (see Game.java).
+    public void drawReplayFrame(Canvas c, int frameIndex) {
+        if (lastMoveFrames == null || frameIndex < 0 || frameIndex >= lastMoveFrames.size()) return;
+        ReplayFrame frame = lastMoveFrames.get(frameIndex);
+
+        for (int x = 0; x < xDim; x++) {
+            for (int y = 0; y < yDim; y++) {
+                int val = frame.blockValues[x * yDim + y];
+                Block b = lastMoveBlockSnapshot[x][y];
+                if (val >= 0 && b != null) {
+                    b.value = val;
+                    b.draw(c);
+                }
+            }
+        }
+
+        for (int i = 0; i < frame.ballX.length; i++) {
+            c.drawCircle(frame.ballX[i], frame.ballY[i], ballRadius, ballPaint);
+        }
+
+        float gameOverLineY = gameOverLineY();
+        c.drawLine(offsetX, gameOverLineY, offsetX + width, gameOverLineY, gameOverLinePaint);
+
+        c.drawLine(offsetX - boundaryPaint.getStrokeWidth() / 2, offsetY + height, offsetX - boundaryPaint.getStrokeWidth() / 2, offsetY, boundaryPaint);
+        c.drawLine(offsetX - boundaryPaint.getStrokeWidth() / 2, offsetY, offsetX + width + boundaryPaint.getStrokeWidth() / 2, offsetY, boundaryPaint);
+        c.drawLine(offsetX + width + boundaryPaint.getStrokeWidth() / 2, offsetY, offsetX + width + boundaryPaint.getStrokeWidth() / 2, offsetY + height, boundaryPaint);
     }
 
     private boolean gameBoardEmpty() {
@@ -2050,14 +2347,16 @@ return false;
         return false;
     }
 
-    private void fire() {
+    private void fire(List<Bonus> consumedBonuses) {
         fireCounter = 0;
         fire = true;
         nextFireBall = 0;
         newFirePosSet = false;
+        blocksClearedThisMove = 0;
 
         // store game board for later debugging
         createBoardCopy();
+        startMoveRecording(consumedBonuses);
 
     }
 
@@ -2099,7 +2398,7 @@ return false;
     }
 
 
-    private boolean ballRolling() {
+    public boolean ballRolling() {
         boolean result = false;
         for ( int b = 0; b < numBalls; b++) {
             if (!balls[b].isStill()) return true;
@@ -2109,16 +2408,15 @@ return false;
 
     // Applies the one-off effect of whichever bonus was just spent on this shot (or does nothing
     // if none was armed). EXTENDED_PATH and MOVE_START_POINT aren't handled here -- they act
-    // continuously while armed (see drawDirLine() and touchDown()), so there's nothing left to do
-    // once the shot fires.
+    // continuously while armed (see drawDirLine() and touchDown()/touchMove()), so there's
+    // nothing left to do once the shot fires. LINE_DELETE isn't handled here either -- it fires
+    // immediately when armed instead of on the next shot (see Game.toggleArmedBonus() and
+    // triggerLineDeleteBonus()).
     private void applyConsumedBonus(Bonus bonus) {
         if (bonus == null) return;
         switch (bonus) {
             case MOVE_STOPPER:
                 skipNextBoardDrop = true;
-                break;
-            case LINE_DELETE:
-                game.addAnimation(new LineDeleteAnimation(this, 30));
                 break;
             case EXTRA_BALLS:
                 while (numBalls < EXTRA_BALLS_TARGET_COUNT && numBalls < maxNumBalls) {
@@ -2127,6 +2425,7 @@ return false;
                 break;
             case EXTENDED_PATH:
             case MOVE_START_POINT:
+            case LINE_DELETE:
                 break;
         }
     }
@@ -2150,12 +2449,13 @@ return false;
         }
 
         if (!ballRolling()) {
-            // MOVE_START_POINT bonus: while armed, the initial touch-down x position plants the
-            // fire point there instead of the usual auto-follow position (see fire() callers).
-            if (game.getArmedBonus() == Bonus.MOVE_START_POINT) {
-                float minX = offsetX + ballRadius;
-                float maxX = offsetX + width - ballRadius;
-                newFirePosX = Math.max(minX, Math.min(maxX, x));
+            // MOVE_START_POINT bonus: while armed, dragging the start ball relocates the fire
+            // point (see touchMove()) for as long as the touch stays below the game-over line,
+            // i.e. in the strip where the ball rests. Touching down already inside the playing
+            // field skips straight to aiming, same as without the bonus armed.
+            movingStartPoint = game.isBonusArmed(Bonus.MOVE_START_POINT) && y > gameOverLineY();
+            if (movingStartPoint) {
+                moveStartPointTo(x);
             }
             dirLineActive = true;
             float[] v = clampAimVector(x - newFirePosX, y - firePosY);
@@ -2169,13 +2469,40 @@ return false;
 
     public void touchMove(float x, float y) {
         if (dirLineActive) {
+            if (movingStartPoint) {
+                if (y > gameOverLineY()) {
+                    moveStartPointTo(x);
+                } else {
+                    // Touch crossed into the playing field: lock the start position and switch
+                    // to steering the aim, same as the rest of the drag from here on.
+                    movingStartPoint = false;
+                }
+            }
             float[] v = clampAimVector(x - newFirePosX, y - firePosY);
             dirLineX = newFirePosX + v[0];
             dirLineY = firePosY + v[1];
         }
     }
 
+    // MOVE_START_POINT bonus: moves the fire x-position (clamped to stay on the board) and the
+    // still-resting balls' sprites to match, so the ball visibly follows the drag.
+    private void moveStartPointTo(float x) {
+        float minX = offsetX + ballRadius;
+        float maxX = offsetX + width - ballRadius;
+        newFirePosX = Math.max(minX, Math.min(maxX, x));
+        for (int b = 0; b < numBalls; b++) {
+            balls[b].setPos(newFirePosX, firePosY);
+        }
+    }
+
     public void touchRelease(float x, float y) {
+        if (dirLineActive && movingStartPoint) {
+            // MOVE_START_POINT bonus: this whole gesture stayed below the game-over line, so it
+            // only repositioned the start ball -- don't fire, just wait for the next gesture to
+            // aim (see touchDown()/touchMove()).
+            dirLineActive = false;
+            return;
+        }
         if (dirLineActive) {
             if ( !reusePreviousFireSpeed) {
                 firePosX = newFirePosX;
@@ -2184,9 +2511,12 @@ return false;
                 setFireSpeed(v[0], v[1]);
             }
             // Applied before fire() so EXTRA_BALLS' extra balls are already in place for this
-            // shot's launch sequence.
-            applyConsumedBonus(game.consumeArmedBonus());
-            fire();
+            // shot's launch sequence. Several bonuses can be armed and spent together.
+            List<Bonus> consumedBonuses = game.consumeArmedBonuses();
+            for (Bonus bonus : consumedBonuses) {
+                applyConsumedBonus(bonus);
+            }
+            fire(consumedBonuses);
             dirLineActive = false;
             endOfRollingPhase = false;
         }
@@ -2224,6 +2554,13 @@ return false;
         return getBlockY(y+1);
     }
 
+    // Y of the game-over line: the boundary between the playing field (blocks above) and the
+    // strip below it where the start ball rests between shots. Also used by the MOVE_START_POINT
+    // bonus to decide whether a drag is still relocating the start ball or already aiming.
+    private float gameOverLineY() {
+        return bottom(yDim - 1);
+    }
+
     public float left(int x) {
         return getBlockX(x);
     }
@@ -2237,6 +2574,16 @@ return false;
 
     public void moveAllBlocks(float dy) {
         for ( int y = 0; y < yDim; y++) {
+            for (int x = 0; x < xDim; x++) {
+                if (blocks[x][y] != null) blocks[x][y].moveBlock(dy);
+            }
+        }
+    }
+
+    // LINE_DELETE bonus: moves only the deleted row and everything below it (rows above stay put
+    // since they aren't affected by the shift -- see deleteLineAndShiftUp()).
+    public void moveBlocksFromRow(int fromRow, float dy) {
+        for ( int y = fromRow; y < yDim; y++) {
             for (int x = 0; x < xDim; x++) {
                 if (blocks[x][y] != null) blocks[x][y].moveBlock(dy);
             }
@@ -2258,20 +2605,37 @@ return false;
         createBoardCopy();
     }
 
-    // LINE_DELETE bonus: removes the topmost non-empty row and shifts every row below it up by
-    // one cell (the inverse of dropAllBlocksByOneCell()), clearing the last playable row that's
-    // now vacated. No-op if the board is empty.
-    public void deleteLineAndShiftUp() {
+    // LINE_DELETE bonus: fires immediately when armed (see Game.toggleArmedBonus()), not on the
+    // next shot. Picks one of the (up to) 3 rows with the highest total block value at random and
+    // removes it; rows above are untouched, rows below slide up to fill the gap. No-op if the
+    // board is empty.
+    public void triggerLineDeleteBonus() {
         int lastPlayableRow = yDim - 3;
-        int rowToDelete = -1;
+        List<Integer> candidates = new ArrayList<>();
         for (int y = 0; y <= lastPlayableRow; y++) {
-            if (hasBlocksInRow(y)) {
-                rowToDelete = y;
-                break;
-            }
+            if (hasBlocksInRow(y)) candidates.add(y);
         }
-        if (rowToDelete == -1) return;
+        if (candidates.isEmpty()) return;
+        candidates.sort((a, b) -> Integer.compare(rowValueSum(b), rowValueSum(a)));
+        List<Integer> topRows = candidates.subList(0, Math.min(3, candidates.size()));
+        int rowToDelete = topRows.get(rand.nextInt(topRows.size()));
+        game.addAnimation(new LineDeleteAnimation(this, 30, rowToDelete));
+    }
 
+    private int rowValueSum(int y) {
+        int sum = 0;
+        for (int x = 0; x < xDim; x++) {
+            Block b = blocks[x][y];
+            if (b != null) sum += b.getValue();
+        }
+        return sum;
+    }
+
+    // Removes rowToDelete and shifts every row below it up by one cell (the inverse of
+    // dropAllBlocksByOneCell()), clearing the last playable row that's now vacated. Called by
+    // LineDeleteAnimation once its slide-up animation finishes (see triggerLineDeleteBonus()).
+    public void deleteLineAndShiftUp(int rowToDelete) {
+        int lastPlayableRow = yDim - 3;
         for (int y = rowToDelete; y < lastPlayableRow; y++) {
             for (int x = 0; x < xDim; x++) {
                 blocks[x][y] = blocks[x][y + 1];

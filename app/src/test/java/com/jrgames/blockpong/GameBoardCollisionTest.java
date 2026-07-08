@@ -245,18 +245,18 @@ public class GameBoardCollisionTest {
         }
 
         @Override
-        public void onRoundEnd() {
+        public void onRoundEnd(int blocksCleared, int ballsUsed) {
             // Not needed for collision-only unit tests.
         }
 
         @Override
-        public Bonus getArmedBonus() {
-            return null;
+        public boolean isBonusArmed(Bonus bonus) {
+            return false;
         }
 
         @Override
-        public Bonus consumeArmedBonus() {
-            return null;
+        public java.util.List<Bonus> consumeArmedBonuses() {
+            return java.util.Collections.emptyList();
         }
     }
 
@@ -275,9 +275,9 @@ public class GameBoardCollisionTest {
         @Override public void resetGameOver() {}
         @Override public void addScore(int points) {}
         @Override public String loadLevelJson(int level) { return levelJson; }
-        @Override public void onRoundEnd() {}
-        @Override public Bonus getArmedBonus() { return null; }
-        @Override public Bonus consumeArmedBonus() { return null; }
+        @Override public void onRoundEnd(int blocksCleared, int ballsUsed) {}
+        @Override public boolean isBonusArmed(Bonus bonus) { return false; }
+        @Override public java.util.List<Bonus> consumeArmedBonuses() { return java.util.Collections.emptyList(); }
     }
 }
 

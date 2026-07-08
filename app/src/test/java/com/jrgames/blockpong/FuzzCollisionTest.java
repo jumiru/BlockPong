@@ -1,14 +1,11 @@
 package com.jrgames.blockpong;
 
-import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.annotation.Config;
 
-import java.util.HashSet;
 import java.util.Random;
-import java.util.Set;
 
 import static org.junit.Assert.fail;
 
@@ -22,13 +19,6 @@ public class FuzzCollisionTest {
     private static final float BOARD_HEIGHT = 900f;
     private static final float NORM_SPEED = 50f;
 
-    // Seeds with a known, not-yet-fixed failure, excluded from the main fuzz run so it stays
-    // green. See knownIssue_adjacentSameOrientationTriangles() below for the root cause.
-    private static final Set<Long> KNOWN_FAILING_SEEDS = new HashSet<>();
-    static {
-        KNOWN_FAILING_SEEDS.add(1136L);
-    }
-
     // Run 300 random scenarios and report all unique failure types.
     @Test
     public void fuzz_randomScenarios_ballNeverLandsOnBlock() {
@@ -39,7 +29,6 @@ public class FuzzCollisionTest {
 
         for (int scenario = 0; scenario < NUM_SCENARIOS; scenario++) {
             long seed = 1000L + scenario;
-            if (KNOWN_FAILING_SEEDS.contains(seed)) continue;
             String failure = runScenario(seed);
             if (failure != null) {
                 if (failure.startsWith("BALL ON BLOCK") && onBlockCount++ < 3) report.append(failure).append("\n\n");
@@ -66,13 +55,14 @@ public class FuzzCollisionTest {
         }
     }
 
-    // Known, not-yet-fixed edge case: two adjacent triangles with the same orientation (e.g. a
-    // BL triangle directly next to another BL triangle) form a solid corridor whose hypotenuse
-    // and straight-edge constraints overlap in a strip narrower than the ball's diameter. The
-    // clearance safety nets (enforceTriangleClearance / enforceSquareClearance in GameBoard) each
-    // resolve one constraint by pushing the ball back into the other's trigger zone, with no
-    // single-step fixed point. Needs a combined-constraint solve rather than sequential pushes.
-    @Ignore("Known edge case: adjacent same-orientation triangles form a corridor narrower than the ball; see comment above")
+    // Regression test for a fixed edge case: two adjacent triangles with the same orientation
+    // (e.g. a BL triangle directly next to another BL triangle) form a solid corridor whose
+    // hypotenuse and straight-edge constraints overlap in a strip narrower than the ball's
+    // diameter. enforceTriangleClearance/-SquareClearance in GameBoard used to resolve one
+    // constraint by pushing the ball back into the other's trigger zone, with no single-step
+    // fixed point -- both now pull the ball back to the last point along its own step path that's
+    // clear of every block (pullBackToLastSafePoint), instead of pushing out along one block's
+    // local normal, which bounds the correction to that step's own travel budget.
     @Test
     public void knownIssue_adjacentSameOrientationTriangles() {
         String result = runScenario(1136L);
@@ -190,8 +180,8 @@ public class FuzzCollisionTest {
         @Override public void resetGameOver() {}
         @Override public void addScore(int points) {}
         @Override public String loadLevelJson(int level) { return null; }
-        @Override public void onRoundEnd() {}
-        @Override public Bonus getArmedBonus() { return null; }
-        @Override public Bonus consumeArmedBonus() { return null; }
+        @Override public void onRoundEnd(int blocksCleared, int ballsUsed) {}
+        @Override public boolean isBonusArmed(Bonus bonus) { return false; }
+        @Override public java.util.List<Bonus> consumeArmedBonuses() { return java.util.Collections.emptyList(); }
     }
 }
