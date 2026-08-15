@@ -37,7 +37,11 @@ public class Block4 extends Block {
     }
 
     public Block4( GameBoard gb, int x, int y, int value) {
-        super(gb, x, y, value);
+        this(gb, x, y, value, null);
+    }
+
+    public Block4( GameBoard gb, int x, int y, int value, Integer overrideColor) {
+        super(gb, x, y, value, overrideColor);
 
         rect = new RectF(gb.getBlockX(x),gb.getBlockY(y),
                 gb.getBlockX(x)+gb.getBlockWidth(),gb.getBlockY(y)+gb.getBlockHeight());

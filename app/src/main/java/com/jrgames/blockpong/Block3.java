@@ -22,6 +22,10 @@ public class Block3 extends Block {
     private float textX;
     private float textY;
 
+    // Test hooks: textX/textY have no other getters since draw() is the only production caller.
+    float getTextXForTests() { return textX; }
+    float getTextYForTests() { return textY; }
+
     public GameBoard.Content blockHitType() {
         switch (type) {
             case BL:
@@ -40,10 +44,16 @@ public class Block3 extends Block {
         this.type = b.type;
         this.path = new Path(b.path);
         this.offset = b.offset;
+        this.textX = b.textX;
+        this.textY = b.textY;
     }
 
     public Block3( GameBoard gb, int x, int y, tTriangle type, int value) {
-        super(gb,x,y,value);
+        this(gb, x, y, type, value, null);
+    }
+
+    public Block3( GameBoard gb, int x, int y, tTriangle type, int value, Integer overrideColor) {
+        super(gb,x,y,value, overrideColor);
 
         this.type = type;
 

@@ -4,43 +4,43 @@
       "x": 3,
       "y": 0,
       "type": "br",
-      "value": 11
+      "value": 9
     },
     {
       "x": 4,
       "y": 0,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 5,
       "y": 0,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 6,
       "y": 0,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 7,
       "y": 0,
       "type": "bl",
-      "value": 11
+      "value": 9
     },
     {
       "x": 2,
       "y": 1,
       "type": "br",
-      "value": 11
+      "value": 9
     },
     {
       "x": 3,
       "y": 1,
       "type": "br",
-      "value": 10
+      "value": 9
     },
     {
       "x": 4,
@@ -64,25 +64,25 @@
       "x": 7,
       "y": 1,
       "type": "bl",
-      "value": 10
+      "value": 9
     },
     {
       "x": 8,
       "y": 1,
       "type": "bl",
-      "value": 11
+      "value": 9
     },
     {
       "x": 1,
       "y": 2,
       "type": "br",
-      "value": 11
+      "value": 9
     },
     {
       "x": 2,
       "y": 2,
       "type": "br",
-      "value": 10
+      "value": 9
     },
     {
       "x": 3,
@@ -93,19 +93,19 @@
     {
       "x": 4,
       "y": 2,
-      "type": "tl",
+      "type": "square",
       "value": 6
     },
     {
       "x": 5,
       "y": 2,
       "type": "square",
-      "value": 5
+      "value": 6
     },
     {
       "x": 6,
       "y": 2,
-      "type": "tr",
+      "type": "square",
       "value": 6
     },
     {
@@ -118,19 +118,19 @@
       "x": 8,
       "y": 2,
       "type": "bl",
-      "value": 10
+      "value": 9
     },
     {
       "x": 9,
       "y": 2,
       "type": "bl",
-      "value": 11
+      "value": 9
     },
     {
       "x": 1,
       "y": 3,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 2,
@@ -141,25 +141,31 @@
     {
       "x": 3,
       "y": 3,
-      "type": "tl",
+      "type": "square",
       "value": 6
     },
     {
       "x": 4,
       "y": 3,
-      "type": "tl",
-      "value": 4
+      "type": "square",
+      "value": 5
+    },
+    {
+      "x": 5,
+      "y": 3,
+      "type": "square",
+      "value": 5
     },
     {
       "x": 6,
       "y": 3,
-      "type": "tr",
-      "value": 4
+      "type": "square",
+      "value": 5
     },
     {
       "x": 7,
       "y": 3,
-      "type": "tr",
+      "type": "square",
       "value": 6
     },
     {
@@ -172,13 +178,13 @@
       "x": 9,
       "y": 3,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 1,
       "y": 4,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 2,
@@ -188,6 +194,24 @@
     },
     {
       "x": 3,
+      "y": 4,
+      "type": "square",
+      "value": 6
+    },
+    {
+      "x": 4,
+      "y": 4,
+      "type": "square",
+      "value": 5
+    },
+    {
+      "x": 5,
+      "y": 4,
+      "type": "square",
+      "value": 3
+    },
+    {
+      "x": 6,
       "y": 4,
       "type": "square",
       "value": 5
@@ -196,7 +220,7 @@
       "x": 7,
       "y": 4,
       "type": "square",
-      "value": 5
+      "value": 6
     },
     {
       "x": 8,
@@ -208,13 +232,13 @@
       "x": 9,
       "y": 4,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 1,
       "y": 5,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 2,
@@ -225,25 +249,31 @@
     {
       "x": 3,
       "y": 5,
-      "type": "bl",
+      "type": "square",
       "value": 6
     },
     {
       "x": 4,
       "y": 5,
-      "type": "bl",
-      "value": 4
+      "type": "square",
+      "value": 5
+    },
+    {
+      "x": 5,
+      "y": 5,
+      "type": "square",
+      "value": 5
     },
     {
       "x": 6,
       "y": 5,
-      "type": "br",
-      "value": 4
+      "type": "square",
+      "value": 5
     },
     {
       "x": 7,
       "y": 5,
-      "type": "br",
+      "type": "square",
       "value": 6
     },
     {
@@ -256,19 +286,19 @@
       "x": 9,
       "y": 5,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 1,
       "y": 6,
       "type": "tr",
-      "value": 11
+      "value": 9
     },
     {
       "x": 2,
       "y": 6,
       "type": "tr",
-      "value": 10
+      "value": 9
     },
     {
       "x": 3,
@@ -279,19 +309,19 @@
     {
       "x": 4,
       "y": 6,
-      "type": "bl",
+      "type": "square",
       "value": 6
     },
     {
       "x": 5,
       "y": 6,
       "type": "square",
-      "value": 5
+      "value": 6
     },
     {
       "x": 6,
       "y": 6,
-      "type": "br",
+      "type": "square",
       "value": 6
     },
     {
@@ -304,25 +334,25 @@
       "x": 8,
       "y": 6,
       "type": "tl",
-      "value": 10
+      "value": 9
     },
     {
       "x": 9,
       "y": 6,
       "type": "tl",
-      "value": 11
+      "value": 9
     },
     {
       "x": 2,
       "y": 7,
       "type": "tr",
-      "value": 11
+      "value": 9
     },
     {
       "x": 3,
       "y": 7,
       "type": "tr",
-      "value": 10
+      "value": 9
     },
     {
       "x": 4,
@@ -346,43 +376,43 @@
       "x": 7,
       "y": 7,
       "type": "tl",
-      "value": 10
+      "value": 9
     },
     {
       "x": 8,
       "y": 7,
       "type": "tl",
-      "value": 11
+      "value": 9
     },
     {
       "x": 3,
       "y": 8,
       "type": "tr",
-      "value": 11
+      "value": 9
     },
     {
       "x": 4,
       "y": 8,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 5,
       "y": 8,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 6,
       "y": 8,
       "type": "square",
-      "value": 11
+      "value": 9
     },
     {
       "x": 7,
       "y": 8,
       "type": "tl",
-      "value": 11
+      "value": 9
     }
   ]
 }

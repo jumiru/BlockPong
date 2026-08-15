@@ -2,13 +2,15 @@ package com.jrgames.blockpong;
 
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
 
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.Window;
-import android.view.WindowManager;
 
 import java.util.prefs.Preferences;
 
@@ -25,12 +27,16 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT );
 
-        // set window to full screen
-        Window window=getWindow();
-        window.setFlags(
-                WindowManager.LayoutParams.FLAG_FULLSCREEN,
-                WindowManager.LayoutParams.FLAG_FULLSCREEN
-        );
+        // Immersive sticky fullscreen: system bars are hidden and only reappear temporarily on an
+        // explicit edge swipe (BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE), rather than the old
+        // FLAG_FULLSCREEN's instant reveal on any touch near the top -- reduces (though doesn't
+        // eliminate, see GameBoard.setTouchDeadZone()) the notification-shade swipe stealing an
+        // in-progress aim near the top edge.
+        Window window = getWindow();
+        WindowCompat.setDecorFitsSystemWindows(window, false);
+        WindowInsetsControllerCompat controller = WindowCompat.getInsetsController(window, window.getDecorView());
+        controller.hide(WindowInsetsCompat.Type.systemBars());
+        controller.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
 
         // The game draws its own header (level/score/best); the system action bar would just
         // eat screen space and visually collide with it.
@@ -56,6 +62,13 @@ public class MainActivity extends AppCompatActivity {
         Log.d("MainActivity()", "onPause()");
         game.pause();
         super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        Log.d("MainActivity()", "onResume()");
+        super.onResume();
+        game.resume();
     }
 
 }

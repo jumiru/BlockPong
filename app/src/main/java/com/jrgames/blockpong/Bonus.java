@@ -8,5 +8,7 @@ public enum Bonus {
     EXTENDED_PATH,      // lengthens the aim preview line
     LINE_DELETE,        // fires immediately on tap: removes one of the top-3 rows by value, rows below slide up
     EXTRA_BALLS,        // fires with many more balls (20) for one shot
-    MOVE_START_POINT    // lets the player freely choose the fire position
+    MOVE_START_POINT,   // lets the player freely choose the fire position
+    DRAG_PADDLE         // a shrinking paddle appears at the fire line after firing, dragged with
+                         // a finger, and bounces balls back upward until it's gone
 }

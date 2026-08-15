@@ -32,7 +32,7 @@ import re
 import sys
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image
 
@@ -55,6 +55,66 @@ LEVEL_FILE_RE = re.compile(r"level(\d+)\.json$", re.IGNORECASE)
 def _level_sort_key(path):
     m = LEVEL_FILE_RE.match(path.name)
     return (0, int(m.group(1))) if m else (1, path.name.lower())
+
+
+# Matches the "Spielfeld vor/nach dem Zug" labels GameBoard.getLastMoveReport() prints right
+# before each embedded JSON block, so pasted debug-export text can be labeled meaningfully.
+SNAPSHOT_LABEL_RE = re.compile(r"Spielfeld (vor|nach) dem Zug[^\n]*|Level \d+ \(JSON[^\n]*")
+
+# Matches the "Level N" prefix of the per-level label the app's "Alle Level exportieren" export
+# uses (see exportAllLevels() in Game.java), to recover which level number a pasted block belongs
+# to -- as opposed to a "Spielfeld vor/nach dem Zug" move-debug label, which isn't a whole level.
+LEVEL_LABEL_RE = re.compile(r"^Level (\d+)\b")
+
+
+def extract_json_blocks_objects(text):
+    """Finds every {"blocks": [...]} JSON object embedded in free-form text -- e.g. a whole
+    "Letzten Zug exportieren (Debug)" report pasted verbatim, which may contain one or two such
+    objects (before/after the move) plus surrounding prose. Returns a list of (label, blocks)
+    tuples in the order they appear."""
+    results = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        start = text.find("{", idx)
+        if start == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("blocks"), list):
+            preceding_labels = list(SNAPSHOT_LABEL_RE.finditer(text[:start]))
+            label = preceding_labels[-1].group().rstrip(":") if preceding_labels else f"JSON object #{len(results) + 1}"
+            results.append((label, obj["blocks"]))
+        idx = max(end, start + 1)
+    return results
+
+
+# Each entry: (display label, regex over the report text, capture group index). Purely
+# informational for the paste-and-compare viewer -- missing fields are just omitted, so this
+# also degrades gracefully if only raw JSON (no report text) was pasted.
+REPORT_METADATA_FIELDS = [
+    ("Level", re.compile(r"Level:\s*(\S+)"), 1),
+    ("Baelle", re.compile(r"Baelle:\s*(\S+)"), 1),
+    ("Boni", re.compile(r"Angewendete Boni:\s*(.+)"), 1),
+    ("Startpunkt x", re.compile(r"Startpunkt x:\s*([^\n(]+)"), 1),
+    ("Winkel", re.compile(r"Winkel[^:]*:\s*(\S+)"), 1),
+]
+
+
+def extract_report_metadata(text):
+    """Pulls the handful of informational fields (level, ball count, bonuses, start x, angle)
+    out of a pasted "Letzten Zug exportieren (Debug)" report, for display alongside the board
+    comparison. Returns an ordered dict-like list of (label, value) pairs; fields not found in
+    the text are simply left out."""
+    found = []
+    for label, pattern, group in REPORT_METADATA_FIELDS:
+        m = pattern.search(text)
+        if m:
+            found.append((label, m.group(group).strip()))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +218,16 @@ def convert(image_path, cols, rows, method, value_min, value_max, frame_index, b
     return blocks, grid, rows
 
 
+def is_random_level_slot(n):
+    """Every 10th level is deliberately left without a level file so GameBoard.randomBoard()
+    generates it -- see Game.isRandomLevelSlot() in the app. Never editable/generatable here."""
+    return n % 10 == 0
+
+
 def resolve_output_path(args):
     if args.level is not None:
+        if is_random_level_slot(args.level):
+            raise SystemExit(f"Level {args.level} is a random-level slot (every 10th level) and can't be authored.")
         return ASSETS_LEVELS_DIR / f"level{args.level}.json"
     if args.output is None:
         raise SystemExit("Specify either an output path or --level N")
@@ -176,6 +244,14 @@ def value_to_hex_color(value):
     hue = (value * 24) % 360
     r, g, b = colorsys.hsv_to_rgb(hue / 360.0, 0.65, 0.90)
     return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def effective_block_color(value, color=None):
+    """A block's displayed color: an explicit override (see GameBoard.loadBlocksFromJson()'s
+    optional "color" field / Block.overrideColor on the app side) if set, else the usual
+    value-derived color. Value and color are otherwise fully independent -- a block's point value
+    no longer dictates its look."""
+    return color if color else value_to_hex_color(value)
 
 
 def contrasting_text_color(hex_color):
@@ -205,6 +281,37 @@ def _tri_br(l, t, r, b):
 
 
 TRIANGLE_POINTS = {"bl": _tri_bl, "tl": _tri_tl, "tr": _tri_tr, "br": _tri_br}
+
+COMPARE_CELL_SIZE = 28  # Smaller than the main editor's CELL_SIZE so two boards fit side by side.
+
+
+def draw_blocks_static(canvas, blocks, cell_size=COMPARE_CELL_SIZE, rows=MAX_PLAYABLE_ROWS, cols=BOARD_COLS):
+    """Renders a blocks list onto a plain Canvas, read-only -- no selection, no bindings. Used by
+    the paste-and-compare viewer, which is for looking at a reported board state, not editing it."""
+    canvas.delete("all")
+    for gy in range(rows):
+        for gx in range(cols):
+            left, top = gx * cell_size, gy * cell_size
+            canvas.create_rectangle(left, top, left + cell_size, top + cell_size, outline="#444444")
+
+    for b in blocks:
+        gx, gy, block_type, value = b["x"], b["y"], b["type"], b["value"]
+        if not (0 <= gx < cols) or not (0 <= gy < rows):
+            continue
+        left, top = gx * cell_size, gy * cell_size
+        right, bottom = left + cell_size, top + cell_size
+        color = effective_block_color(value, b.get("color"))
+        if block_type == "square":
+            canvas.create_rectangle(left, top, right, bottom, fill=color, outline="white")
+            cx, cy = (left + right) / 2, (top + bottom) / 2
+        elif block_type in TRIANGLE_POINTS:
+            pts = TRIANGLE_POINTS[block_type](left, top, right, bottom)
+            canvas.create_polygon(pts, fill=color, outline="white")
+            cx = (pts[0] + pts[2] + pts[4]) / 3
+            cy = (pts[1] + pts[3] + pts[5]) / 3
+        else:
+            continue
+        canvas.create_text(cx, cy, text=str(value), fill=contrasting_text_color(color), font=("TkDefaultFont", 7))
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +421,262 @@ class ImportImageDialog(tk.Toplevel):
         self.destroy()
 
 
+class BoardCompareWindow(tk.Toplevel):
+    """Read-only side-by-side viewer for one or more board snapshots pasted from a debug-export
+    report (typically "vor"/"nach dem Zug") -- purely for visually inspecting a reported bug, not
+    for editing, so it has no selection or block-editing bindings at all."""
+
+    def __init__(self, parent, snapshots, metadata):
+        super().__init__(parent)
+        self.title("Board Comparison")
+        self.transient(parent)
+
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        if metadata:
+            info_text = "    ".join(f"{label}: {value}" for label, value in metadata)
+            ttk.Label(outer, text=info_text, font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(0, 8))
+
+        panels = ttk.Frame(outer)
+        panels.pack(fill="both", expand=True)
+
+        for label, blocks in snapshots:
+            panel = ttk.Frame(panels, padding=(0, 0, 12, 0))
+            panel.pack(side="left", anchor="n")
+            ttk.Label(panel, text=label, font=("TkDefaultFont", 9, "bold")).pack(anchor="w")
+            canvas = tk.Canvas(
+                panel, width=BOARD_COLS * COMPARE_CELL_SIZE, height=MAX_PLAYABLE_ROWS * COMPARE_CELL_SIZE,
+                background="#1e1e1e", highlightthickness=1, highlightbackground="#666666",
+            )
+            canvas.pack(pady=(4, 0))
+            draw_blocks_static(canvas, blocks)
+
+        ttk.Button(outer, text="Close", command=self.destroy).pack(anchor="e", pady=(10, 0))
+
+
+class PasteJsonDialog(tk.Toplevel):
+    """Lets the user paste a "Letzten Zug exportieren (Debug)" report (or raw
+    {"blocks": [...]} JSON) copied from the app, and opens a read-only BoardCompareWindow showing
+    every board snapshot found in it (typically "vor"/"nach dem Zug") side by side -- for visually
+    inspecting a reported bug's board state, not editing it."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Paste Debug JSON")
+        self.geometry("640x480")
+        self.transient(parent)
+        self.grab_set()
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text='Paste a debug-export report (or raw {"blocks": [...]} JSON) below:').pack(anchor="w")
+
+        text_frame = ttk.Frame(frm)
+        text_frame.pack(fill="both", expand=True, pady=(4, 8))
+        self.text = tk.Text(text_frame, wrap="word", undo=True)
+        self.text.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(text_frame, command=self.text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.text.configure(yscrollcommand=scrollbar.set)
+
+        try:
+            self.text.insert("1.0", self.clipboard_get())
+        except tk.TclError:
+            pass
+        self.text.focus_set()
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Paste from Clipboard", command=self._paste_clipboard).pack(side="left")
+        ttk.Button(btns, text="Save All to Assets...", command=self._do_save_all).pack(side="left", padx=5)
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="Visualize", command=self._do_visualize).pack(side="right", padx=5)
+
+    def _paste_clipboard(self):
+        try:
+            clipboard = self.clipboard_get()
+        except tk.TclError:
+            messagebox.showerror("Paste Debug JSON", "Clipboard is empty or not text.", parent=self)
+            return
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", clipboard)
+
+    def _do_save_all(self):
+        content = self.text.get("1.0", "end")
+        levels = []
+        for label, blocks in extract_json_blocks_objects(content):
+            m = LEVEL_LABEL_RE.match(label)
+            if m:
+                levels.append((int(m.group(1)), blocks))
+        if not levels:
+            messagebox.showerror(
+                "Save All to Assets",
+                "No \"Level N (JSON ...)\" blocks found in the pasted text -- use the app's "
+                "\"Alle Level exportieren\" export for this.",
+                parent=self)
+            return
+        existing = sorted(n for n, _ in levels if (ASSETS_LEVELS_DIR / f"level{n}.json").exists())
+        msg = f"Write {len(levels)} level file(s) to {ASSETS_LEVELS_DIR}?"
+        if existing:
+            msg += "\n" + f"{len(existing)} already exist and will be overwritten: " + ", ".join(str(n) for n in existing)
+        if not messagebox.askyesno("Save All to Assets", msg, parent=self):
+            return
+        for n, blocks in levels:
+            path = ASSETS_LEVELS_DIR / f"level{n}.json"
+            sorted_blocks = sorted(blocks, key=lambda b: (b.get("y", 0), b.get("x", 0)))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump({"blocks": sorted_blocks}, f, indent=2)
+        messagebox.showinfo("Save All to Assets", f"Wrote {len(levels)} level file(s).", parent=self)
+
+    def _do_visualize(self):
+        content = self.text.get("1.0", "end")
+        found = extract_json_blocks_objects(content)
+        if not found:
+            messagebox.showerror(
+                "Paste Debug JSON", 'No {"blocks": [...]} JSON found in the pasted text.', parent=self)
+            return
+        metadata = extract_report_metadata(content)
+        BoardCompareWindow(self, found, metadata)
+
+
+class LevelOverviewWindow(tk.Toplevel):
+    """Scrollable matrix of small thumbnails, one per authored (non-random-slot) level found in
+    assets/levels/ -- 9 per row, since that's exactly how many designed levels sit between two
+    random-level slots (see is_random_level_slot()). Meant for spotting sparse/boring levels at a
+    glance and jumping straight to editing one by clicking its thumbnail."""
+
+    THUMB_COLS = 9
+    CELL_PX = 6  # one board cell, shrunk down, per thumbnail pixel
+    GAP_X = 14
+    GAP_Y = 20
+    LABEL_H = 14
+
+    def __init__(self, parent, app, is_entry_view=False):
+        super().__init__(parent)
+        self.app = app
+        self.is_entry_view = is_entry_view
+        self.title("Level Overview")
+        self.geometry("900x700")
+
+        if is_entry_view:
+            # This is the whole app's landing view (main window still withdrawn) -- closing it via
+            # the window manager needs to fall back to showing the blank editor instead of leaving
+            # the process running with no visible window at all.
+            self.protocol("WM_DELETE_WINDOW", self._close_to_blank_editor)
+            toolbar = ttk.Frame(self)
+            toolbar.pack(fill="x", side="top")
+            ttk.Button(toolbar, text="Neues Level...", command=self._new_level).pack(side="left", padx=6, pady=4)
+
+        container = ttk.Frame(self)
+        container.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(container, background="#1e1e1e", highlightthickness=0)
+        vbar = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Button-4>", self._on_wheel)
+        self.canvas.bind("<Button-5>", self._on_wheel)
+        self.canvas.bind("<Button-1>", self._on_click)
+
+        self._thumb_rects = []  # (path, x0, y0, x1, y1)
+        self._populate()
+
+    def _close_to_blank_editor(self):
+        self.destroy()
+        self.app.root.deiconify()
+
+    def _new_level(self):
+        self.app.new_level()
+        if self.is_entry_view:
+            self.app.root.deiconify()
+        self.destroy()
+
+    def _populate(self):
+        files = sorted(ASSETS_LEVELS_DIR.glob("level*.json"), key=_level_sort_key) if ASSETS_LEVELS_DIR.exists() else []
+        levels = []
+        for p in files:
+            m = LEVEL_FILE_RE.match(p.name)
+            if not m or is_random_level_slot(int(m.group(1))):
+                continue
+            levels.append((int(m.group(1)), p))
+
+        if not levels:
+            self.canvas.create_text(20, 20, text="No authored levels found.", fill="#aaaaaa", anchor="nw")
+            return
+
+        thumb_w = BOARD_COLS * self.CELL_PX
+        thumb_h = MAX_PLAYABLE_ROWS * self.CELL_PX
+        cell_w = thumb_w + self.GAP_X
+        cell_h = thumb_h + self.LABEL_H + self.GAP_Y
+
+        for idx, (n, path) in enumerate(levels):
+            col = idx % self.THUMB_COLS
+            row = idx // self.THUMB_COLS
+            x0 = self.GAP_X + col * cell_w
+            y0 = self.GAP_Y + self.LABEL_H + row * cell_h
+            self._draw_thumbnail(n, path, x0, y0, thumb_w, thumb_h)
+
+        total_rows = (len(levels) + self.THUMB_COLS - 1) // self.THUMB_COLS
+        total_w = self.GAP_X + self.THUMB_COLS * cell_w
+        total_h = self.GAP_Y + self.LABEL_H + total_rows * cell_h
+        self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
+
+    def _draw_thumbnail(self, n, path, x0, y0, w, h):
+        self.canvas.create_text(x0 + w / 2, y0 - 2, text=str(n), fill="#aaaaaa", anchor="s", font=("TkDefaultFont", 7))
+        self.canvas.create_rectangle(x0, y0, x0 + w, y0 + h, outline="#555555", fill="#111111")
+
+        try:
+            data = json.loads(path.read_text())
+            blocks = data.get("blocks", [])
+        except Exception:
+            self.canvas.create_text(x0 + w / 2, y0 + h / 2, text="!", fill="#ff5555")
+            blocks = []
+
+        for b in blocks:
+            bx, by, value = b.get("x"), b.get("y"), b.get("value")
+            if bx is None or by is None or value is None:
+                continue
+            if not (0 <= bx < BOARD_COLS) or not (0 <= by < MAX_PLAYABLE_ROWS):
+                continue
+            cx0 = x0 + bx * self.CELL_PX
+            cy0 = y0 + by * self.CELL_PX
+            self.canvas.create_rectangle(
+                cx0, cy0, cx0 + self.CELL_PX, cy0 + self.CELL_PX,
+                outline="", fill=effective_block_color(value, b.get("color")))
+
+        self._thumb_rects.append((path, x0, y0, x0 + w, y0 + h))
+
+    def _on_click(self, event):
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        for path, x0, y0, x1, y1 in self._thumb_rects:
+            if x0 <= cx <= x1 and y0 <= cy <= y1:
+                self._open_level(path)
+                return
+
+    def _open_level(self, path):
+        if not self.app._confirm_discard():
+            return
+        self.app._load_level_file(path)
+        if self.is_entry_view:
+            self.app.root.deiconify()
+        self.destroy()
+
+    def _on_wheel(self, event):
+        if event.num == 4:
+            self.canvas.yview_scroll(-3, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(3, "units")
+        else:
+            self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+
 class LevelEditorApp:
     def __init__(self, root, initial_path=None):
         self.root = root
@@ -332,8 +695,15 @@ class LevelEditorApp:
                 self._load_level_file(p)
             else:
                 self._import_image_path(p)
-
-        self._update_title()
+            self._update_title()
+        else:
+            # No file given on the command line: land on the Level Overview first instead of a
+            # blank canvas (see show_level_overview()/LevelOverviewWindow) -- the main editor
+            # window stays hidden until a thumbnail is picked, "Neues Level..." is chosen, or the
+            # overview is closed outright (falls back to showing the blank editor).
+            self._update_title()
+            self.root.withdraw()
+            self.show_level_overview(is_entry_view=True)
 
     # -- layout ------------------------------------------------------------
 
@@ -344,6 +714,8 @@ class LevelEditorApp:
         file_menu.add_command(label="New", command=self.new_level, accelerator="Ctrl+N")
         file_menu.add_command(label="Open Level JSON...", command=self.open_level, accelerator="Ctrl+O")
         file_menu.add_command(label="Import Image...", command=self.import_image, accelerator="Ctrl+I")
+        file_menu.add_command(label="Paste Debug JSON...", command=self.paste_debug_json, accelerator="Ctrl+Shift+V")
+        file_menu.add_command(label="Level Overview...", command=self.show_level_overview, accelerator="Ctrl+Shift+O")
         file_menu.add_separator()
         file_menu.add_command(label="Save", command=self.save, accelerator="Ctrl+S")
         file_menu.add_command(label="Save As...", command=self.save_as)
@@ -360,6 +732,10 @@ class LevelEditorApp:
         self.root.bind("<Control-n>", lambda e: self.new_level())
         self.root.bind("<Control-o>", lambda e: self.open_level())
         self.root.bind("<Control-i>", lambda e: self.import_image())
+        self.root.bind("<Control-Shift-V>", lambda e: self.paste_debug_json())
+        self.root.bind("<Control-Shift-v>", lambda e: self.paste_debug_json())
+        self.root.bind("<Control-Shift-O>", lambda e: self.show_level_overview())
+        self.root.bind("<Control-Shift-o>", lambda e: self.show_level_overview())
         self.root.bind("<Control-s>", lambda e: self.save())
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
 
@@ -404,6 +780,7 @@ class LevelEditorApp:
         self.level_combo.bind("<<ComboboxSelected>>", self._on_level_selected)
         ttk.Button(level_row, text="⟳", width=3, command=self._refresh_level_list).pack(side="left", padx=(4, 0))
         self._refresh_level_list()
+        ttk.Button(sidebar, text="Übersicht...", command=self.show_level_overview).pack(fill="x", pady=(4, 0))
 
         ttk.Separator(sidebar, orient="horizontal").pack(fill="x", pady=8)
 
@@ -424,12 +801,35 @@ class LevelEditorApp:
         spin.pack(anchor="w", pady=(0, 4))
         self.current_value.trace_add("write", lambda *args: self._update_swatch())
 
-        self.swatch = tk.Canvas(sidebar, width=70, height=32, highlightthickness=1, highlightbackground="black")
+        # None = color derived from value, the default; else an explicit "#RRGGBB" override (see
+        # effective_block_color()). Value and color are otherwise fully independent -- picking a
+        # color here doesn't change what's in the Value spinbox, and vice versa.
+        self.current_color = None
+        self.swatch = tk.Canvas(sidebar, width=70, height=32, highlightthickness=1,
+                                 highlightbackground="black", cursor="hand2")
         self.swatch.pack(pady=4)
+        self.swatch.bind("<Button-1>", lambda e: self._pick_color())
+        self.color_status_var = tk.StringVar(value="")
+        ttk.Label(sidebar, textvariable=self.color_status_var, foreground="#888888",
+                  font=("TkDefaultFont", 8)).pack(anchor="w")
+        ttk.Button(sidebar, text="Reset color to value", command=self._reset_color).pack(fill="x", pady=(2, 0))
         self._update_swatch()
 
         ttk.Separator(sidebar, orient="horizontal").pack(fill="x", pady=8)
         ttk.Button(sidebar, text="Clear All", command=self.clear_all).pack(fill="x")
+
+        ttk.Separator(sidebar, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Label(sidebar, text="Shift All", font=("TkDefaultFont", 9, "bold")).pack(anchor="w")
+        shift_grid = ttk.Frame(sidebar)
+        shift_grid.pack(pady=(2, 0))
+        ttk.Button(shift_grid, text="↑", width=3,
+                   command=lambda: self.shift_all(0, -1)).grid(row=0, column=1)
+        ttk.Button(shift_grid, text="←", width=3,
+                   command=lambda: self.shift_all(-1, 0)).grid(row=1, column=0)
+        ttk.Button(shift_grid, text="→", width=3,
+                   command=lambda: self.shift_all(1, 0)).grid(row=1, column=2)
+        ttk.Button(shift_grid, text="↓", width=3,
+                   command=lambda: self.shift_all(0, 1)).grid(row=2, column=1)
 
         ttk.Label(sidebar, text=(
             "Left-drag: paint\nRight-drag: erase\nWheel: adjust value\n\n"
@@ -453,10 +853,34 @@ class LevelEditorApp:
             value = self.current_value.get()
         except tk.TclError:
             return
-        color = value_to_hex_color(value)
+        color = effective_block_color(value, self.current_color)
         self.swatch.delete("all")
         self.swatch.create_rectangle(2, 2, 68, 30, fill=color, outline="")
         self.swatch.create_text(35, 16, text=str(value), fill=contrasting_text_color(color))
+        self.color_status_var.set(f"Color: custom {self.current_color}" if self.current_color else "Color: auto (from value)")
+
+    def _pick_color(self):
+        # Click the swatch to pick a color independent of the block's point value -- see
+        # effective_block_color(). Applies to the currently selected placed block (if any), and
+        # becomes the color new blocks are painted with from here on (like current_value).
+        initial = self.current_color or value_to_hex_color(self.current_value.get())
+        _rgb, hexcode = colorchooser.askcolor(color=initial, title="Pick block color", parent=self.root)
+        if hexcode is None:
+            return
+        self.current_color = hexcode.lower()
+        if self.selected is not None and self.selected in self.grid:
+            self.grid[self.selected]["color"] = self.current_color
+            self._mark_dirty()
+            self._redraw()
+        self._update_swatch()
+
+    def _reset_color(self):
+        self.current_color = None
+        if self.selected is not None and self.selected in self.grid:
+            if self.grid[self.selected].pop("color", None) is not None:
+                self._mark_dirty()
+                self._redraw()
+        self._update_swatch()
 
     # -- drawing -------------------------------------------------------
 
@@ -476,7 +900,7 @@ class LevelEditorApp:
         for (gx, gy), info in self.grid.items():
             left, top = gx * CELL_SIZE, gy * CELL_SIZE
             right, bottom = left + CELL_SIZE, top + CELL_SIZE
-            color = value_to_hex_color(info["value"])
+            color = effective_block_color(info["value"], info.get("color"))
             block_type = info["type"]
             if block_type == "square":
                 self.canvas.create_rectangle(left, top, right, bottom, fill=color, outline="white", width=2)
@@ -529,7 +953,7 @@ class LevelEditorApp:
         except tk.TclError:
             self._redraw()
             return
-        self.grid[cell] = {"type": tool, "value": value}
+        self.grid[cell] = self._new_block_info(tool, value)
         self._mark_dirty()
         self._redraw()
 
@@ -581,6 +1005,12 @@ class LevelEditorApp:
         self._redraw()
         return "break"
 
+    def _new_block_info(self, block_type, value):
+        info = {"type": block_type, "value": value}
+        if self.current_color:
+            info["color"] = self.current_color
+        return info
+
     def _set_selected_value(self, value):
         if self.selected is None:
             return
@@ -589,7 +1019,7 @@ class LevelEditorApp:
         else:
             tool = self.tool_var.get()
             block_type = tool if tool != "eraser" else "square"
-            self.grid[self.selected] = {"type": block_type, "value": value}
+            self.grid[self.selected] = self._new_block_info(block_type, value)
         self.current_value.set(value)
         self._mark_dirty()
         self._redraw()
@@ -649,9 +1079,32 @@ class LevelEditorApp:
         self.root.title(f"BlockPong Level Editor - {name}{star}")
         self._refresh_level_selection()
 
+    # Reserved random-level slots (see is_random_level_slot()) never get a file, so they'd simply
+    # be absent from a plain directory listing -- shown here instead as greyed-out, locked entries
+    # interspersed with the real levels so the gap is visible rather than silent. Tkinter's
+    # Combobox can't style individual popup rows, so "greyed out" is approximated by a distinct
+    # label plus outright rejecting the selection in _on_level_selected().
+    RANDOM_SLOT_SUFFIX = "  (Zufalls-Level, gesperrt)"
+
     def _refresh_level_list(self):
         files = sorted(ASSETS_LEVELS_DIR.glob("level*.json"), key=_level_sort_key) if ASSETS_LEVELS_DIR.exists() else []
-        self.level_combo["values"] = [p.name for p in files]
+        real_by_num = {}
+        max_num = 0
+        for p in files:
+            m = LEVEL_FILE_RE.match(p.name)
+            if not m:
+                continue
+            n = int(m.group(1))
+            real_by_num[n] = p.name
+            max_num = max(max_num, n)
+
+        values = []
+        for n in range(1, max_num + 1):
+            if is_random_level_slot(n):
+                values.append(f"level{n}.json{self.RANDOM_SLOT_SUFFIX}")
+            elif n in real_by_num:
+                values.append(real_by_num[n])
+        self.level_combo["values"] = values
         self._refresh_level_selection()
 
     def _refresh_level_selection(self):
@@ -664,6 +1117,13 @@ class LevelEditorApp:
     def _on_level_selected(self, event=None):
         name = self.level_var.get()
         if not name:
+            return
+        if name.endswith(self.RANDOM_SLOT_SUFFIX):
+            messagebox.showinfo(
+                "Zufalls-Level",
+                name[:-len(self.RANDOM_SLOT_SUFFIX)] + " ist ein Zufalls-Level (wird im Spiel automatisch generiert) und kann nicht bearbeitet werden.",
+            )
+            self._refresh_level_selection()
             return
         if not self._confirm_discard():
             self._refresh_level_selection()
@@ -690,7 +1150,11 @@ class LevelEditorApp:
             if block_type not in BLOCK_TYPES:
                 print(f"Skipping block with unknown type '{block_type}' at ({x},{y})", file=sys.stderr)
                 continue
-            self.grid[(x, y)] = {"type": block_type, "value": value}
+            info = {"type": block_type, "value": value}
+            color = b.get("color")
+            if color:
+                info["color"] = color
+            self.grid[(x, y)] = info
 
     def _load_level_file(self, path):
         try:
@@ -748,6 +1212,17 @@ class LevelEditorApp:
         self._redraw()
         self._update_title()
 
+    def paste_debug_json(self):
+        # Purely a read-only viewer (see BoardCompareWindow) -- doesn't touch self.grid, so
+        # there's nothing to discard/confirm here, unlike import_image()/open_level().
+        PasteJsonDialog(self.root)
+
+    def show_level_overview(self, is_entry_view=False):
+        # Read-only until a thumbnail is clicked (see LevelOverviewWindow._open_level(), which
+        # goes through the same _confirm_discard()/_load_level_file() path as picking a level from
+        # the sidebar dropdown) -- so nothing to discard/confirm just to open the window itself.
+        LevelOverviewWindow(self.root, self, is_entry_view=is_entry_view)
+
     def clear_all(self):
         if not self.grid:
             return
@@ -756,11 +1231,28 @@ class LevelEditorApp:
             self._mark_dirty()
             self._redraw()
 
+    def shift_all(self, dx, dy):
+        if not self.grid:
+            return
+        for (x, y) in self.grid:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < BOARD_COLS and 0 <= ny < EDITOR_ROWS):
+                messagebox.showinfo("Shift All", "Cannot shift: a block would move outside the board.")
+                return
+        self.grid = {(x + dx, y + dy): info for (x, y), info in self.grid.items()}
+        if self.selected is not None:
+            sx, sy = self.selected
+            self.selected = (sx + dx, sy + dy)
+        self._mark_dirty()
+        self._redraw()
+
     def _write_json(self, path):
-        blocks = [
-            {"x": x, "y": y, "type": info["type"], "value": info["value"]}
-            for (x, y), info in sorted(self.grid.items(), key=lambda item: (item[0][1], item[0][0]))
-        ]
+        blocks = []
+        for (x, y), info in sorted(self.grid.items(), key=lambda item: (item[0][1], item[0][0])):
+            b = {"x": x, "y": y, "type": info["type"], "value": info["value"]}
+            if info.get("color"):
+                b["color"] = info["color"]
+            blocks.append(b)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump({"blocks": blocks}, f, indent=2)
@@ -782,7 +1274,12 @@ class LevelEditorApp:
         )
         if not path:
             return False
-        self.current_path = Path(path)
+        target = Path(path)
+        m = LEVEL_FILE_RE.match(target.name)
+        if m and target.parent == ASSETS_LEVELS_DIR and is_random_level_slot(int(m.group(1))):
+            messagebox.showerror("Save As", f"{target.name} is a random-level slot (every 10th level) and can't be authored.")
+            return False
+        self.current_path = target
         self._write_json(self.current_path)
         self.dirty = False
         self._refresh_level_list()
@@ -792,6 +1289,9 @@ class LevelEditorApp:
     def export_to_assets(self):
         n = simpledialog.askinteger("Export to assets", "Level number:", initialvalue=1, minvalue=1, parent=self.root)
         if n is None:
+            return
+        if is_random_level_slot(n):
+            messagebox.showerror("Export to assets", f"Level {n} is a random-level slot (every 10th level) and can't be authored.")
             return
         path = ASSETS_LEVELS_DIR / f"level{n}.json"
         if path.exists() and not messagebox.askyesno("Export to assets", f"{path.name} already exists. Overwrite?"):

@@ -23,6 +23,11 @@ public abstract class Block {
     // block is hit) so the block's color stays stable for its whole lifetime instead of drifting
     // as it takes damage.
     protected final int initialValue;
+    // Explicit color from the level file's optional "color" field (see GameBoard.loadBlocksFromJson()),
+    // decoupled from the block's point value -- e.g. for drawing a picture/pattern in a level
+    // without that shape dictating difficulty. Null means "no override", the common case: color is
+    // derived from initialValue the way it always was (see getRectColorFromValue()).
+    protected final Integer overrideColor;
 
     private tEdge hitBorder;
     private float hitCornerX;
@@ -63,10 +68,15 @@ public abstract class Block {
         return y;
     }
     public Block( GameBoard gb, int x, int y, int value) {
+        this(gb, x, y, value, null);
+    }
+
+    public Block( GameBoard gb, int x, int y, int value, Integer overrideColor) {
         this.x = x;
         this.y = y;
         this.value = value;
         this.initialValue = value;
+        this.overrideColor = overrideColor;
 
 
         // fill
@@ -94,6 +104,7 @@ public abstract class Block {
         y = b.y;
         value = b.value;
         initialValue = b.initialValue;
+        overrideColor = b.overrideColor;
     }
 
     public void setCoords(int x, int y) {
@@ -122,11 +133,15 @@ public abstract class Block {
         return (0.299f * Color.red(color) + 0.587f * Color.green(color) + 0.114f * Color.blue(color)) / 255f;
     }
 
-    // Colored by the block's starting value (not its current, decreasing value) so a block's
-    // color stays put for its whole lifetime instead of drifting hit by hit. The hue cycles
-    // through the color wheel as the starting value grows, giving tougher blocks visibly
-    // different (and, past 15, repeating) colors rather than everything reading as "greenish".
+    // An explicit overrideColor (see field above) always wins. Otherwise colored by the block's
+    // starting value (not its current, decreasing value) so a block's color stays put for its
+    // whole lifetime instead of drifting hit by hit. The hue cycles through the color wheel as the
+    // starting value grows, giving tougher blocks visibly different (and, past 15, repeating)
+    // colors rather than everything reading as "greenish".
     protected int getRectColorFromValue() {
+        if (overrideColor != null) {
+            return overrideColor;
+        }
         float hue = (initialValue * 24f) % 360f;
         return Color.HSVToColor(new float[]{ hue, 0.65f, 0.90f });
     }
@@ -136,6 +151,11 @@ public abstract class Block {
 
     public int getInitialValue() {
         return initialValue;
+    }
+
+    // Null if this block's color is derived from its value the usual way -- see overrideColor.
+    public Integer getOverrideColor() {
+        return overrideColor;
     }
 
     abstract public void draw(Canvas c);

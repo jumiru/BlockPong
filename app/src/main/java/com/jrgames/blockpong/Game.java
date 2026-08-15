@@ -13,18 +13,28 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.ViewConfiguration;
+import android.view.ViewGroup;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -37,18 +47,26 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 
 /**
  * Game manages all objects in the game and is responsible for updating all states
  * and renders all objects to the screen
  */
-public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoard.GameCallbacks {
+public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoard.GameCallbacks, LevelEditor.EditorCallbacks {
 
     private static final int LEFT_BORDER = 10;
     private static final int RIGHT_BORDER = 10;
     private static final int TOP_BORDER = 20;
     private static final int BOTTOM_BORDER = 400;
+    // Width of the input-inert strip kept clear along the screen edges (see
+    // GameBoard.setTouchDeadZone()) and, on API 29+, the width of the rects handed to
+    // setSystemGestureExclusionRects() below -- both address the same problem (Android's
+    // back-gesture on the sides and the notification-shade swipe on top stealing an in-progress
+    // aim) from two different angles, so they share one constant.
+    private static final int EDGE_DEAD_ZONE_DP = 24;
     // Gap between the board's bottom edge (where the ball rests on the fire line) and the bonus
     // button row drawn below it, in the reserved footer area.
     private static final int BONUS_ROW_TOP_MARGIN = 20;
@@ -56,13 +74,28 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // Gap between the bonus row and the LEVEL/SCORE/BEST boxes below it.
     private static final int BONUS_ROW_BOTTOM_MARGIN = 20;
     private static final int STATS_BOX_HEIGHT = 150;
-    // A move (one shot until all balls are back at rest) earns a random bonus once it clears this
-    // many blocks. Fixed and un-tiered for now -- revisit once the bonus effects themselves (see
-    // Bonus.java) are wired up and their real-world impact is known. Also the first bonus-tier
-    // boundary drawn on the shot-statistics histogram (see drawStatsScreen()).
+    // A move (one shot until all balls are back at rest) earns random bonuses once it clears
+    // enough blocks -- more bonuses at higher tiers (see bonusesForBlocksCleared()), not additive
+    // (40 blocks awards 3, not 1+2+3). Also the bonus-tier boundaries drawn on the shot-statistics
+    // histogram (see drawStatsScreen()).
     private static final int BLOCKS_CLEARED_BONUS_THRESHOLD = 20;
+    private static final int BLOCKS_CLEARED_BONUS_THRESHOLD_2 = 30;
+    private static final int BLOCKS_CLEARED_BONUS_THRESHOLD_3 = 40;
+    // Multiple bonuses earned by the same shot pop in one after another rather than all at once
+    // (see onRoundEnd()) -- simultaneous BonusAwardAnimations would otherwise be perfectly
+    // coincident opaque circles, hiding all but the topmost for their whole duration.
+    private static final int BONUS_AWARD_STAGGER_TICKS = 45;
+    // pickRandomBonus(): a bonus type the player currently holds none of is this many times more
+    // likely to be picked than one they already have -- a soft nudge towards variety, not a hard
+    // rule (an already-owned bonus can still come up, just less often).
+    private static final int UNOWNED_BONUS_WEIGHT_MULTIPLIER = 3;
     // Bin width (in blocks cleared) for the shot-statistics histogram.
     private static final int SHOT_HISTOGRAM_BIN_SIZE = 5;
+    // Bin width (in blocks hit, cleared or not) for the hit-statistics histogram. Wider than
+    // SHOT_HISTOGRAM_BIN_SIZE: a shot can hit far more blocks than it clears, so this histogram's
+    // range runs much higher -- coarser bins keep the label count (and the label-thinning in
+    // drawHistogramChart()) more readable.
+    private static final int HIT_HISTOGRAM_BIN_SIZE = 10;
     private static final String PREFS_KEY_BEST_SCORE = "best_score";
     // Snapshot of an in-progress game, written on pause() and restored on the next cold start so
     // the app can pick up where it left off even if Android killed the process to reclaim memory
@@ -74,6 +107,15 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // Shot-statistics histograms (blocks cleared per shot, bucketed by how many balls the shot
     // was fired with), collected across all games -- see recordShotStatistics().
     private static final String PREFS_KEY_SHOT_HISTOGRAMS = "shot_histograms";
+    // Companion histogram: blocks actually hit per shot (cleared or not), same bucketing --
+    // see recordHitStatistics(). Kept separate from PREFS_KEY_SHOT_HISTOGRAMS since a shot can
+    // hit far more blocks than it clears (chipping a block's value without destroying it).
+    private static final String PREFS_KEY_HIT_HISTOGRAMS = "hit_histograms";
+    // Manual save slots (long-press SCORE): independent of the auto-save above -- the player
+    // explicitly picks when to save/load, e.g. as a checkpoint before a risky shot. Each slot's
+    // prefs keys are "slot_<index>_<field>" (see slotKey()); a missing "level" key means empty.
+    private static final int SAVE_SLOT_COUNT = 3;
+    private static final String PREFS_KEY_SLOT_PREFIX = "slot_";
     private GameLoop gameLoop;
     private GameBoard gameBoard;
     private int canvasWidth;
@@ -89,12 +131,18 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     private Paint[] bonusColorPaints;
     private Paint bonusArmedBorderPaint;
     private Paint bonusIconPaint;
+    // Filled counterpart to bonusIconPaint's stroke -- used for solid icon details (arrowheads,
+    // the lightning bolt, ball cluster dots) that read better filled than outlined at this size.
+    private Paint bonusIconFillPaint;
+    // Thinner counterpart to bonusIconPaint's stroke -- used for EXTENDED_PATH's taper.
+    private Paint bonusIconThinPaint;
     private Paint bonusBadgePaint;
     private Paint bonusBadgeTextPaint;
     private Paint statsTitlePaint;
     private Paint statsDropdownPaint;
     private Paint statsDropdownTextPaint;
     private Paint statsBarPaint;
+    private Paint statsBarPaint2;
     private Paint statsBarLabelPaint;
     private Paint statsBarCountPaint;
     private Paint statsThresholdPaint;
@@ -107,6 +155,9 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // (replaces the old two-finger-tap cycling through 1x/2x/4x/8x).
     private static final int DEBUG_SLOW_MOTION_FACTOR = 4;
     private static final int REPLAY_SLOW_MOTION_FACTOR = 6;
+    // Duration (in update() ticks, ~60/s -- see GameLoop) of BonusAwardAnimation's pop-in/hold/
+    // fade-out celebration.
+    private static final int BONUS_AWARD_ANIMATION_DURATION = 100;
     private static final float MENU_BUTTON_SIZE = 90f;
     private static final float MENU_BUTTON_MARGIN = 15f;
 
@@ -118,6 +169,38 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     private int replayFrameIndex;
     private int replayTickCounter;
 
+    // "Import & Replay (Debug)" dialog state: the pasted text survives closing/reopening the
+    // dialog (so the same board+shot can be tried again -- e.g. normal speed, then slow motion,
+    // then again after a rebuild -- without retyping it each time), and pendingAutoReplay* lets
+    // the "Abspielen in Zeitlupe" button detect when *its* shot (not some earlier one) finishes,
+    // so it can auto-start the slow-motion replay once it does.
+    private String importReplayDraftText = "";
+    private boolean pendingAutoReplay;
+    private int pendingAutoReplaySeq;
+
+    // "Level-Editor" screen (burger menu): full-screen takeover like showingStats/replaying below,
+    // see draw()/update()/handleTouchEvent(). null until first opened.
+    private boolean levelEditorActive;
+    private LevelEditor levelEditor;
+
+    // "Probespielen" (test play a level being edited, see LevelEditor's action row): while active,
+    // the editor screen is hidden and gameplay runs completely normally against the editor's
+    // in-memory (possibly unsaved) layout instead of any real level file -- see loadLevelJson()'s
+    // short-circuit and startTestPlay()/endTestPlay(). The player's real progress (level, score,
+    // board, bonuses, armed bonuses) is snapshotted into these preTestPlay* fields on entry and
+    // restored verbatim on exit, so a test run can never leak into or corrupt it -- including via
+    // saveState() (see its own testPlayActive guard), which would otherwise persist the abandoned
+    // test board over the real save if the app were backgrounded mid-test.
+    private boolean testPlayActive;
+    private String testPlayJson;
+    private int preTestPlayLevel;
+    private int preTestPlayScore;
+    private String preTestPlayBlocksJson;
+    private boolean preTestPlayGameOver;
+    private boolean preTestPlayGameWon;
+    private int[] preTestPlayBonusCounts;
+    private EnumSet<Bonus> preTestPlayArmedBonuses;
+
     // "Statistik" screen (burger menu): shows the shot-statistics histogram (see
     // recordShotStatistics()) for one ballsUsed bucket at a time, picked via a dropdown-style tap
     // target (see showStatsBallsPicker()). null once no shot has been recorded yet for any bucket.
@@ -126,6 +209,11 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // ballsUsed -> (bin index = blocksCleared / SHOT_HISTOGRAM_BIN_SIZE) -> shot count. Collected
     // across all games, persisted in saveState()/surfaceCreated().
     private final TreeMap<Integer, TreeMap<Integer, Integer>> shotHistograms = new TreeMap<>();
+    // Same shape as shotHistograms, but binned by blocks hit (cleared or not) instead of blocks
+    // cleared -- see recordHitStatistics(). Always recorded together with shotHistograms (both
+    // updated from the same onRoundEnd() call), so it always has the same set of ballsUsed keys;
+    // the ballsUsed dropdown/picker only needs to consult shotHistograms.
+    private final TreeMap<Integer, TreeMap<Integer, Integer>> hitHistograms = new TreeMap<>();
 
     boolean gameOver;
 
@@ -156,11 +244,20 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     private Runnable bonusLongPressRunnable;
     private boolean bonusLongPressTriggered;
 
+    // Same press-and-hold pattern as the bonus buttons above, but for the SCORE stat box: holding
+    // it opens the manual save-slot menu (showSaveSlotMenu()) instead of waiting for ACTION_UP;
+    // scoreLongPressTriggered then tells ACTION_UP to suppress the normal cheat-sequence tap.
+    private final Handler statBoxLongPressHandler = new Handler(Looper.getMainLooper());
+    private Runnable statBoxLongPressRunnable;
+    private boolean scoreLongPressTriggered;
+
     // Testing cheats via tap sequences on the LEVEL/SCORE/BEST stat boxes (see onStatBoxTapped()):
     // tapping BEST four times in a row resets the highscore; tapping LEVEL, SCORE, BEST, LEVEL in
     // that order grants one of every bonus. Once a cheat is used, the highscore no longer updates
     // for the rest of the session so cheated runs can't taint it.
-    private enum StatBox { LEVEL, SCORE, BEST }
+    // Declaration order matches the on-screen left-to-right order (SCORE, LEVEL, BEST) --
+    // getStatBoxHit() maps screen position to constant via StatBox.values()[index].
+    private enum StatBox { SCORE, LEVEL, BEST }
     private static final long CHEAT_TAP_WINDOW_MS = 4000;
     private final List<StatBox> statBoxTapSequence = new ArrayList<>();
     private long lastStatBoxTapTime;
@@ -170,7 +267,6 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     private List<Animation> ongoingAnimations = new ArrayList<>(20);
     private List<Animation> newAnimations = new ArrayList<>(20);
 
-
     public Game(Context context, SharedPreferences prefs) {
         super(context);
         this.prefs = prefs;
@@ -178,8 +274,6 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         //getSurfaceHolder and add callback method
         SurfaceHolder surfaceHolder = getHolder();
         surfaceHolder.addCallback(this);
-
-
 
         setFocusable( true );
     }
@@ -200,6 +294,23 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             int boardHeight = canvasHeight - TOP_BORDER - BOTTOM_BORDER;
             gameBoard = new GameBoard(this, (float)boardWidth, (float)boardHeight, LEFT_BORDER, TOP_BORDER);
 
+            float density = getResources().getDisplayMetrics().density;
+            float deadZonePx = EDGE_DEAD_ZONE_DP * density;
+            gameBoard.setTouchDeadZone(deadZonePx, canvasWidth - deadZonePx, deadZonePx);
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Tell the system not to steal the edge back-gesture along the sides of the play
+                // area -- aiming can legitimately start close to the screen edge, which otherwise
+                // overlaps the back-gesture zone on gesture-nav devices. No equivalent API exists
+                // for the top edge (notification-shade swipe); that's mitigated separately via
+                // immersive sticky mode in MainActivity.
+                int exclusionWidthPx = Math.round(deadZonePx);
+                List<Rect> exclusionRects = new ArrayList<>();
+                exclusionRects.add(new Rect(0, 0, exclusionWidthPx, canvasHeight));
+                exclusionRects.add(new Rect(canvasWidth - exclusionWidthPx, 0, canvasWidth, canvasHeight));
+                setSystemGestureExclusionRects(exclusionRects);
+            }
+
             // initBoard() (called from the GameBoard constructor above) just generated a fresh
             // layout for `level`; overwrite it with the exact saved layout, if any, so partially
             // cleared blocks aren't lost.
@@ -208,19 +319,10 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 gameBoard.restoreBlocksFromJson(savedBlocks);
             }
 
-            String savedBonusCounts = prefs.getString(PREFS_KEY_SAVED_BONUS_COUNTS, null);
-            if (savedBonusCounts != null) {
-                String[] parts = savedBonusCounts.split(",");
-                for (int i = 0; i < bonusCounts.length && i < parts.length; i++) {
-                    try {
-                        bonusCounts[i] = Integer.parseInt(parts[i]);
-                    } catch (NumberFormatException ignored) {
-                        // leave that slot at 0
-                    }
-                }
-            }
+            loadBonusCounts(prefs.getString(PREFS_KEY_SAVED_BONUS_COUNTS, null));
 
-            loadShotHistograms(prefs.getString(PREFS_KEY_SHOT_HISTOGRAMS, null));
+            loadHistogram(prefs.getString(PREFS_KEY_SHOT_HISTOGRAMS, null), shotHistograms);
+            loadHistogram(prefs.getString(PREFS_KEY_HIT_HISTOGRAMS, null), hitHistograms);
 
             blackPaint = new Paint();
             blackPaint.setColor(Color.BLACK);
@@ -252,6 +354,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                     Color.rgb(233, 30, 99),  // LINE_DELETE - pink
                     Color.rgb(76, 175, 80),  // EXTRA_BALLS - green
                     Color.rgb(156, 39, 176), // MOVE_START_POINT - purple
+                    Color.rgb(0, 188, 212),  // DRAG_PADDLE - cyan
             };
             bonusColorPaints = new Paint[Bonus.values().length];
             for (int i = 0; i < bonusColorPaints.length; i++) {
@@ -269,7 +372,17 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             bonusIconPaint.setColor(Color.WHITE);
             bonusIconPaint.setStyle(Paint.Style.STROKE);
             bonusIconPaint.setStrokeWidth(6);
+            bonusIconPaint.setStrokeCap(Paint.Cap.ROUND);
+            bonusIconPaint.setStrokeJoin(Paint.Join.ROUND);
             bonusIconPaint.setAntiAlias(true);
+
+            bonusIconFillPaint = new Paint();
+            bonusIconFillPaint.setColor(Color.WHITE);
+            bonusIconFillPaint.setStyle(Paint.Style.FILL);
+            bonusIconFillPaint.setAntiAlias(true);
+
+            bonusIconThinPaint = new Paint(bonusIconPaint);
+            bonusIconThinPaint.setStrokeWidth(bonusIconPaint.getStrokeWidth() * 0.4f);
 
             bonusBadgePaint = new Paint();
             bonusBadgePaint.setColor(Color.rgb(220, 20, 20));
@@ -311,6 +424,9 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             statsBarPaint = new Paint();
             statsBarPaint.setColor(Color.rgb(33, 150, 243));
 
+            statsBarPaint2 = new Paint();
+            statsBarPaint2.setColor(Color.rgb(76, 175, 80));
+
             statsBarLabelPaint = new Paint();
             statsBarLabelPaint.setColor(Color.rgb(190, 180, 220));
             statsBarLabelPaint.setTextSize(26);
@@ -342,6 +458,14 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         }
 
 
+        // surfaceDestroyed() below stops any previous loop before this runs again, but guard here
+        // too in case some code path ever calls surfaceCreated() twice without an intervening
+        // destroy -- starting a second GameLoop on top of a live one would have both threads
+        // calling update()/draw() every frame (guarded by the same lock, so not corrupting state,
+        // but silently doubling update speed and duplicating all game-over/round-end side effects).
+        if (gameLoop != null) {
+            gameLoop.stopLoop();
+        }
         gameLoop = new GameLoop(this, holder);
         gameLoop.startLoop();
     }
@@ -351,13 +475,41 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         Log.d("Game()", "surfaceChanged()");
     }
 
+    // Stops the render/update thread before the Surface backing it goes away. Previously a no-op
+    // -- the GameLoop thread kept running and calling surfaceHolder.lockCanvas() against a Surface
+    // that could be mid-teardown, however that manifests on a given device/API level (a null
+    // canvas making Game.draw() throw and silently killing the thread, or just wasted work).
+    // Whenever the surface is later recreated (screen rotation, the app coming back to the
+    // foreground, or -- as reported -- the soft keyboard opening for the Import & Replay dialog's
+    // EditText triggering a window resize), that dead/stale thread left nothing driving
+    // GameBoard.update() anymore: the board visibly froze and stayed frozen even though touch
+    // input kept being delivered and mutating state that nothing ever rendered or advanced again.
     @Override
     public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
         Log.d("Game()", "surfaceDestroyed()");
+        if (gameLoop != null) {
+            gameLoop.stopLoop();
+            gameLoop = null;
+        }
     }
 
+    // GameLoop runs update()/draw() on its own thread, guarded by synchronized(surfaceHolder)
+    // (see GameLoop.run()). onTouchEvent() runs on the UI thread and mutates the exact same
+    // GameBoard state (fireSpeedX/Y, nextFireBall, fire, dirLineActive, ball positions) with no
+    // lock at all -- so a touch completing a new aim could interleave with an in-progress
+    // multi-ball launch mid-sequence, overwriting fireSpeedX/Y partway through: balls already
+    // dispatched keep the old direction, the rest pick up the new one (reported bug: "launch angle
+    // changes partway through firing the balls"). Synchronizing on the same lock GameLoop uses
+    // (getHolder() is the same SurfaceHolder instance passed to it) makes touch handling and
+    // update()/draw() mutually exclusive, closing the race.
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        synchronized (getHolder()) {
+            return handleTouchEvent(event);
+        }
+    }
+
+    private boolean handleTouchEvent(MotionEvent event) {
 
         // While a replay is playing, the live board/animations are paused (see update()): the
         // burger menu button still works, and a tap anywhere else skips the replay early.
@@ -368,6 +520,20 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 } else {
                     replaying = false;
                 }
+            }
+            return true;
+        }
+
+        // Level-Editor screen: the menu button is disabled here (see draw()) -- its hit area sits
+        // on top of the grid's top-right cell, which made that cell untappable (reported bug).
+        // "Schliessen" in the editor's own action row is the way out instead.
+        if (levelEditorActive) {
+            if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                levelEditor.handleTouch(event.getX(), event.getY());
+            } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
+                // "Streifen": lets a finger dragged across several cells paint/erase all of them
+                // in one motion instead of tapping each individually (see LevelEditor.handleTouchMove()).
+                levelEditor.handleTouchMove(event.getX(), event.getY());
             }
             return true;
         }
@@ -396,6 +562,12 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                     showBurgerMenu();
                     return true;
                 }
+                // Speed-up overlay (see GameBoard.shouldOfferSpeedUp()): fast-forward past the
+                // current boring stretch instead of forwarding the tap as an aim release.
+                if (gameBoard != null && gameBoard.isSpeedUpButtonHit(event.getX(), event.getY())) {
+                    gameBoard.fastForwardToNextBlockHit();
+                    return true;
+                }
                 // Check if a bonus button was hit -- arms/disarms it for the next shot instead of
                 // being forwarded to the board as an aim release. A press-and-hold on the same
                 // button instead shows its explanation dialog (already triggered by the pending
@@ -412,12 +584,19 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 }
                 bonusLongPressTriggered = false;
                 // Check if a LEVEL/SCORE/BEST stat box was hit -- feeds the cheat tap-sequence
-                // detector instead of being forwarded to the board.
+                // detector instead of being forwarded to the board. A press-and-hold on SCORE
+                // instead opens the save-slot menu (already triggered by the pending Runnable
+                // below while it was still held, so just suppress the tap here).
+                cancelStatBoxLongPress();
                 StatBox tappedStatBox = getStatBoxHit(event.getX(), event.getY());
                 if (tappedStatBox != null) {
-                    onStatBoxTapped(tappedStatBox);
+                    if (!(tappedStatBox == StatBox.SCORE && scoreLongPressTriggered)) {
+                        onStatBoxTapped(tappedStatBox);
+                    }
+                    scoreLongPressTriggered = false;
                     return true;
                 }
+                scoreLongPressTriggered = false;
                 // Check if Share Report button was hit (and game is frozen)
                 if (gameBoard != null && gameBoard.isFrozen() && gameBoard.isShareReportButtonHit(event.getX(), event.getY())) {
                     System.out.println("Button hit! Calling shareDebugReport()");
@@ -445,6 +624,9 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 if (isMenuButtonHit(event.getX(), event.getY())) {
                     return true;
                 }
+                if (gameBoard != null && gameBoard.isSpeedUpButtonHit(event.getX(), event.getY())) {
+                    return true;
+                }
                 cancelBonusLongPress();
                 bonusTouchDownBonus = getBonusButtonHit(event.getX(), event.getY());
                 bonusLongPressTriggered = false;
@@ -455,6 +637,15 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                         showBonusExplanationDialog(pressedBonus);
                     };
                     bonusLongPressHandler.postDelayed(bonusLongPressRunnable, ViewConfiguration.getLongPressTimeout());
+                }
+                cancelStatBoxLongPress();
+                scoreLongPressTriggered = false;
+                if (getStatBoxHit(event.getX(), event.getY()) == StatBox.SCORE) {
+                    statBoxLongPressRunnable = () -> {
+                        scoreLongPressTriggered = true;
+                        showSaveSlotMenu();
+                    };
+                    statBoxLongPressHandler.postDelayed(statBoxLongPressRunnable, ViewConfiguration.getLongPressTimeout());
                 }
                 if (gameOver) {
                       gameOver = false;
@@ -477,9 +668,40 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                     }
                 }
                 return true;
+            case MotionEvent.ACTION_CANCEL:
+                // The OS sends this instead of ACTION_UP when a system gesture steals the touch
+                // mid-aim (e.g. pulling down the notification shade to start a screen recording).
+                // Without this, dirLineActive stayed stuck true, and the next unrelated tap (often
+                // meant for the burger button) was interpreted by touchRelease() as completing that
+                // abandoned aim -- firing a shot instead of opening the menu.
+                cancelBonusLongPress();
+                bonusTouchDownBonus = null;
+                bonusLongPressTriggered = false;
+                cancelStatBoxLongPress();
+                scoreLongPressTriggered = false;
+                if (gameBoard != null) {
+                    gameBoard.cancelAim();
+                }
+                return true;
         }
 
         return super.onTouchEvent(event);
+    }
+
+    // Android 12+ shows its own "Copied to clipboard" system overlay (with Copy/Share/etc. actions)
+    // right after ClipboardManager.setPrimaryClip() -- a default-gravity Toast lands in that same
+    // bottom-center area and covers those actions (reported bug). Toast#setGravity() can't fix
+    // this: apps targeting API 30+ (this app targets 35) have their Toast gravity silently ignored
+    // by the platform -- confirmed still overlapping after trying that. Drawing our own banner
+    // near the top of the board (see MessageBannerAnimation) sidesteps the restriction entirely.
+    // Used for every clipboard-copy confirmation in this file instead of a system Toast.
+    private static final int CLIPBOARD_TOAST_SHORT_TICKS = 120; // ~2s at 60 updates/s
+    private static final int CLIPBOARD_TOAST_LONG_TICKS = 210;  // ~3.5s
+
+    private void showClipboardToast(String message, int duration) {
+        if (gameBoard == null) return;
+        int ticks = (duration == Toast.LENGTH_LONG) ? CLIPBOARD_TOAST_LONG_TICKS : CLIPBOARD_TOAST_SHORT_TICKS;
+        addAnimation(new MessageBannerAnimation(gameBoard, ticks, message));
     }
 
     private void shareDebugReport() {
@@ -489,7 +711,10 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             return;
         }
 
-        String report = gameBoard.getDebugReportForSharing();
+        String report;
+        synchronized (getHolder()) {
+            report = gameBoard.getDebugReportForSharing();
+        }
         System.out.println("Generated report length: " + report.length());
         logDebugReportToLogcat(report);
 
@@ -499,7 +724,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             System.out.println("Report copied to clipboard");
         }
 
-        Toast.makeText(getContext(), "Debug-Report kopiert. E-Mail-Entwurf wird geoeffnet.", Toast.LENGTH_SHORT).show();
+        showClipboardToast("Debug-Report kopiert. E-Mail-Entwurf wird geoeffnet.", Toast.LENGTH_SHORT);
 
         Intent emailIntent = new Intent(Intent.ACTION_SENDTO);
         emailIntent.setData(Uri.parse("mailto:"));
@@ -525,7 +750,18 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // with Claude) instead of having to describe a bug by hand. Unlike shareDebugReport() above,
     // this works after any normal shot, not just while frozen on a detected collision bug.
     private void exportLastMoveReport() {
-        String report = gameBoard == null ? null : gameBoard.getLastMoveReport();
+        // Runs from the burger AlertDialog's item-click callback -- a separate UI-thread event,
+        // entirely outside onTouchEvent()'s synchronized(getHolder()) block (see there for why
+        // that's needed). GameLoop's thread can be mid-way through finishMoveRecording() (which
+        // updates lastMoveBlockSnapshot/lastMoveBlockSnapshotAfter) at the exact moment this reads
+        // them, so without this same lock the "vor"/"nach" JSON here could come from two different
+        // moves, or otherwise not reflect a consistent snapshot pair (reported bug: exported
+        // "vor"/"nach dem Zug" boards came back identical for a shot that must have changed the
+        // board).
+        String report;
+        synchronized (getHolder()) {
+            report = gameBoard == null ? null : gameBoard.getLastMoveReport();
+        }
         if (report == null) {
             Toast.makeText(getContext(), "Kein letzter Zug zum Exportieren vorhanden.", Toast.LENGTH_SHORT).show();
             return;
@@ -535,7 +771,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         if (clipboard != null) {
             clipboard.setPrimaryClip(ClipData.newPlainText("BlockPong Letzter Zug", report));
         }
-        Toast.makeText(getContext(), "Letzter Zug kopiert.", Toast.LENGTH_SHORT).show();
+        showClipboardToast("Letzter Zug kopiert.", Toast.LENGTH_SHORT);
 
         Intent shareIntent = new Intent(Intent.ACTION_SEND);
         shareIntent.setType("text/plain");
@@ -587,6 +823,8 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             canvas.drawText("REPLAY  SLOW x" + REPLAY_SLOW_MOTION_FACTOR, 50, 1700, debugPaint);
         } else if (showingStats) {
             drawStatsScreen(canvas);
+        } else if (levelEditorActive) {
+            levelEditor.draw(canvas);
         } else {
             // draw game board
             gameBoard.draw(canvas);
@@ -605,9 +843,17 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             if (debugMode) {
                 canvas.drawText("DEBUG ON  SLOW x" + slowMotionFactor, 50, 1700, debugPaint);
             }
+            if (testPlayActive) {
+                canvas.drawText("TESTSPIEL - Menue > \"Testspiel beenden\"", 30, 60, debugPaint);
+            }
         }
 
-        drawMenuButton(canvas);
+        // Hidden in the Level-Editor -- its hit area overlapped the grid's top-right cell, making
+        // that cell untappable (reported bug); "Schliessen" in the editor's own action row is the
+        // way out instead (see handleTouchEvent()).
+        if (!levelEditorActive) {
+            drawMenuButton(canvas);
+        }
     }
 
     public void update() {
@@ -617,16 +863,27 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         if (replaying) {
             replayTickCounter++;
             if (replayTickCounter % REPLAY_SLOW_MOTION_FACTOR == 0) {
-                replayFrameIndex++;
-                if (gameBoard == null || replayFrameIndex >= gameBoard.getLastMoveFrameCount()) {
+                if (gameBoard == null) {
                     replaying = false;
+                } else if (replayFrameIndex < gameBoard.getLastMoveFrameCount() - 1) {
+                    replayFrameIndex++;
                 }
+                // else: last frame reached -- hold there instead of auto-clearing "replaying".
+                // It must only end via the explicit tap onTouchEvent() already handles (same as
+                // skipping it early), otherwise a tap meant to dismiss the finished replay can
+                // land just after it auto-clears and get misread as a live aim/fire on the actual
+                // board underneath -- launching an unwanted ball (reported bug).
             }
             return;
         }
 
         // Live gameplay/animations are paused while the Statistik screen is up, same as replaying.
         if (showingStats) {
+            return;
+        }
+
+        // ...and while the Level-Editor is up.
+        if (levelEditorActive) {
             return;
         }
 
@@ -654,6 +911,15 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
 
         // game updates
         gameBoard.update();
+
+        // "Abspielen in Zeitlupe" in the Import & Replay dialog: once the shot fired from there
+        // (identified by the move-completion count moving past what it was right before firing --
+        // not just hasLastMoveRecording(), which could already be true from an earlier, unrelated
+        // move) has finished, automatically switch into the existing slow-motion replay viewer.
+        if (pendingAutoReplay && gameBoard.getCompletedMoveCount() != pendingAutoReplaySeq) {
+            pendingAutoReplay = false;
+            startReplay();
+        }
     }
 
     public void addAnimation(Animation a) {
@@ -667,30 +933,50 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         gameLoop.stopLoop();
     }
 
+    // Counterpart to pause() -- MainActivity previously had no onResume() at all, so once
+    // onPause() stopped the loop, nothing ever restarted it unless surfaceCreated() happened to
+    // fire again on the way back (which it reliably does after the process was killed and
+    // relaunched, but NOT after a lighter-weight transition like the system share chooser opened
+    // by "Letzten Zug exportieren (Debug)" -- that activity doesn't tear down this one's Surface,
+    // so surfaceCreated() never re-fires and the board was left permanently frozen, looking
+    // exactly like a hung "Import & Replay", even for actions unrelated to that dialog).
+    // gameBoard==null means surfaceCreated() hasn't run even once yet -- nothing to resume; it
+    // will start the loop itself once the surface is ready.
+    public void resume() {
+        if (gameBoard == null) return;
+        if (gameLoop != null) {
+            gameLoop.stopLoop();
+        }
+        gameLoop = new GameLoop(this, getHolder());
+        gameLoop.startLoop();
+    }
+
     // Persists level/score/board so the game can be reconstructed on next launch even after the
     // whole process was killed (e.g. Android reclaiming memory after the app sat unused for a
     // long time). Called from pause(), which the OS guarantees to run before that can happen.
     private void saveState() {
         if (gameBoard == null) return;
-        StringBuilder bonusCountsCsv = new StringBuilder();
-        for (int i = 0; i < bonusCounts.length; i++) {
-            if (i > 0) bonusCountsCsv.append(',');
-            bonusCountsCsv.append(bonusCounts[i]);
-        }
+        // Probespielen: never persist an abandoned test board/level/score over the real save --
+        // e.g. if the app gets backgrounded (and possibly killed) while test-playing. The real
+        // state sitting in the preTestPlay* fields is only ever written back via endTestPlay(),
+        // not through here.
+        if (testPlayActive) return;
         prefs.edit()
                 .putInt(PREFS_KEY_SAVED_LEVEL, level)
                 .putInt(PREFS_KEY_SAVED_SCORE, score)
                 .putString(PREFS_KEY_SAVED_BLOCKS, gameBoard.exportBlocksJson())
-                .putString(PREFS_KEY_SAVED_BONUS_COUNTS, bonusCountsCsv.toString())
-                .putString(PREFS_KEY_SHOT_HISTOGRAMS, serializeShotHistograms())
+                .putString(PREFS_KEY_SAVED_BONUS_COUNTS, serializeBonusCounts())
+                .putString(PREFS_KEY_SHOT_HISTOGRAMS, serializeHistogram(shotHistograms))
+                .putString(PREFS_KEY_HIT_HISTOGRAMS, serializeHistogram(hitHistograms))
                 .apply();
     }
 
     // Format: "<ballsUsed>:<bin>=<count>,<bin>=<count>;<ballsUsed>:...". Both maps are TreeMaps
-    // so this (and the dropdown listing) always comes out in a stable, sorted order.
-    private String serializeShotHistograms() {
+    // so this (and the dropdown listing) always comes out in a stable, sorted order. Shared by
+    // both shotHistograms and hitHistograms, which have the same shape.
+    private String serializeHistogram(TreeMap<Integer, TreeMap<Integer, Integer>> histogram) {
         StringBuilder sb = new StringBuilder();
-        for (Map.Entry<Integer, TreeMap<Integer, Integer>> bucket : shotHistograms.entrySet()) {
+        for (Map.Entry<Integer, TreeMap<Integer, Integer>> bucket : histogram.entrySet()) {
             if (sb.length() > 0) sb.append(';');
             sb.append(bucket.getKey()).append(':');
             boolean first = true;
@@ -703,8 +989,8 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         return sb.toString();
     }
 
-    private void loadShotHistograms(String csv) {
-        shotHistograms.clear();
+    private void loadHistogram(String csv, TreeMap<Integer, TreeMap<Integer, Integer>> target) {
+        target.clear();
         if (csv == null || csv.isEmpty()) return;
         for (String bucketPart : csv.split(";")) {
             String[] bucketSplit = bucketPart.split(":", 2);
@@ -717,17 +1003,19 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                     if (binSplit.length != 2) continue;
                     bins.put(Integer.parseInt(binSplit[0]), Integer.parseInt(binSplit[1]));
                 }
-                if (!bins.isEmpty()) shotHistograms.put(ballsUsed, bins);
+                if (!bins.isEmpty()) target.put(ballsUsed, bins);
             } catch (NumberFormatException ignored) {
                 // skip malformed entry
             }
         }
     }
 
-    // Tallies one finished shot into the histogram for its ballsUsed bucket (see onRoundEnd()).
-    private void recordShotStatistics(int ballsUsed, int blocksCleared) {
-        int bin = blocksCleared / SHOT_HISTOGRAM_BIN_SIZE;
-        shotHistograms.computeIfAbsent(ballsUsed, k -> new TreeMap<>()).merge(bin, 1, Integer::sum);
+    // Tallies one finished shot into the histograms for its ballsUsed bucket (see onRoundEnd()).
+    private void recordShotStatistics(int ballsUsed, int blocksCleared, int blocksHit) {
+        int clearedBin = blocksCleared / SHOT_HISTOGRAM_BIN_SIZE;
+        shotHistograms.computeIfAbsent(ballsUsed, k -> new TreeMap<>()).merge(clearedBin, 1, Integer::sum);
+        int hitBin = blocksHit / HIT_HISTOGRAM_BIN_SIZE;
+        hitHistograms.computeIfAbsent(ballsUsed, k -> new TreeMap<>()).merge(hitBin, 1, Integer::sum);
     }
 
     public void setGameOver(boolean win) {
@@ -740,6 +1028,11 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     }
 
     public void increaselevel() {
+        // Probespielen: clearing the whole test board must not advance the player's real level --
+        // loadLevelJson() keeps returning the same testPlayJson regardless, so the LevelComplete-
+        // Animation's subsequent initBoard() call just reloads the fresh, unplayed test layout,
+        // letting the player try it again immediately.
+        if (testPlayActive) return;
         level++;
     }
 
@@ -749,25 +1042,55 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
 
     public void addScore(int points) {
         score += points;
-        if (!cheatsUsed && score > bestScore) {
+        // Probespielen: a good test run must not leak into the real highscore, same as cheatsUsed.
+        if (!cheatsUsed && !testPlayActive && score > bestScore) {
             bestScore = score;
             prefs.edit().putInt(PREFS_KEY_BEST_SCORE, bestScore).apply();
         }
     }
 
     // Called by GameBoard once a move (all balls back at rest) ends. Tallies the shot into the
-    // statistics histogram, then awards a random bonus if it cleared BLOCKS_CLEARED_BONUS_THRESHOLD
-    // blocks -- unless this same shot already spent a bonus (see consumeArmedBonuses()), so bonus
-    // shots can't chain into more bonuses.
+    // statistics histogram, then awards random bonuses per bonusesForBlocksCleared() -- unless this
+    // same shot already spent a bonus (see consumeArmedBonuses()), so bonus shots can't chain into
+    // more bonuses.
     @Override
     public void onRoundEnd(int blocksCleared, int ballsUsed) {
-        recordShotStatistics(ballsUsed, blocksCleared);
+        int blocksHit = gameBoard == null ? blocksCleared : gameBoard.getHitsThisMove();
+        // Probespielen: test shots aren't representative real play, so they're kept out of the
+        // persisted shot/hit histograms (see showStatsScreen()).
+        if (!testPlayActive) {
+            recordShotStatistics(ballsUsed, blocksCleared, blocksHit);
+        }
         boolean bonusSpentThisShot = bonusUsedThisShot;
         bonusUsedThisShot = false;
-        if (!bonusSpentThisShot && blocksCleared >= BLOCKS_CLEARED_BONUS_THRESHOLD) {
-            Bonus awarded = Bonus.values()[bonusRandom.nextInt(Bonus.values().length)];
-            bonusCounts[awarded.ordinal()]++;
+        if (!bonusSpentThisShot) {
+            int bonusesToAward = bonusesForBlocksCleared(blocksCleared);
+            for (int i = 0; i < bonusesToAward; i++) {
+                Bonus awarded = pickRandomBonus();
+                bonusCounts[awarded.ordinal()]++;
+                if (gameBoard != null) {
+                    addAnimation(new BonusAwardAnimation(gameBoard, BONUS_AWARD_ANIMATION_DURATION,
+                            awarded, bonusColorPaints[awarded.ordinal()].getColor(), bonusTitle(awarded),
+                            i * BONUS_AWARD_STAGGER_TICKS));
+                }
+            }
         }
+    }
+
+    // Tier lookup for onRoundEnd() -- highest tier the shot reached wins (not additive), see
+    // BLOCKS_CLEARED_BONUS_THRESHOLD*'s comment. Also used by drawStatsScreen() to know which
+    // boundaries to mark on the shot-statistics histogram.
+    private static int bonusesForBlocksCleared(int blocksCleared) {
+        if (blocksCleared >= BLOCKS_CLEARED_BONUS_THRESHOLD_3) return 3;
+        if (blocksCleared >= BLOCKS_CLEARED_BONUS_THRESHOLD_2) return 2;
+        if (blocksCleared >= BLOCKS_CLEARED_BONUS_THRESHOLD) return 1;
+        return 0;
+    }
+
+    // Picks the bonus type to award (see onRoundEnd()) -- see BonusPicker for the actual weighting
+    // (favors whichever types bonusCounts says the player doesn't have yet).
+    private Bonus pickRandomBonus() {
+        return BonusPicker.pickWeighted(bonusRandom, bonusCounts, UNOWNED_BONUS_WEIGHT_MULTIPLIER);
     }
 
     // GameBoard reads this to apply EXTENDED_PATH/MOVE_START_POINT continuously while armed
@@ -874,8 +1197,19 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         return new RectF(left, top, right, bottom);
     }
 
+    // The menu button must always win over aiming/firing, even for a touch that lands just
+    // outside its drawn bounds (reported requirement: releasing near the button should never
+    // launch a ball) -- so hit-testing uses this padded rect rather than the tight drawn one.
+    private static final float MENU_BUTTON_HIT_PADDING = 60f;
+
+    private RectF getMenuButtonHitRect() {
+        RectF r = getMenuButtonRect();
+        r.inset(-MENU_BUTTON_HIT_PADDING, -MENU_BUTTON_HIT_PADDING);
+        return r;
+    }
+
     private boolean isMenuButtonHit(float x, float y) {
-        return getMenuButtonRect().contains(x, y);
+        return getMenuButtonHitRect().contains(x, y);
     }
 
     private void drawMenuButton(Canvas canvas) {
@@ -894,38 +1228,476 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
 
     private void showBurgerMenu() {
         List<String> items = new ArrayList<>();
+
+        // Every item's index is captured explicitly (rather than relied on via hardcoded
+        // `case N:` labels) since several items are only conditionally added -- "Testspiel
+        // beenden" only while test-playing, "Zu einem frueheren Level"/"Level-Editor" only while
+        // NOT test-playing (jumping levels or re-entering the editor mid-test would conflict with
+        // the paused real game the test is sitting on top of, see startTestPlay()/endTestPlay()) --
+        // so a fixed case number would silently point at the wrong action whenever a conditional
+        // item's presence didn't match what the number assumed.
+        final int testPlayEndIdx = testPlayActive ? items.size() : -1;
+        if (testPlayActive) {
+            items.add("Testspiel beenden (zurueck zum Editor)");
+        }
+        final int replayIdx = items.size();
         items.add("Replay in Zeitlupe (letzter Zug)");
+        final int debugIdx = items.size();
         items.add(debugMode ? "Debug-Modus deaktivieren" : "Debug-Modus aktivieren");
+        final int restartIdx = items.size();
         items.add("Spiel neu starten");
+        final int statsIdx = items.size();
         items.add("Statistik");
+        final int exportMoveIdx = items.size();
         items.add("Letzten Zug exportieren (Debug)");
-        if (level > 1) {
+        final int importReplayIdx = items.size();
+        items.add("Import & Replay (Debug)...");
+        final int levelPickerIdx = (!testPlayActive && level > 1) ? items.size() : -1;
+        if (levelPickerIdx != -1) {
             items.add("Zu einem früheren Level zurückkehren");
+        }
+        final int levelEditorIdx = testPlayActive ? -1 : items.size();
+        if (!testPlayActive) {
+            items.add("Level-Editor");
         }
         new AlertDialog.Builder(getContext())
                 .setItems(items.toArray(new String[0]), (dialog, which) -> {
-                    switch (which) {
-                        case 0:
-                            startReplay();
-                            break;
-                        case 1:
-                            toggleDebugMode();
-                            break;
-                        case 2:
-                            restartLevel();
-                            break;
-                        case 3:
-                            showStatsScreen();
-                            break;
-                        case 4:
-                            exportLastMoveReport();
-                            break;
-                        case 5:
-                            showLevelPicker();
-                            break;
+                    if (which == testPlayEndIdx) {
+                        endTestPlay();
+                    } else if (which == replayIdx) {
+                        startReplay();
+                    } else if (which == debugIdx) {
+                        toggleDebugMode();
+                    } else if (which == restartIdx) {
+                        restartLevel();
+                    } else if (which == statsIdx) {
+                        showStatsScreen();
+                    } else if (which == exportMoveIdx) {
+                        exportLastMoveReport();
+                    } else if (which == importReplayIdx) {
+                        showImportReplayDialog();
+                    } else if (which == levelPickerIdx) {
+                        showLevelPicker();
+                    } else if (which == levelEditorIdx) {
+                        showLevelEditorEntry();
                     }
                 })
                 .show();
+    }
+
+    // Burger menu action: pick an existing level to edit, or create a new one (appended after the
+    // last known level, or inserted at a chosen position -- see LevelEditor.Mode and
+    // insertLevelWithShift()).
+    private void showLevelEditorEntry() {
+        List<Integer> known = listKnownLevels();
+        int maxKnown = known.isEmpty() ? 0 : known.get(known.size() - 1);
+
+        // Rows cover every level 1..maxKnown so the reserved random-level slots (10, 20, 30, ...)
+        // show up too, greyed out and unselectable, instead of just silently not being listed --
+        // see isRandomLevelSlot().
+        List<Integer> rowLevel = new ArrayList<>(); // -1 for the trailing "action" rows
+        List<String> labels = new ArrayList<>();
+        List<Boolean> rowEnabled = new ArrayList<>();
+        for (int lvl = 1; lvl <= maxKnown; lvl++) {
+            if (isRandomLevelSlot(lvl)) {
+                labels.add("Level " + lvl + " (Zufalls-Level)");
+                rowEnabled.add(false);
+                rowLevel.add(lvl);
+            } else if (known.contains(lvl)) {
+                labels.add("Level " + lvl + " bearbeiten");
+                rowEnabled.add(true);
+                rowLevel.add(lvl);
+            }
+        }
+        final int newLevelIdx = labels.size();
+        labels.add("Neues Level erstellen...");
+        rowEnabled.add(true);
+        rowLevel.add(-1);
+        final int exportAllIdx = labels.size();
+        labels.add("Alle Level exportieren");
+        rowEnabled.add(true);
+        rowLevel.add(-1);
+
+        ArrayAdapter<String> adapter = new ArrayAdapter<String>(getContext(), android.R.layout.simple_list_item_1, labels) {
+            @Override
+            public boolean isEnabled(int position) {
+                return rowEnabled.get(position);
+            }
+
+            @NonNull
+            @Override
+            public android.view.View getView(int position, android.view.View convertView, @NonNull ViewGroup parent) {
+                android.view.View v = super.getView(position, convertView, parent);
+                TextView tv = (TextView) v;
+                tv.setTextColor(rowEnabled.get(position) ? Color.WHITE : Color.GRAY);
+                tv.setEnabled(rowEnabled.get(position));
+                return v;
+            }
+        };
+
+        new AlertDialog.Builder(getContext())
+                .setTitle("Level-Editor")
+                .setAdapter(adapter, (dialog, which) -> {
+                    if (!rowEnabled.get(which)) {
+                        return; // random-level rows are not clickable, but guard defensively
+                    }
+                    if (which == newLevelIdx) {
+                        showNewLevelDialog(known);
+                    } else if (which == exportAllIdx) {
+                        exportAllLevels(known);
+                    } else {
+                        openLevelEditorFor(rowLevel.get(which));
+                    }
+                })
+                .show();
+    }
+
+    // "Alle Level exportieren": bundles every known level (assets + Level-Editor overrides, see
+    // listKnownLevels()) into one clipboard export -- each section uses the same
+    // "LabelN (JSON, kompatibel mit tools/level_editor.py):\n{...}" shape getLastMoveReport()
+    // already uses for its "vor"/"nach dem Zug" boards, which tools/level_editor.py's paste-JSON
+    // import already knows how to pull multiple {"blocks":...} objects out of in one paste --
+    // sparing a level-by-level "Exportieren" click for every override an insert-with-shift may
+    // have touched.
+    private void exportAllLevels(List<Integer> known) {
+        if (known.isEmpty()) {
+            Toast.makeText(getContext(), "Keine Level zum Exportieren vorhanden.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("BlockPong - Alle Level (Export)\n");
+        for (int lvl : known) {
+            String json = loadLevelJson(lvl);
+            if (json == null) continue;
+            sb.append("Level ").append(lvl).append(" (JSON, kompatibel mit tools/level_editor.py):\n");
+            sb.append(json.trim()).append("\n\n");
+        }
+        exportJsonToClipboard(sb.toString());
+        showClipboardToast(known.size() + " Level in die Zwischenablage kopiert.", Toast.LENGTH_LONG);
+    }
+
+    private void showNewLevelDialog(List<Integer> known) {
+        int nextAppend = known.isEmpty() ? 1 : nextEditableSlot(known.get(known.size() - 1) + 1);
+        String[] options = {"Anhängen (wird Level " + nextAppend + ")", "Einfügen an Position..."};
+        new AlertDialog.Builder(getContext())
+                .setTitle("Neues Level erstellen")
+                .setItems(options, (dialog, which) -> {
+                    if (which == 0) {
+                        openLevelEditorNew(nextAppend, false);
+                    } else {
+                        showInsertPositionDialog(nextAppend);
+                    }
+                })
+                .show();
+    }
+
+    // Numeric entry for "insert at position N" -- a plain AlertDialog only offers up to 3 button
+    // slots and none of them are text-input-friendly, so this reuses the hand-built
+    // EditText+ScrollView+button-bar template already established for showImportReplayDialog().
+    private void showInsertPositionDialog(int defaultLevel) {
+        EditText input = new EditText(getContext());
+        input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        input.setText(String.valueOf(defaultLevel));
+
+        LinearLayout container = new LinearLayout(getContext());
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.addView(input);
+
+        AlertDialog dialog = new AlertDialog.Builder(getContext())
+                .setTitle("An welcher Position einfügen?")
+                .setView(container)
+                .setPositiveButton("Einfügen", null)
+                .setNegativeButton("Abbrechen", null)
+                .create();
+        dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            try {
+                int position = Integer.parseInt(input.getText().toString().trim());
+                if (position < 1) throw new NumberFormatException();
+                if (isRandomLevelSlot(position)) {
+                    Toast.makeText(getContext(), "Level " + position + " ist ein Zufalls-Level und kann nicht belegt werden.", Toast.LENGTH_LONG).show();
+                    return;
+                }
+                openLevelEditorNew(position, true);
+                dialog.dismiss();
+            } catch (NumberFormatException e) {
+                Toast.makeText(getContext(), "Bitte eine gültige Levelnummer (>=1) eingeben.", Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    private void openLevelEditorFor(int level) {
+        if (levelEditor == null) {
+            levelEditor = new LevelEditor(gameBoard, this);
+        }
+        levelEditor.openForEdit(level);
+        levelEditorActive = true;
+    }
+
+    private void openLevelEditorNew(int level, boolean insert) {
+        if (levelEditor == null) {
+            levelEditor = new LevelEditor(gameBoard, this);
+        }
+        levelEditor.openNew(level, insert);
+        levelEditorActive = true;
+    }
+
+    // "Probespielen" (LevelEditor.EditorCallbacks): leaves the editor screen and plays the editor's
+    // current in-memory layout -- saved or not -- as completely normal gameplay, so a level can be
+    // tried out before committing to "Speichern"/"Exportieren". The real game state underneath
+    // (which was simply paused, untouched, while the editor screen was up on top of it) is
+    // snapshotted here and restored by endTestPlay(), the only way back out (burger menu ->
+    // "Testspiel beenden").
+    @Override
+    public void startTestPlay(String json, int targetLevel) {
+        if (gameBoard == null) return;
+        preTestPlayLevel = level;
+        preTestPlayScore = score;
+        preTestPlayBlocksJson = gameBoard.exportBlocksJson();
+        preTestPlayGameOver = gameOver;
+        preTestPlayGameWon = gameWon;
+        preTestPlayBonusCounts = bonusCounts.clone();
+        preTestPlayArmedBonuses = EnumSet.copyOf(armedBonuses);
+
+        testPlayActive = true;
+        testPlayJson = json;
+        level = targetLevel;
+        gameOver = false;
+        armedBonuses.clear();
+        levelEditorActive = false;
+        gameBoard.initBoard();
+        showToast("Testspiel gestartet - Menue > \"Testspiel beenden\" fuehrt zurueck zum Editor.");
+    }
+
+    private void endTestPlay() {
+        if (!testPlayActive) return;
+        testPlayActive = false;
+        testPlayJson = null;
+        // Discard any animation left over from the test run (e.g. a level-complete curtain or
+        // game-over flourish still playing) rather than let it keep running over the restored,
+        // unrelated real board.
+        synchronized (ongoingAnimations) {
+            ongoingAnimations.clear();
+        }
+        synchronized (newAnimations) {
+            newAnimations.clear();
+        }
+
+        level = preTestPlayLevel;
+        score = preTestPlayScore;
+        gameOver = preTestPlayGameOver;
+        gameWon = preTestPlayGameWon;
+        System.arraycopy(preTestPlayBonusCounts, 0, bonusCounts, 0, bonusCounts.length);
+        armedBonuses.clear();
+        armedBonuses.addAll(preTestPlayArmedBonuses);
+
+        if (gameBoard != null) {
+            // Same two-step pattern as surfaceCreated()'s startup restore: initBoard() first to
+            // reset ball/fire-position state cleanly for the restored level (loadLevelJson() now
+            // resolves normally again, testPlayActive being false), then overlay the exact
+            // block layout the player had paused on.
+            gameBoard.initBoard();
+            gameBoard.restoreBlocksFromJson(preTestPlayBlocksJson);
+        }
+        levelEditorActive = true;
+    }
+
+    // Burger menu action: pastes a "Letzten Zug exportieren (Debug)" report (or just its board
+    // JSON + start x + launch vector) and immediately fires that exact shot live on the real
+    // board, bypassing touch input entirely -- so a reported bug's exact repro can be replayed
+    // with real physics to check whether a fix actually holds, instead of only watching the
+    // frozen recorded "Replay in Zeitlupe" (which can't exercise a code change at all).
+    private void showImportReplayDialog() {
+        // Defaults to the last completed shot's own report -- replaying the move that was just
+        // played is the common case (e.g. right after it looked wrong), so this saves having to
+        // export it and paste it back in by hand. Only kicks in with no draft yet (an edited/
+        // pasted-from-elsewhere draft from a previous open of this dialog still wins -- see
+        // importReplayDraftText's persistence across opens).
+        if (importReplayDraftText.isEmpty() && gameBoard != null) {
+            String lastMoveReport = gameBoard.getLastMoveReport();
+            if (lastMoveReport != null) {
+                importReplayDraftText = lastMoveReport;
+            }
+        }
+
+        EditText input = new EditText(getContext());
+        input.setMinLines(6);
+        input.setGravity(Gravity.TOP | Gravity.START);
+        input.setHint("Debug-Export hier einfuegen...");
+        input.setText(importReplayDraftText);
+
+        // A pasted debug report can run to dozens of lines (full board JSON, replay data); a bare
+        // EditText grows to fit all of it, which can push the dialog's buttons off the bottom of
+        // the screen with no way to reach them (reported bug). Capping the EditText inside a
+        // ScrollView keeps the dialog's own height (and its buttons) fixed regardless of paste
+        // length -- the text scrolls internally instead.
+        float density = getResources().getDisplayMetrics().density;
+        int maxHeightPx = Math.round(300 * density);
+        int paddingPx = Math.round(8 * density);
+        ScrollView scrollContainer = new ScrollView(getContext()) {
+            @Override
+            protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+                super.onMeasure(widthMeasureSpec,
+                        MeasureSpec.makeMeasureSpec(maxHeightPx, MeasureSpec.AT_MOST));
+            }
+        };
+        scrollContainer.setPadding(paddingPx, 0, paddingPx, 0);
+        scrollContainer.addView(input, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // AlertDialog.Builder only offers three built-in button slots (positive/neutral/negative),
+        // one short of the four wanted here in a specific order -- so the buttons are laid out by
+        // hand below the input instead of via setPositiveButton()/setNeutralButton()/
+        // setNegativeButton(), giving full control over both the order and the extra "Loeschen".
+        LinearLayout buttonBar = new LinearLayout(getContext());
+        buttonBar.setOrientation(LinearLayout.VERTICAL);
+        Button playButton = new Button(getContext());
+        playButton.setText("Abspielen");
+        Button slowMoButton = new Button(getContext());
+        slowMoButton.setText("Abspielen in Zeitlupe");
+        Button clearButton = new Button(getContext());
+        clearButton.setText("Loeschen");
+        Button closeButton = new Button(getContext());
+        closeButton.setText("Schliessen");
+        buttonBar.addView(playButton);
+        buttonBar.addView(slowMoButton);
+        buttonBar.addView(clearButton);
+        buttonBar.addView(closeButton);
+
+        LinearLayout container = new LinearLayout(getContext());
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.addView(scrollContainer);
+        container.addView(buttonBar);
+
+        AlertDialog dialog = new AlertDialog.Builder(getContext())
+                .setTitle("Import & Replay (Debug)")
+                .setView(container)
+                .create();
+        dialog.show();
+
+        // On success the dialog closes right away so the live board (with the shot now firing) is
+        // actually visible instead of staying hidden behind the dialog (reported bug -- the dialog
+        // used to never auto-close, so the shot played out unseen); on an invalid paste it stays
+        // open so the text can be fixed without retyping it.
+        playButton.setOnClickListener(v -> {
+            importReplayDraftText = input.getText().toString();
+            if (runImportReplay(importReplayDraftText, false)) {
+                dialog.dismiss();
+            }
+        });
+        slowMoButton.setOnClickListener(v -> {
+            importReplayDraftText = input.getText().toString();
+            if (runImportReplay(importReplayDraftText, true)) {
+                dialog.dismiss();
+            }
+        });
+        clearButton.setOnClickListener(v -> {
+            input.setText("");
+            importReplayDraftText = "";
+        });
+        closeButton.setOnClickListener(v -> dialog.dismiss());
+    }
+
+    // Returns true if the shot was actually fired (caller dismisses the dialog on true).
+    private boolean runImportReplay(String text, boolean thenShowSlowMotionReplay) {
+        int seqBeforeFire = gameBoard == null ? 0 : gameBoard.getCompletedMoveCount();
+        String error = importAndReplayDebugText(text);
+        if (error != null) {
+            Toast.makeText(getContext(), error, Toast.LENGTH_LONG).show();
+            return false;
+        }
+        if (thenShowSlowMotionReplay) {
+            pendingAutoReplay = true;
+            pendingAutoReplaySeq = seqBeforeFire;
+            Toast.makeText(getContext(), "Zug wird abgespielt, danach Zeitlupen-Replay...", Toast.LENGTH_SHORT).show();
+        } else {
+            Toast.makeText(getContext(), "Zug wird abgespielt...", Toast.LENGTH_SHORT).show();
+        }
+        return true;
+    }
+
+    // Returns null on success, or a user-facing error message (shown as a Toast) on failure.
+    private String importAndReplayDebugText(String text) {
+        if (gameBoard == null) {
+            return "Kein Spielfeld vorhanden.";
+        }
+        String blocksJson = extractBoardJson(text);
+        if (blocksJson == null) {
+            return "Kein Spielfeld-JSON im eingefuegten Text gefunden.";
+        }
+        Float startX = extractFirstNumberAfter(text, "Startpunkt x:");
+        float[] launch = extractLaunchVector(text);
+        if (startX == null || launch == null) {
+            return "Startpunkt x oder Wurfrichtung nicht gefunden -- bitte den kompletten Debug-Export einfuegen.";
+        }
+        Integer balls = extractFirstIntAfter(text, "Baelle:");
+        int ballCount = balls != null ? balls : 10;
+
+        // Same lock GameLoop's thread uses for update()/draw() (see onTouchEvent()) -- this
+        // mutates GameBoard state from a menu-dialog callback, exactly like the export actions
+        // that turned out to need it too.
+        boolean ok;
+        synchronized (getHolder()) {
+            ok = gameBoard.importAndReplayForDebug(blocksJson, startX, launch[0], launch[1], ballCount);
+        }
+        if (!ok) {
+            // The extracted "blocks" JSON didn't parse (e.g. text mangled by copy/paste through an
+            // email client) -- previously this silently fired a shot at an unrelated random board
+            // instead, with no indication anything had gone wrong (reported bug).
+            return "Spielfeld-JSON ist ungueltig -- bitte den kompletten, unveraenderten Debug-Export einfuegen.";
+        }
+        gameOver = false;
+        return null;
+    }
+
+    // Finds the first {"blocks": [...]} JSON object in free-form text (preferring the one after
+    // a "vor dem Zug" label, if present, since a full report may contain a "nach dem Zug" one
+    // too) via brace counting -- simple but sufficient since this format never nests braces
+    // inside string values.
+    private String extractBoardJson(String text) {
+        int labelIdx = text.indexOf("vor dem Zug");
+        int searchFrom = labelIdx >= 0 ? labelIdx : 0;
+        int start = text.indexOf('{', searchFrom);
+        if (start < 0) return null;
+        int depth = 0;
+        for (int i = start; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) return text.substring(start, i + 1);
+            }
+        }
+        return null;
+    }
+
+    private Float extractFirstNumberAfter(String text, String label) {
+        int idx = text.indexOf(label);
+        if (idx < 0) return null;
+        Matcher m = Pattern.compile("(-?[0-9]+(?:\\.[0-9]+)?)").matcher(text.substring(idx + label.length()));
+        if (!m.find()) return null;
+        try {
+            return Float.parseFloat(m.group(1));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private Integer extractFirstIntAfter(String text, String label) {
+        Float value = extractFirstNumberAfter(text, label);
+        return value == null ? null : Math.round(value);
+    }
+
+    private float[] extractLaunchVector(String text) {
+        int idx = text.indexOf("Wurfrichtung");
+        if (idx < 0) return null;
+        Matcher m = Pattern.compile("(-?[0-9]+(?:\\.[0-9]+)?)\\s*,\\s*(-?[0-9]+(?:\\.[0-9]+)?)").matcher(text.substring(idx));
+        if (!m.find()) return null;
+        try {
+            return new float[]{Float.parseFloat(m.group(1)), Float.parseFloat(m.group(2))};
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     // Opens the Statistik screen (burger menu), defaulting to the smallest ballsUsed bucket with
@@ -958,13 +1730,14 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 .show();
     }
 
-    // Histogram of blocks cleared per shot (see recordShotStatistics()), for the currently
-    // selected ballsUsed bucket. X-axis: blocks cleared, in SHOT_HISTOGRAM_BIN_SIZE-wide bins.
-    // Y-axis: how many shots landed in that bin. A vertical line marks
-    // BLOCKS_CLEARED_BONUS_THRESHOLD, the point from which a shot earns a bonus.
+    // Two histograms for the currently selected ballsUsed bucket, stacked in one screen: blocks
+    // actually cleared per shot (see recordShotStatistics(), same data/threshold as before) on
+    // top, and blocks merely hit (cleared or not) per shot below it -- the two can differ a lot
+    // (a shot can chip many blocks' values without clearing any of them), so seeing both at once
+    // is the point.
     private void drawStatsScreen(Canvas canvas) {
         canvas.drawColor(Color.BLACK);
-        canvas.drawText("Steine pro Schuss", 50, 150, statsTitlePaint);
+        canvas.drawText("Statistik", 50, 150, statsTitlePaint);
 
         RectF dropdown = getStatsDropdownRect();
         canvas.drawRoundRect(dropdown, 16, 16, statsDropdownPaint);
@@ -978,9 +1751,41 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             return;
         }
 
-        TreeMap<Integer, Integer> bins = shotHistograms.get(statsSelectedBallsUsed);
-        int thresholdBin = BLOCKS_CLEARED_BONUS_THRESHOLD / SHOT_HISTOGRAM_BIN_SIZE;
-        int maxBinIndex = Math.max(bins.isEmpty() ? 0 : bins.lastKey(), thresholdBin);
+        float slotsTop = 330f;
+        float slotsBottom = canvasHeight - 40f;
+        float slotGap = 30f;
+        float slotHeight = (slotsBottom - slotsTop - slotGap) / 2f;
+
+        drawHistogramChart(canvas, "Steine entfernt pro Schuss",
+                shotHistograms.get(statsSelectedBallsUsed), SHOT_HISTOGRAM_BIN_SIZE,
+                slotsTop, slotsTop + slotHeight, statsBarPaint,
+                new int[]{BLOCKS_CLEARED_BONUS_THRESHOLD, BLOCKS_CLEARED_BONUS_THRESHOLD_2, BLOCKS_CLEARED_BONUS_THRESHOLD_3},
+                new String[]{"1 Bonus ab " + BLOCKS_CLEARED_BONUS_THRESHOLD,
+                        "2 Boni ab " + BLOCKS_CLEARED_BONUS_THRESHOLD_2,
+                        "3 Boni ab " + BLOCKS_CLEARED_BONUS_THRESHOLD_3});
+
+        drawHistogramChart(canvas, "Treffer pro Schuss",
+                hitHistograms.get(statsSelectedBallsUsed), HIT_HISTOGRAM_BIN_SIZE,
+                slotsTop + slotHeight + slotGap, slotsBottom, statsBarPaint2,
+                null, null);
+    }
+
+    // Draws one bar-chart histogram (title, bars, bin labels, optional threshold markers) inside
+    // the vertical band [slotTop, slotBottom] -- shared by both charts in drawStatsScreen().
+    // X-axis: bin start value, in binSize-wide bins. Y-axis: how many shots landed in that bin.
+    // thresholdValues/thresholdLabels are parallel arrays (both null, or both the same length).
+    private void drawHistogramChart(Canvas canvas, String title, TreeMap<Integer, Integer> bins,
+                                     int binSize, float slotTop, float slotBottom, Paint barPaint,
+                                     int[] thresholdValues, String[] thresholdLabels) {
+        if (bins == null) bins = new TreeMap<>();
+        canvas.drawText(title, 50, slotTop + 30, statsTitlePaint);
+
+        int maxBinIndex = bins.isEmpty() ? 0 : bins.lastKey();
+        if (thresholdValues != null) {
+            for (int thresholdValue : thresholdValues) {
+                maxBinIndex = Math.max(maxBinIndex, thresholdValue / binSize);
+            }
+        }
         int binCount = maxBinIndex + 2;
         int maxCount = 1;
         for (int count : bins.values()) {
@@ -989,11 +1794,19 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
 
         float chartLeft = 80f;
         float chartRight = canvasWidth - 80f;
-        float chartTop = 380f;
-        float chartBottom = canvasHeight - 200f;
+        float chartTop = slotTop + 70f;
+        float chartBottom = slotBottom - 60f;
         float chartHeight = chartBottom - chartTop;
         float barSlotWidth = (chartRight - chartLeft) / binCount;
         float barGap = barSlotWidth * 0.15f;
+
+        // A wide-ranging histogram (the hits chart especially: one shot can hit far more blocks
+        // than it clears, e.g. bin "35-39") packs many narrow bins into the same chart width --
+        // drawing every bin's label then makes neighboring labels overlap. Thin them out to only
+        // as many as actually fit, evenly spaced, based on how wide the widest label actually is.
+        String widestLabel = ((binCount - 1) * binSize) + "-" + ((binCount - 1) * binSize + binSize - 1);
+        float labelWidth = statsBarLabelPaint.measureText(widestLabel);
+        int labelStride = Math.max(1, (int) Math.ceil((labelWidth + 16f) / barSlotWidth));
 
         for (int bin = 0; bin < binCount; bin++) {
             int count = bins.getOrDefault(bin, 0);
@@ -1002,16 +1815,24 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             if (count > 0) {
                 float barHeight = (count / (float) maxCount) * chartHeight;
                 barRect.top = chartBottom - barHeight;
-                canvas.drawRect(barRect, statsBarPaint);
+                canvas.drawRect(barRect, barPaint);
                 canvas.drawText(String.valueOf(count), barRect.centerX(), barRect.top - 12, statsBarCountPaint);
             }
-            String label = (bin * SHOT_HISTOGRAM_BIN_SIZE) + "-" + (bin * SHOT_HISTOGRAM_BIN_SIZE + SHOT_HISTOGRAM_BIN_SIZE - 1);
-            canvas.drawText(label, barLeft + (barSlotWidth - barGap) / 2f, chartBottom + 40, statsBarLabelPaint);
+            if (bin % labelStride == 0) {
+                String label = (bin * binSize) + "-" + (bin * binSize + binSize - 1);
+                canvas.drawText(label, barLeft + (barSlotWidth - barGap) / 2f, chartBottom + 40, statsBarLabelPaint);
+            }
         }
 
-        float thresholdX = chartLeft + thresholdBin * barSlotWidth;
-        canvas.drawLine(thresholdX, chartTop, thresholdX, chartBottom, statsThresholdPaint);
-        canvas.drawText("Bonus ab " + BLOCKS_CLEARED_BONUS_THRESHOLD, thresholdX + 10, chartTop - 10, statsThresholdTextPaint);
+        if (thresholdValues != null) {
+            for (int i = 0; i < thresholdValues.length; i++) {
+                int thresholdBin = thresholdValues[i] / binSize;
+                float thresholdX = chartLeft + thresholdBin * barSlotWidth;
+                canvas.drawLine(thresholdX, chartTop, thresholdX, chartBottom, statsThresholdPaint);
+                // Stack labels for adjacent tier lines that would otherwise overlap at chartTop.
+                canvas.drawText(thresholdLabels[i], thresholdX + 10, chartTop - 10 - i * 28, statsThresholdTextPaint);
+            }
+        }
     }
 
     // Lists every level below the current one so the player can jump back to it. Levels are
@@ -1057,9 +1878,12 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         }
     }
 
-    // Rebuilds the current level's board, keeping score/level as they are (see the burger menu).
+    // Rebuilds the current level's board (see the burger menu). Resets score back to 0, but keeps
+    // the current level -- bestScore is untouched since it's only ever raised on a new high (see
+    // addScore()).
     private void restartLevel() {
         gameOver = false;
+        score = 0;
         resetBonuses();
         if (gameBoard != null) {
             gameBoard.initBoard();
@@ -1071,10 +1895,139 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         Arrays.fill(bonusCounts, 0);
     }
 
+    // Shared by the auto-save (saveState()/surfaceCreated()) and the manual save slots
+    // (saveToSlot()/loadFromSlot()) -- both persist bonusCounts in the same simple CSV format.
+    private String serializeBonusCounts() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < bonusCounts.length; i++) {
+            if (i > 0) sb.append(',');
+            sb.append(bonusCounts[i]);
+        }
+        return sb.toString();
+    }
+
+    private void loadBonusCounts(String csv) {
+        Arrays.fill(bonusCounts, 0);
+        if (csv == null) return;
+        String[] parts = csv.split(",");
+        for (int i = 0; i < bonusCounts.length && i < parts.length; i++) {
+            try {
+                bonusCounts[i] = Integer.parseInt(parts[i]);
+            } catch (NumberFormatException ignored) {
+                // leave that slot at 0
+            }
+        }
+    }
+
+    // Manual save slots (long-press SCORE -- see handleTouchEvent()): independent of the
+    // auto-save, so the player can explicitly checkpoint a game (e.g. before a risky shot) and
+    // come back to it later. Doesn't cover shot/hit histograms or bestScore -- those are
+    // lifetime/global stats, not tied to any one saved game.
+    private void showSaveSlotMenu() {
+        // Mid-shot, balls reference the live board -- swapping it out from under them would be
+        // visually broken at best. Same restriction LINE_DELETE's bonus effect already uses.
+        if (gameBoard == null || gameBoard.ballRolling()) return;
+        String[] items = new String[SAVE_SLOT_COUNT];
+        for (int i = 0; i < SAVE_SLOT_COUNT; i++) {
+            items[i] = describeSlot(i);
+        }
+        new AlertDialog.Builder(getContext())
+                .setTitle("Speicherstände")
+                .setItems(items, (dialog, which) -> onSlotTapped(which))
+                .show();
+    }
+
+    private boolean slotIsOccupied(int slot) {
+        return prefs.contains(slotKey(slot, "level"));
+    }
+
+    private String describeSlot(int slot) {
+        if (!slotIsOccupied(slot)) {
+            return "Slot " + (slot + 1) + ": leer";
+        }
+        int slotLevel = prefs.getInt(slotKey(slot, "level"), 1);
+        int slotScore = prefs.getInt(slotKey(slot, "score"), 0);
+        return "Slot " + (slot + 1) + ": Level " + slotLevel + ", Score " + slotScore;
+    }
+
+    // Tapping an empty slot saves the current game there right away; tapping an occupied one
+    // opens a follow-up dialog (load / overwrite / delete) instead of silently clobbering it.
+    private void onSlotTapped(int slot) {
+        if (!slotIsOccupied(slot)) {
+            saveToSlot(slot);
+            Toast.makeText(getContext(), "In Slot " + (slot + 1) + " gespeichert.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new AlertDialog.Builder(getContext())
+                .setTitle(describeSlot(slot))
+                .setItems(new String[]{"Laden", "Überschreiben", "Löschen"}, (dialog, which) -> {
+                    switch (which) {
+                        case 0:
+                            loadFromSlot(slot);
+                            break;
+                        case 1:
+                            saveToSlot(slot);
+                            Toast.makeText(getContext(), "Slot " + (slot + 1) + " überschrieben.", Toast.LENGTH_SHORT).show();
+                            break;
+                        case 2:
+                            deleteSlot(slot);
+                            Toast.makeText(getContext(), "Slot " + (slot + 1) + " gelöscht.", Toast.LENGTH_SHORT).show();
+                            break;
+                    }
+                })
+                .show();
+    }
+
+    private void saveToSlot(int slot) {
+        if (gameBoard == null) return;
+        prefs.edit()
+                .putInt(slotKey(slot, "level"), level)
+                .putInt(slotKey(slot, "score"), score)
+                .putString(slotKey(slot, "blocks"), gameBoard.exportBlocksJson())
+                .putString(slotKey(slot, "bonus_counts"), serializeBonusCounts())
+                .apply();
+    }
+
+    private void loadFromSlot(int slot) {
+        if (gameBoard == null || !slotIsOccupied(slot)) return;
+        level = prefs.getInt(slotKey(slot, "level"), 1);
+        score = prefs.getInt(slotKey(slot, "score"), 0);
+        gameOver = false;
+        armedBonuses.clear();
+        loadBonusCounts(prefs.getString(slotKey(slot, "bonus_counts"), null));
+        String blocksJson = prefs.getString(slotKey(slot, "blocks"), null);
+        if (blocksJson != null) {
+            gameBoard.restoreBlocksFromJson(blocksJson);
+        } else {
+            gameBoard.initBoard();
+        }
+        Toast.makeText(getContext(), "Slot " + (slot + 1) + " geladen.", Toast.LENGTH_SHORT).show();
+    }
+
+    private void deleteSlot(int slot) {
+        prefs.edit()
+                .remove(slotKey(slot, "level"))
+                .remove(slotKey(slot, "score"))
+                .remove(slotKey(slot, "blocks"))
+                .remove(slotKey(slot, "bonus_counts"))
+                .apply();
+    }
+
+    private String slotKey(int slot, String field) {
+        return PREFS_KEY_SLOT_PREFIX + slot + "_" + field;
+    }
+
     private void cancelBonusLongPress() {
         if (bonusLongPressRunnable != null) {
             bonusLongPressHandler.removeCallbacks(bonusLongPressRunnable);
             bonusLongPressRunnable = null;
+        }
+    }
+
+    private void cancelStatBoxLongPress() {
+        if (statBoxLongPressRunnable != null) {
+            statBoxLongPressHandler.removeCallbacks(statBoxLongPressRunnable);
+            statBoxLongPressRunnable = null;
         }
     }
 
@@ -1095,6 +2048,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             case LINE_DELETE: return "Line Delete";
             case EXTRA_BALLS: return "Extra viele Bälle";
             case MOVE_START_POINT: return "Startpunkt verschieben";
+            case DRAG_PADDLE: return "Zieh-Paddle";
         }
         return bonus.name();
     }
@@ -1102,7 +2056,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     private String bonusDescription(Bonus bonus) {
         switch (bonus) {
             case MOVE_STOPPER:
-                return "Das automatische Runterschieben des Spielfelds setzt einmal aus.";
+                return "Das automatische Runterschieben des Spielfelds setzt einmal aus. Verhindert auch ein Game Over für diesen Zug, falls bereits ein Block die unterste Reihe erreicht hat.";
             case EXTENDED_PATH:
                 return "Die Vorschau-Ziellinie wird länger, um weiter oben liegende Bereiche besser anpeilen zu können.";
             case LINE_DELETE:
@@ -1111,6 +2065,8 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 return "Der nächste Schuss wird mit deutlich mehr Bällen (20) abgefeuert.";
             case MOVE_START_POINT:
                 return "Du kannst frei bestimmen, von wo aus der nächste Ball abgeschossen wird.";
+            case DRAG_PADDLE:
+                return "Nach dem Abschuss erscheint auf Höhe der Startlinie ein Balken, der Bälle nach oben zurückwirft. Ziehe mit dem Finger nach links oder rechts, um ihn zu verschieben. Mit jedem Treffer wird er kleiner, bis er nach 10 Treffern (oder am Ende des Zugs) verschwindet.";
         }
         return "";
     }
@@ -1118,7 +2074,28 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // Predefined level layouts live in assets/levels/level<N>.json (see tools/level_editor.py).
     // Returns null -- meaning "no predefined layout, generate one randomly" -- if the level has
     // no file, keeping levels beyond the last authored one playable.
+    //
+    // Checks a Level-Editor override first: a running app can't write back into its own assets/,
+    // so edits/new levels made on-device via the "Level-Editor" burger menu action are persisted
+    // to app-internal storage instead (see levelOverrideFile()) -- this is the single resolution
+    // point GameBoard.initBoard() already goes through, so an edited level is immediately playable
+    // via completely normal gameplay, not just inside the editor.
     public String loadLevelJson(int level) {
+        // Probespielen (test play, see startTestPlay()): unconditionally wins over any real level
+        // file or override, regardless of which level number GameBoard.initBoard() asks for --
+        // that's what makes a still-unsaved editor layout playable at all.
+        if (testPlayActive) {
+            return testPlayJson;
+        }
+        // Every 10th level is deliberately random (see isRandomLevelSlot()) -- short-circuit to
+        // null unconditionally so it stays random even if a stray override somehow exists.
+        if (isRandomLevelSlot(level)) {
+            return null;
+        }
+        String override = readLevelOverride(level);
+        if (override != null) {
+            return override;
+        }
         String path = "levels/level" + level + ".json";
         try (InputStream is = getContext().getAssets().open(path)) {
             StringBuilder sb = new StringBuilder();
@@ -1133,20 +2110,152 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         }
     }
 
+    // Every 10th level (10, 20, 30, ...) is deliberately left without a level*.json file (and
+    // never gets a Level-Editor override, see loadLevelJson()/insertLevelWithShift() below) so
+    // it's always randomly generated by GameBoard.randomBoard() -- a recognizable "Zufalls-Level"
+    // breather between authored levels. Greyed out / unselectable in the Level-Editor UI.
+    static boolean isRandomLevelSlot(int level) {
+        return level % 10 == 0;
+    }
+
+    // Smallest level number >= level that isn't a random-level slot -- used for the default
+    // "append" target and while shifting levels during "insert at position" so nothing ever lands
+    // on a reserved slot.
+    private static int nextEditableSlot(int level) {
+        while (isRandomLevelSlot(level)) level++;
+        return level;
+    }
+
+    // ---- Level-Editor persistence (LevelEditor.EditorCallbacks) ----
+
+    private static final Pattern LEVEL_FILE_PATTERN = Pattern.compile("level(\\d+)\\.json");
+
+    private File levelOverrideFile(int level) {
+        return new File(new File(getContext().getFilesDir(), "levels"), "level" + level + ".json");
+    }
+
+    private String readLevelOverride(int level) {
+        File f = levelOverrideFile(level);
+        if (!f.isFile()) return null;
+        try (InputStream is = new java.io.FileInputStream(f)) {
+            StringBuilder sb = new StringBuilder();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append('\n');
+            }
+            return sb.toString();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private void writeLevelOverride(int level, String json) {
+        File f = levelOverrideFile(level);
+        f.getParentFile().mkdirs();
+        try (java.io.FileOutputStream os = new java.io.FileOutputStream(f)) {
+            os.write(json.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            Log.e("Game()", "Failed to save level override " + level, e);
+        }
+    }
+
+    // Union of level numbers found as assets/levels/level<N>.json and as Level-Editor overrides
+    // under internal storage -- always derived fresh (no separately tracked "level count" that
+    // could go stale).
+    @Override
+    public java.util.List<Integer> listKnownLevels() {
+        java.util.TreeSet<Integer> levels = new java.util.TreeSet<>();
+        try {
+            String[] assetFiles = getContext().getAssets().list("levels");
+            if (assetFiles != null) {
+                for (String name : assetFiles) {
+                    Matcher m = LEVEL_FILE_PATTERN.matcher(name);
+                    if (m.matches()) levels.add(Integer.parseInt(m.group(1)));
+                }
+            }
+        } catch (IOException e) {
+            Log.e("Game()", "Failed to list asset levels", e);
+        }
+        File overrideDir = new File(getContext().getFilesDir(), "levels");
+        File[] overrideFiles = overrideDir.listFiles();
+        if (overrideFiles != null) {
+            for (File f : overrideFiles) {
+                Matcher m = LEVEL_FILE_PATTERN.matcher(f.getName());
+                if (m.matches()) levels.add(Integer.parseInt(m.group(1)));
+            }
+        }
+        return new ArrayList<>(levels);
+    }
+
+    @Override
+    public String loadLevelJsonForEdit(int level) {
+        return loadLevelJson(level);
+    }
+
+    @Override
+    public void saveLevelJson(int level, String json) {
+        writeLevelOverride(level, json);
+    }
+
+    // "Insert at N": every currently-known level from the highest down to N is shifted up to the
+    // next slot (read its *current resolved* content, write it as the override at
+    // nextEditableSlot(levelNum + 1) -- skipping over any reserved random-level slot crossed in
+    // the process, so 10/20/30/... never end up holding real content), then the new content is
+    // written at N -- see LevelEditor's Mode.INSERT. Only ever touches the override layer since
+    // asset files can't be modified; already-shifted slots simply become override-backed instead
+    // of asset-backed, which resolves identically either way.
+    @Override
+    public void insertLevelWithShift(int atLevel, String json) {
+        if (isRandomLevelSlot(atLevel)) {
+            return; // guarded by the UI (showInsertPositionDialog) -- defensive no-op here too
+        }
+        java.util.List<Integer> known = listKnownLevels();
+        int max = known.isEmpty() ? atLevel - 1 : known.get(known.size() - 1);
+        for (int levelNum = max; levelNum >= atLevel; levelNum--) {
+            String content = loadLevelJson(levelNum);
+            if (content != null) {
+                writeLevelOverride(nextEditableSlot(levelNum + 1), content);
+            }
+        }
+        writeLevelOverride(atLevel, json);
+    }
+
+    @Override
+    public void exportJsonToClipboard(String json) {
+        ClipboardManager clipboard = (ClipboardManager) getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+        if (clipboard != null) {
+            clipboard.setPrimaryClip(ClipData.newPlainText("BlockPong Level JSON", json));
+        }
+    }
+
+    @Override
+    public void showToast(String message) {
+        // Covers both LevelEditor's "gespeichert" and "kopiert" confirmations -- it doesn't
+        // distinguish which, so both get the clipboard-safe raised position; harmless for the
+        // save confirmation, necessary for the export one.
+        showClipboardToast(message, Toast.LENGTH_LONG);
+    }
+
+    @Override
+    public void closeEditor() {
+        levelEditorActive = false;
+    }
+
     // 2048-style stat boxes (LEVEL / SCORE / BEST), drawn below the bonus row in the reserved
     // footer area -- the aim line always points up into the board (see
     // GameBoard.clampAimVector), so it never reaches down here regardless of drag distance.
     private void drawStatsFooter(Canvas canvas) {
-        RectF levelBox = getStatBoxRect(0);
-        RectF scoreBox = getStatBoxRect(1);
+        RectF scoreBox = getStatBoxRect(0);
+        RectF levelBox = getStatBoxRect(1);
         RectF bestBox = getStatBoxRect(2);
 
-        drawStatBox(canvas, levelBox, "LEVEL", String.valueOf(level));
         drawStatBox(canvas, scoreBox, "SCORE", String.valueOf(score));
+        drawStatBox(canvas, levelBox, "LEVEL", String.valueOf(level));
         drawStatBox(canvas, bestBox, "BEST", String.valueOf(bestScore));
     }
 
-    // index: 0=LEVEL, 1=SCORE, 2=BEST.
+    // index: 0=SCORE, 1=LEVEL, 2=BEST.
     private RectF getStatBoxRect(int index) {
         int boxTop = bonusRowBottom() + BONUS_ROW_BOTTOM_MARGIN;
         int boxBottom = boxTop + STATS_BOX_HEIGHT;
@@ -1217,45 +2326,14 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         }
     }
 
-    // Simple hand-drawn glyphs (matching this project's all-vector art style) so each bonus type
-    // is visually distinguishable without needing icon assets.
+    // Hand-drawn glyphs (matching this project's all-vector art style, no icon assets) so each
+    // bonus type is visually distinguishable and reads as what it actually does at a glance.
+    // Actual shapes live in BonusIcons, shared with BonusAwardAnimation's pop-in celebration.
     private void drawBonusIcon(Canvas canvas, Bonus bonus, RectF box) {
         float cx = box.centerX();
         float cy = box.centerY();
         float r = Math.min(box.width(), box.height()) * 0.28f;
-        switch (bonus) {
-            case MOVE_STOPPER:
-                // pause icon: two vertical bars
-                canvas.drawLine(cx - r * 0.5f, cy - r, cx - r * 0.5f, cy + r, bonusIconPaint);
-                canvas.drawLine(cx + r * 0.5f, cy - r, cx + r * 0.5f, cy + r, bonusIconPaint);
-                break;
-            case EXTENDED_PATH:
-                // upward arrow: longer aim line
-                canvas.drawLine(cx, cy + r, cx, cy - r, bonusIconPaint);
-                canvas.drawLine(cx, cy - r, cx - r * 0.5f, cy - r * 0.4f, bonusIconPaint);
-                canvas.drawLine(cx, cy - r, cx + r * 0.5f, cy - r * 0.4f, bonusIconPaint);
-                break;
-            case LINE_DELETE:
-                // horizontal bar struck through
-                canvas.drawLine(cx - r, cy, cx + r, cy, bonusIconPaint);
-                canvas.drawLine(cx - r * 0.6f, cy - r * 0.6f, cx + r * 0.6f, cy + r * 0.6f, bonusIconPaint);
-                canvas.drawLine(cx - r * 0.6f, cy + r * 0.6f, cx + r * 0.6f, cy - r * 0.6f, bonusIconPaint);
-                break;
-            case EXTRA_BALLS:
-                // cluster of three small balls
-                float ballR = r * 0.35f;
-                canvas.drawCircle(cx - r * 0.5f, cy + ballR * 0.3f, ballR, bonusIconPaint);
-                canvas.drawCircle(cx + r * 0.5f, cy + ballR * 0.3f, ballR, bonusIconPaint);
-                canvas.drawCircle(cx, cy - r * 0.5f, ballR, bonusIconPaint);
-                break;
-            case MOVE_START_POINT:
-                // horizontal double-headed arrow: fire position can be moved freely
-                canvas.drawLine(cx - r, cy, cx + r, cy, bonusIconPaint);
-                canvas.drawLine(cx - r, cy, cx - r * 0.5f, cy - r * 0.4f, bonusIconPaint);
-                canvas.drawLine(cx - r, cy, cx - r * 0.5f, cy + r * 0.4f, bonusIconPaint);
-                canvas.drawLine(cx + r, cy, cx + r * 0.5f, cy - r * 0.4f, bonusIconPaint);
-                canvas.drawLine(cx + r, cy, cx + r * 0.5f, cy + r * 0.4f, bonusIconPaint);
-                break;
-        }
+        BonusIcons.draw(canvas, bonus, cx, cy, r,
+                bonusIconPaint, bonusIconThinPaint, bonusIconFillPaint, bonusGrayPaint);
     }
 }

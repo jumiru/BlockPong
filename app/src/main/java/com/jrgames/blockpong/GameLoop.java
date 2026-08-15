@@ -61,7 +61,15 @@ public class GameLoop extends Thread {
                     game.update();
                     updateCount++;
 
-                    game.draw(canvas);
+                    // lockCanvas() can legitimately return null (e.g. the Surface is mid-teardown
+                    // around a surfaceDestroyed()/surfaceCreated() cycle) -- game.draw(null) would
+                    // throw a NullPointerException that isn't caught below, silently killing this
+                    // thread and leaving the board looking permanently frozen even though update()
+                    // above kept running fine. Skipping just the draw for this one frame is enough;
+                    // the next successfully locked canvas catches up visually.
+                    if (canvas != null) {
+                        game.draw(canvas);
+                    }
                 }
             } catch ( IllegalArgumentException e) {
                 e.printStackTrace();

@@ -6,6 +6,7 @@ import org.robolectric.RobolectricTestRunner;
 import org.robolectric.annotation.Config;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -102,27 +103,23 @@ public class GameBoardCollisionTest {
     }
 
     @Test
-    public void aimBelowFireLine_getsClampedToUpwardMinimumAngle() {
+    public void aimBelowFireLine_cancelsInsteadOfFiring() {
+        // Was "...getsClampedToUpwardMinimumAngle": a drag that stays below the fire line used to
+        // still fire, clamped to the steepest allowed angle. Changed per reported requirement --
+        // releasing at/below the fire line (see touchRelease()) is now treated as "not a committed
+        // aim" and cancels instead, so the player can just touch down again.
         GameBoard gameBoard = createTestBoard();
         float fx = gameBoard.getFirePosXForTests();
         float fy = gameBoard.getFirePosYForTests();
 
-        // Dragged down and to the right -- straight down toward/past the fire line, which must
-        // not be allowed to aim the ball away from the board.
         gameBoard.touchDown(fx + 50f, fy + 50f);
         gameBoard.touchRelease(fx + 300f, fy + 300f);
 
-        float dx = gameBoard.getFireSpeedXForTests();
-        float dy = gameBoard.getFireSpeedYForTests();
-        assertTrue("expected an upward shot, got dy=" + dy, dy < 0f);
-
-        double angleFromHorizontalDeg = Math.toDegrees(Math.atan2(-dy, Math.abs(dx)));
-        assertEquals(10.0, angleFromHorizontalDeg, 0.5);
-        assertTrue("expected a rightward shot, got dx=" + dx, dx > 0f);
+        assertFalse("release at/below the fire line should cancel, not fire", gameBoard.ballRolling());
     }
 
     @Test
-    public void aimBelowFireLineToTheLeft_getsClampedToUpwardMinimumAngle() {
+    public void aimBelowFireLineToTheLeft_cancelsInsteadOfFiring() {
         GameBoard gameBoard = createTestBoard();
         float fx = gameBoard.getFirePosXForTests();
         float fy = gameBoard.getFirePosYForTests();
@@ -130,13 +127,7 @@ public class GameBoardCollisionTest {
         gameBoard.touchDown(fx - 50f, fy + 50f);
         gameBoard.touchRelease(fx - 300f, fy + 300f);
 
-        float dx = gameBoard.getFireSpeedXForTests();
-        float dy = gameBoard.getFireSpeedYForTests();
-        assertTrue("expected an upward shot, got dy=" + dy, dy < 0f);
-
-        double angleFromHorizontalDeg = Math.toDegrees(Math.atan2(-dy, Math.abs(dx)));
-        assertEquals(10.0, angleFromHorizontalDeg, 0.5);
-        assertTrue("expected a leftward shot, got dx=" + dx, dx < 0f);
+        assertFalse("release at/below the fire line should cancel, not fire", gameBoard.ballRolling());
     }
 
     @Test
