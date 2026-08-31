@@ -27,6 +27,7 @@ public class LineDeleteAnimation extends Animation {
         animationCycle++;
         if (animationCycle >= animationDuration) {
             gb.deleteLineAndShiftUp(rowToDelete);
+            gb.checkLevelCompleteAfterLineDelete();
             return true;
         }
         return false;

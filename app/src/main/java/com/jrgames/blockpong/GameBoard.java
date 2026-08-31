@@ -48,35 +48,31 @@ public class GameBoard {
     // Points awarded per hit = the block's starting value times this factor. Tougher blocks
     // (higher starting value) are worth more per hit, and every hit counts, not just the kill.
     private static final int POINTS_PER_VALUE = 1;
-    // EXTENDED_PATH bonus: how much longer the aim preview line gets while armed.
-    private static final float EXTENDED_PATH_LENGTH_MULTIPLIER = 1.6f;
-    // EXTRA_BALLS bonus: ball count is bumped up to this (permanently, if not already there)
-    // when spent.
-    private static final int EXTRA_BALLS_TARGET_COUNT = 20;
+    // EXTENDED_PATH bonus: safety cap on how many physics ticks computeFullPathPoints() will
+    // simulate while tracing the first ball's whole round trip back to the start line -- matches
+    // SPEEDUP_MAX_TICKS' order of magnitude (see fastForwardToNextBlockHit()), a bound already
+    // trusted in production for a full real-time shot simulation, so it comfortably covers even a
+    // shot that bounces around for a very long time before returning.
+    private static final int EXTENDED_PATH_MAX_TICKS = 3000;
+    // EXTRA_BALLS bonus: stackable up to 4 times per level -- each application bumps the ball
+    // count up to the next entry here (permanently, if not already there), topping out at 50.
+    // Reset in initBoard() so a fresh level always starts back at 0 applications.
+    private static final int[] EXTRA_BALLS_TARGETS = {20, 30, 40, 50};
+    private int extraBallsAppliedCount;
     // MOVE_STOPPER bonus: set when spent, consumed (and cleared) by the next board-drop check in
     // actionAfterBallRolling() so that one drop is skipped -- and the game-over check for that
     // same shot is bypassed too, since it would otherwise fire before the bonus is even consulted.
     private boolean skipNextBoardDrop;
 
-    // DRAG_PADDLE bonus: a paddle at the fire line, active for the rest of the shot it was spent
-    // on (set in fire(), not applyConsumedBonus() -- unlike a one-off flag like skipNextBoardDrop,
-    // its position/width keep evolving for as long as it's active, closer to EXTENDED_PATH/
-    // MOVE_START_POINT's "continuously active" bonuses, except those poll isBonusArmed() during
-    // aiming while this one has to keep going through the whole rolling phase, well after the
-    // bonus is already consumed and isBonusArmed() would say false). Position follows a finger
-    // drag directly (see touchDown()/touchMove()) -- an earlier accelerometer-tilt version felt
-    // too sluggish to control precisely. Shrinks per reflection, not on a timer -- see the
-    // collision check below -- and is also force-cleared once the move ends
-    // (actionAfterBallRolling()), so it never lingers into the next shot's aim.
-    private static final float PADDLE_INITIAL_WIDTH_FRACTION = 0.35f; // of board width
-    private static final float PADDLE_HEIGHT = 18f;
-    private static final int PADDLE_MAX_HITS = 10;
-    private boolean paddleActive;
-    private float paddlePosX;
-    private float paddleWidth;
-    private float paddleShrinkPerHit;
-    private int paddleHitsRemaining;
-    private Paint paddlePaint;
+    // BASELINE_BOUNCE bonus: replaces an earlier "drag a shrinking paddle with your finger"
+    // version that testers found too fiddly to aim in time (reported feedback). Far simpler: for
+    // the rest of the shot it was spent on, any ball reaching the start line bounces back upward
+    // instead of settling there, budgeted at one reflection per ball in the shot (numBalls) shared
+    // across all of them -- set in fire() (not applyConsumedBonus(), since it needs numBalls,
+    // which EXTRA_BALLS may still be about to change) and decremented in the collision check below.
+    // No dragging, no per-position hit test -- it's the whole baseline, not a paddle.
+    private int baselineBounceReflectionsRemaining;
+    private Paint baselineBouncePaint;
 
     private final float dirLineLength;
     private final Paint frozenBallPaint;
@@ -278,10 +274,21 @@ public class GameBoard {
     private boolean fire;
     private int fireCounter;
     private int nextFireBall;
+    // How many balls of the current shot have already flown back below the start line (firePosY)
+    // and come to rest there -- reset in fire(), incremented in the "ball back on start line"
+    // branch of update(). Used by ballsRemainingToFire() so the launch HUD counts back up as balls
+    // return, instead of jumping straight back to numBalls the instant the last ball is dispatched.
+    private int ballsReturnedThisShot;
     private float firePosX;
     private float newFirePosX;
     private float firePosY;
     private boolean newFirePosSet;
+
+    // How far below the start line (firePosY) a release is still allowed to go before
+    // touchRelease() treats it as an abandoned aim instead of firing -- see setAimCancelY().
+    // Defaults to firePosY itself (cancel as soon as the release doesn't clear the start line at
+    // all), matching the original behavior for callers/tests that never set it explicitly.
+    private float aimCancelY;
 
     private float normSpeed;
     private float fireSpeedX;
@@ -314,6 +321,11 @@ public class GameBoard {
 
     private Paint debugTextPaint;
 
+    // Live HUD next to the launch/rest position: balls still to be fired this shot, and blocks
+    // cleared so far by it -- lets the player (or a debug session) tell at a glance how a shot is
+    // going without waiting for it to finish and the Statistik screen.
+    private Paint launchHudPaint;
+
     private Block[][] blocks;
     private Block[][] blocksCopy;
     private int xDim;
@@ -340,8 +352,9 @@ public class GameBoard {
     private static final float SHARE_BUTTON_HEIGHT = 80f;
 
     // "Speed-up" overlay button (see shouldOfferSpeedUp()/fastForwardToNextBlockHit()): appears
-    // centered on the board once the balls have gone SPEEDUP_TRIGGER_COLLISIONS bounces without
-    // hitting a block, offering to fast-forward past the boring stretch.
+    // top-left on the board once the balls have gone SPEEDUP_TRIGGER_COLLISIONS bounces without
+    // hitting a block, or SPEEDUP_TRIGGER_IDLE_MS have passed without hitting a block,
+    // offering to fast-forward past the boring stretch.
     private Paint speedUpButtonPaint;
     private Paint speedUpButtonTextPaint;
     private RectF speedUpButtonRect;
@@ -351,6 +364,30 @@ public class GameBoard {
     // against looping (close to) forever in some pathological state instead of ever reaching a
     // block hit or the end of the shot (e.g. balls endlessly circling an otherwise-cleared area).
     private static final int SPEEDUP_MAX_TICKS = 3000;
+
+    // EXTENDED_PATH bonus: predicted blocksClearedThisMove for the shot currently being aimed --
+    // set by drawDirLine() (see predictBlocksCleared()) every frame the bonus is armed and an aim
+    // is active, read by drawLaunchHud() to show it next to the usual block-clear counter. -1
+    // means "no prediction available this frame" (aim not active, or a degenerate aim vector).
+    private int aimedBlocksClearedPreview = -1;
+
+    // Extended-Path fine-position mode: once EXTENDED_PATH is armed, releasing the aim drag
+    // doesn't fire right away -- it holds the shot and shows three buttons (nudge left, fire,
+    // nudge right) so the player can fine-tune the previewed trajectory first. See
+    // touchRelease()/confirmFire()/nudgeFineAim() and drawFinePositionButtons(). Cleared again the
+    // moment the shot actually fires (confirmFire()) or a fresh aim drag starts (touchDown()).
+    private boolean finePositionActive;
+    private Paint finePositionButtonPaint;
+    private Paint finePositionButtonTextPaint;
+    private RectF fineLeftButtonRect;
+    private RectF fineFireButtonRect;
+    private RectF fineRightButtonRect;
+    private static final float FINE_BUTTON_WIDTH = 130f;
+    private static final float FINE_BUTTON_HEIGHT = 90f;
+    private static final float FINE_BUTTON_GAP = 16f;
+    // Fixed angular step each tap of the nudge buttons rotates the previewed aim by -- same
+    // convention as clampAimVector() (0 = straight up, positive = tilted right).
+    private static final float FINE_AIM_NUDGE_DEG = 0.4f;
 
     private boolean debugSupport;
 
@@ -393,7 +430,17 @@ public class GameBoard {
     // making progress for a while, so offer to fast-forward (see fastForwardToNextBlockHit()).
     // Reset in fire() so every shot starts this streak fresh.
     private int collisionsSinceLastBlockHit;
-    static final int SPEEDUP_TRIGGER_COLLISIONS = 5;
+    static final int SPEEDUP_TRIGGER_COLLISIONS = 10;
+
+    // Wall-clock time of the last block hit -- second, independent trigger for the Speed-up
+    // button: a ball can fly through open space and bounce off borders/paddle for a long time
+    // without ever hitting a block, which never touches collisionsSinceLastBlockHit above (that
+    // only counts border bounces, not idle time), so shouldOfferSpeedUp() also offers
+    // fast-forward once this much real time has passed since the last block hit. Reset only on
+    // an actual block hit in recordCollision() (border/paddle bounces must NOT reset this, or the
+    // timer would never accumulate while the ball keeps bouncing off borders) and in fire().
+    private long lastCollisionTimeMs;
+    static final long SPEEDUP_TRIGGER_IDLE_MS = 2000;
 
     private static class ReplayFrame {
         final float[] ballX;
@@ -457,18 +504,25 @@ public class GameBoard {
         gameOverLinePaint.setColor(Color.rgb(80, 80, 80));
         gameOverLinePaint.setStrokeWidth(1.5f);
 
-        paddlePaint = new Paint();
-        paddlePaint.setColor(Color.rgb(0, 188, 212));
-        paddlePaint.setAntiAlias(true);
+        baselineBouncePaint = new Paint();
+        baselineBouncePaint.setColor(Color.rgb(0, 188, 212));
+        baselineBouncePaint.setStrokeWidth(6f);
+        baselineBouncePaint.setAntiAlias(true);
 
         debugTextPaint = new Paint();
         debugTextPaint.setColor(Color.WHITE);
         debugTextPaint.setTextSize(50);
 
+        launchHudPaint = new Paint();
+        launchHudPaint.setColor(Color.WHITE);
+        launchHudPaint.setTextSize(36);
+        launchHudPaint.setAntiAlias(true);
+
 
         firePosX=width/2.0f+offsetX;
 
         firePosY=height-2*ballRadius;
+        aimCancelY = firePosY;
         newFirePosX = firePosX;
 
         double rad = Math.toRadians(12.125);
@@ -513,6 +567,21 @@ public class GameBoard {
         speedUpButtonTextPaint.setAntiAlias(true);
 
         speedUpButtonRect = new RectF(0, 0, SPEEDUP_BUTTON_WIDTH, SPEEDUP_BUTTON_HEIGHT);
+
+        // Initialize Extended-Path fine-position buttons
+        finePositionButtonPaint = new Paint();
+        finePositionButtonPaint.setColor(Color.parseColor("#455A64"));
+        finePositionButtonPaint.setStyle(Paint.Style.FILL);
+
+        finePositionButtonTextPaint = new Paint();
+        finePositionButtonTextPaint.setColor(Color.WHITE);
+        finePositionButtonTextPaint.setTextSize(42);
+        finePositionButtonTextPaint.setTextAlign(Paint.Align.CENTER);
+        finePositionButtonTextPaint.setAntiAlias(true);
+
+        fineLeftButtonRect = new RectF(0, 0, FINE_BUTTON_WIDTH, FINE_BUTTON_HEIGHT);
+        fineFireButtonRect = new RectF(0, 0, FINE_BUTTON_WIDTH, FINE_BUTTON_HEIGHT);
+        fineRightButtonRect = new RectF(0, 0, FINE_BUTTON_WIDTH, FINE_BUTTON_HEIGHT);
 
         initBoard();
 
@@ -580,6 +649,7 @@ public class GameBoard {
         for (int i = 0; i < numInitBalls; i++) {
             addBall(i);
         };
+        extraBallsAppliedCount = 0;
         endOfRollingPhase = true;
         newFirePosSet = false;
         freezeBall = 0;
@@ -593,11 +663,44 @@ public class GameBoard {
     // left without a level*.json file so it's always a random "Zufalls-Level" -- see
     // Game.isRandomLevelSlot(). The level-vs-level scaling (maxValueAtTop/densityAtTop) still
     // scales continuously with the raw level number so an early random level like 10 isn't as
-    // dense/tough as one appearing at level 100+, but *within* one generated board the row-by-row
-    // shape is itself randomized rather than a fixed formula (see the random-walk below): the
-    // bottom RANDOM_BOARD_EMPTY_BOTTOM_ROWS rows always stay empty, and going up from there both
-    // density and block value tend to grow -- but via random per-row steps (occasionally even a
-    // small dip) rather than a smooth deterministic curve, so no two generated boards look alike.
+    // dense/tough as one appearing at level 100+.
+    //
+    // Shape (reported request): random levels exist specifically to give the player a realistic
+    // shot at the blocks-cleared bonus (see Game.BLOCKS_CLEARED_BONUS_THRESHOLD*, awarded for
+    // clearing a lot of blocks in one move), so the row-by-row density/value curve is no longer a
+    // single smooth increase from paddle to top (see GATE_*/CLEAR_OUT_* below and lerpCurve()).
+    // Going up from the paddle:
+    //  - an "approach" stretch that ramps up gently, same difficulty feel as the old curve;
+    //  - a dense, high-value "gate" band around the middle of the board -- but with a randomized,
+    //    gently wandering low-density corridor running through it, so a shot can actually get
+    //    past it instead of being fully absorbed;
+    //  - a "clear-out" band above the gate where density stays high but block values drop back
+    //    down -- a ball that makes it through the gate can then plow through many easy blocks in
+    //    one shot, which is exactly what racks up a big blocksCleared count.
+    // Both curves still get a small per-row random jitter around their target shape (see
+    // JITTER_FRACTION) so no two generated boards look alike, and the corridor's own random walk
+    // (SHAPE_FRACS-scoped, see below) keeps it from reading as a ruler-straight slot.
+    private static final double[] SHAPE_FRACS = {0.00, 0.35, 0.50, 0.65, 1.00};
+    private static final double[] DENSITY_SHAPE = {0.10, 0.45, 0.95, 0.75, 0.85};
+    private static final double[] VALUE_SHAPE = {0.15, 0.35, 1.00, 0.25, 0.20};
+    private static final double JITTER_FRACTION = 0.12; // +/- how far a row may stray from target
+    private static final double GATE_BAND_START_FRAC = 0.40;
+    private static final double GATE_BAND_END_FRAC = 0.60;
+
+    // Piecewise-linear interpolation between control points (fracs ascending, fracs[0]==0.0,
+    // fracs[last]==1.0) -- used to turn SHAPE_FRACS/DENSITY_SHAPE/VALUE_SHAPE into a continuous
+    // curve over the board's height instead of hard-coding a value per row.
+    private static double lerpCurve(double frac, double[] fracs, double[] values) {
+        if (frac <= fracs[0]) return values[0];
+        for (int i = 1; i < fracs.length; i++) {
+            if (frac <= fracs[i]) {
+                double t = (frac - fracs[i - 1]) / (fracs[i] - fracs[i - 1]);
+                return values[i - 1] + t * (values[i] - values[i - 1]);
+            }
+        }
+        return values[values.length - 1];
+    }
+
     private void randomBoard() {
         int rowCount = yDim - RANDOM_BOARD_EMPTY_BOTTOM_ROWS;
         if (rowCount <= 0) {
@@ -605,32 +708,42 @@ public class GameBoard {
         }
         int lastRow = rowCount - 1; // bottom-most randomizable row (closest to the paddle)
         int level = game.getLevel();
-        double maxValueAtTop = 3.0 + 0.22 * level;
-        double densityAtTop = Math.min(0.7, 0.35 + 0.003 * level);
+        // Random levels were reported as too easy -- quadrupled density (with the cap raised well
+        // above the old 0.7 so it isn't immediately saturated away) and doubled block values, so
+        // even the earliest random slot (level 10) comes out noticeably harder than before.
+        double maxValueAtTop = 2.0 * (3.0 + 0.22 * level);
+        double densityAtTop = Math.min(0.92, 4.0 * (0.35 + 0.003 * level));
 
-        // Random walk from the paddle-most randomizable row up to the top: each row nudges its
-        // density/max-value up from the row below by a random amount, mostly positive (biased
-        // step, see below) but occasionally slightly negative, so the upward tendency holds
-        // without being a rigid gradient. Clamped to [0, atTop] / [1, atTop] throughout.
-        double[] rowDensity = new double[rowCount];
-        double[] rowMaxValue = new double[rowCount];
-        rowDensity[lastRow] = rand.nextDouble() * densityAtTop * 0.15;
-        rowMaxValue[lastRow] = 1.0 + rand.nextDouble() * maxValueAtTop * 0.15;
-        double densityStepScale = lastRow > 0 ? (densityAtTop * 1.6 / lastRow) : 0;
-        double valueStepScale = lastRow > 0 ? (maxValueAtTop * 1.6 / lastRow) : 0;
-        for (int y = lastRow - 1; y >= 0; y--) {
-            double densityDelta = (rand.nextDouble() - 0.2) * densityStepScale;
-            rowDensity[y] = Math.max(0.0, Math.min(densityAtTop, rowDensity[y + 1] + densityDelta));
-            double valueDelta = (rand.nextDouble() - 0.2) * valueStepScale;
-            rowMaxValue[y] = Math.max(1.0, Math.min(maxValueAtTop, rowMaxValue[y + 1] + valueDelta));
-        }
+        // The gate's passage: a low-density corridor a few columns wide, wandering by a small
+        // random amount per row while inside the gate band, so it reads as a natural gap.
+        int corridorWidth = Math.max(1, xDim / 5);
+        double corridorCenter = xDim / 2.0 + (rand.nextDouble() - 0.5) * xDim * 0.3;
 
-        for ( int y = 0; y < rowCount; y++) {
-            int rowMaxValueInt = Math.max(1, (int) Math.round(rowMaxValue[y]));
-            double rowDensityAtY = rowDensity[y];
-            for ( int x = 0; x < xDim; x++ ) {
-                if (rand.nextDouble() < rowDensityAtY)  {
-                    int v = rand.nextInt(rowMaxValueInt)+1;
+        for (int y = lastRow; y >= 0; y--) {
+            double frac = lastRow > 0 ? (double) (lastRow - y) / lastRow : 0.0;
+            double targetDensity = densityAtTop * lerpCurve(frac, SHAPE_FRACS, DENSITY_SHAPE);
+            double targetValue = maxValueAtTop * lerpCurve(frac, SHAPE_FRACS, VALUE_SHAPE);
+
+            double densityJitter = (rand.nextDouble() * 2 - 1) * densityAtTop * JITTER_FRACTION;
+            double valueJitter = (rand.nextDouble() * 2 - 1) * maxValueAtTop * JITTER_FRACTION;
+            double rowDensity = Math.max(0.0, Math.min(densityAtTop, targetDensity + densityJitter));
+            int rowMaxValueInt = Math.max(1, (int) Math.round(
+                    Math.max(1.0, Math.min(maxValueAtTop, targetValue + valueJitter))));
+
+            boolean inGateBand = frac >= GATE_BAND_START_FRAC && frac <= GATE_BAND_END_FRAC;
+            if (inGateBand) {
+                corridorCenter += (rand.nextDouble() - 0.5) * 1.5;
+                corridorCenter = Math.max(corridorWidth / 2.0,
+                        Math.min(xDim - corridorWidth / 2.0, corridorCenter));
+            }
+
+            for (int x = 0; x < xDim; x++) {
+                double density = rowDensity;
+                if (inGateBand && Math.abs(x - corridorCenter) < corridorWidth / 2.0) {
+                    density = Math.min(density, 0.05);
+                }
+                if (rand.nextDouble() < density) {
+                    int v = rand.nextInt(rowMaxValueInt) + 1;
                     if (rand.nextBoolean()) {
                         blocks[x][y] = new Block4(this, x, y, v);
                     } else {
@@ -809,6 +922,12 @@ public class GameBoard {
         if ((dirLineActive && !movingStartPoint) || debugSupport) {
             drawDirLine(c);
         }
+        if (dirLineActive && movingStartPoint) {
+            drawStartPointGuideLine(c);
+        }
+        if (finePositionActive) {
+            drawFinePositionButtons(c);
+        }
 
 
         // draw balls
@@ -816,12 +935,12 @@ public class GameBoard {
             balls[b].draw(c);
         }
 
-        // DRAG_PADDLE bonus: paddle at the fire line, shrinking away one hit at a time.
-        if (paddleActive) {
-            float halfWidth = paddleWidth / 2f;
-            RectF paddleRect = new RectF(paddlePosX - halfWidth, firePosY - PADDLE_HEIGHT / 2f,
-                    paddlePosX + halfWidth, firePosY + PADDLE_HEIGHT / 2f);
-            c.drawRoundRect(paddleRect, PADDLE_HEIGHT / 2f, PADDLE_HEIGHT / 2f, paddlePaint);
+        drawLaunchHud(c);
+
+        // BASELINE_BOUNCE bonus: highlight the whole start line while it's still got reflections
+        // left, so it's visually obvious why balls are bouncing back up instead of settling.
+        if (baselineBounceReflectionsRemaining > 0) {
+            c.drawLine(offsetX, firePosY, offsetX + width, firePosY, baselineBouncePaint);
         }
 
         // Speed-up overlay: see shouldOfferSpeedUp()/fastForwardToNextBlockHit(). Drawn on top of
@@ -891,11 +1010,102 @@ public class GameBoard {
         }
     }
 
+    // MOVE_START_POINT bonus: while the drag is still relocating the start ball (not yet steering
+    // an aim, see touchMove()), a plain vertical line through its current x lets the player line
+    // it up with a gap in the blocks above before committing to that position -- there's no aim
+    // line to look at yet at this point in the gesture.
+    private void drawStartPointGuideLine(Canvas c) {
+        c.drawLine(newFirePosX, top(0), newFirePosX, firePosY, dirLinePaint);
+    }
+
+    // Extended-Path fine-position mode: lays out the left/fire/right buttons in a row centered
+    // over the launch point, just above the resting balls -- see the class-level finePositionActive
+    // comment. Clamped to stay fully within the board's horizontal bounds (reported bug: with the
+    // launch point near the left/right edge, the outer button slid off-screen and became
+    // untappable) instead of always centering on newFirePosX regardless of how close to an edge it
+    // is. Recomputed fresh each call (cheap) so draw() and the touch hit-tests always agree.
+    private RectF getFineButtonRect(RectF rect, int slot) {
+        float totalWidth = 3 * FINE_BUTTON_WIDTH + 2 * FINE_BUTTON_GAP;
+        float startX = newFirePosX - totalWidth / 2f;
+        startX = Math.max(offsetX, Math.min(offsetX + width - totalWidth, startX));
+        float y = firePosY - ballRadius * 2f - FINE_BUTTON_HEIGHT - 20f;
+        float x = startX + slot * (FINE_BUTTON_WIDTH + FINE_BUTTON_GAP);
+        rect.set(x, y, x + FINE_BUTTON_WIDTH, y + FINE_BUTTON_HEIGHT);
+        return rect;
+    }
+
+    private RectF getFineLeftButtonRect() { return getFineButtonRect(fineLeftButtonRect, 0); }
+    private RectF getFineFireButtonRect() { return getFineButtonRect(fineFireButtonRect, 1); }
+    private RectF getFineRightButtonRect() { return getFineButtonRect(fineRightButtonRect, 2); }
+
+    private void drawFinePositionButtons(Canvas c) {
+        RectF left = getFineLeftButtonRect();
+        RectF fireBtn = getFineFireButtonRect();
+        RectF right = getFineRightButtonRect();
+        c.drawRoundRect(left, 16, 16, finePositionButtonPaint);
+        c.drawRoundRect(fireBtn, 16, 16, finePositionButtonPaint);
+        c.drawRoundRect(right, 16, 16, finePositionButtonPaint);
+        c.drawText("◀", left.centerX(), left.centerY() + 14f, finePositionButtonTextPaint);
+        c.drawText("🔥", fireBtn.centerX(), fireBtn.centerY() + 14f, finePositionButtonTextPaint);
+        c.drawText("▶", right.centerX(), right.centerY() + 14f, finePositionButtonTextPaint);
+    }
+
+    public boolean isFinePositionActive() {
+        return finePositionActive;
+    }
+
+    public boolean isFineLeftButtonHit(float touchX, float touchY) {
+        return finePositionActive && getFineLeftButtonRect().contains(touchX, touchY);
+    }
+
+    public boolean isFineFireButtonHit(float touchX, float touchY) {
+        return finePositionActive && getFineFireButtonRect().contains(touchX, touchY);
+    }
+
+    public boolean isFineRightButtonHit(float touchX, float touchY) {
+        return finePositionActive && getFineRightButtonRect().contains(touchX, touchY);
+    }
+
+    // Rotates the previewed aim direction by a fixed angle around the launch point, keeping its
+    // length (only the direction matters for firing -- see setFireSpeed()). Same angle convention
+    // as clampAimVector(): 0 = straight up, positive = tilted right, clamped to the same bounds.
+    private void nudgeFineAim(float deltaDeg) {
+        float dx = dirLineX - newFirePosX;
+        float dy = dirLineY - firePosY;
+        float len = (float) Math.sqrt(dx * dx + dy * dy);
+        if (len <= EPSILON) return;
+        double phiDeg = Math.toDegrees(Math.atan2(dx, -dy)) + deltaDeg;
+        if (phiDeg > MAX_AIM_ANGLE_FROM_UP_DEG) phiDeg = MAX_AIM_ANGLE_FROM_UP_DEG;
+        if (phiDeg < -MAX_AIM_ANGLE_FROM_UP_DEG) phiDeg = -MAX_AIM_ANGLE_FROM_UP_DEG;
+        double rad = Math.toRadians(phiDeg);
+        dirLineX = newFirePosX + len * (float) Math.sin(rad);
+        dirLineY = firePosY - len * (float) Math.cos(rad);
+    }
+
+    public void nudgeFineAimLeft() {
+        if (finePositionActive) nudgeFineAim(-FINE_AIM_NUDGE_DEG);
+    }
+
+    public void nudgeFineAimRight() {
+        if (finePositionActive) nudgeFineAim(FINE_AIM_NUDGE_DEG);
+    }
+
+    // Fine-position mode's Fire button: commits whatever direction the nudge buttons left the
+    // preview pointed at.
+    public void confirmFineFire() {
+        if (finePositionActive) confirmFire();
+    }
+
     private void drawDirLine(Canvas c) {
         float x0 = newFirePosX;
         float y0 = firePosY;
         float x1 = dirLineX;
         float y1 = dirLineY;
+
+        // Stale from a previous frame otherwise -- e.g. once the aim line goes degenerate below,
+        // or the bonus isn't armed this frame, drawLaunchHud() must not keep showing an old
+        // prediction from before the aim moved.
+        aimedBlocksClearedPreview = -1;
 
         float lenOfSelection = (float)Math.sqrt((x1-x0)*(x1-x0) + (y1-y0)*(y1-y0));
         if (lenOfSelection <= EPSILON) {
@@ -906,13 +1116,16 @@ public class GameBoard {
         float vy = (y1-y0)/lenOfSelection;
 
         // EXTENDED_PATH bonus: while armed, show the ball's actual simulated trajectory (real
-        // wall/block bounces) instead of the plain single-wall-mirror preview below -- see
-        // computeExtendedPathPoints(). Falls through to the plain preview if the simulation
-        // couldn't be set up for some reason (e.g. a degenerate aim vector).
+        // wall/block bounces), all the way until it returns to the start line, instead of the
+        // plain single-wall-mirror preview below -- see computeFullPathPoints(). Also predicts the
+        // shot's total block-clear count the same way (see predictBlocksCleared()), surfaced via
+        // aimedBlocksClearedPreview for drawLaunchHud() to show. Falls through to the plain
+        // preview if the simulation couldn't be set up for some reason (e.g. a degenerate aim
+        // vector).
         if (game.isBonusArmed(Bonus.EXTENDED_PATH)) {
-            float targetLength = dirLineLength * EXTENDED_PATH_LENGTH_MULTIPLIER;
-            List<float[]> points = computeExtendedPathPoints(x0, y0, vx, vy, targetLength);
+            List<float[]> points = computeFullPathPoints(x0, y0, vx, vy);
             if (points != null && points.size() >= 2) {
+                aimedBlocksClearedPreview = predictBlocksCleared(x0, vx, vy);
                 for (int i = 1; i < points.size(); i++) {
                     float[] a = points.get(i - 1);
                     float[] b = points.get(i);
@@ -994,13 +1207,16 @@ public class GameBoard {
 
     // EXTENDED_PATH bonus: runs the real ball-collision physics (GameBoard.update()) on a
     // throwaway copy of the current board with a single ball fired along the given aim, recording
-    // its position every tick until the preview's target length is covered (or the simulated shot
-    // naturally ends). This is the same importAndReplayForDebug()/update() machinery the "Import &
-    // Replay (Debug)" burger menu action already uses to replay an exact shot -- reusing it here
-    // means the preview is guaranteed to match what the ball will actually do (multi-bounce off
-    // walls *and* blocks), not just an idealized single-wall mirror. Returns null if the aim
-    // vector is degenerate.
-    private List<float[]> computeExtendedPathPoints(float startX, float startY, float dx, float dy, float targetLength) {
+    // its position every tick until that ball rolls back to rest on the start line (or
+    // EXTENDED_PATH_MAX_TICKS is hit, whichever comes first) -- reported requirement: show the
+    // whole round trip, not just a short prefix. This is the same
+    // importAndReplayForDebug()/update() machinery the "Import & Replay (Debug)" burger menu
+    // action already uses to replay an exact shot -- reusing it here means the preview is
+    // guaranteed to match what the ball will actually do (multi-bounce off walls *and* blocks),
+    // not just an idealized single-wall mirror. Cheap even at the full round trip: it's pure
+    // physics ticks with no rendering, the same per-tick cost fastForwardToNextBlockHit() already
+    // runs synchronously on every Speed-up tap. Returns null if the aim vector is degenerate.
+    private List<float[]> computeFullPathPoints(float startX, float startY, float dx, float dy) {
         float len = (float) Math.sqrt(dx * dx + dy * dy);
         if (len <= EPSILON) return null;
 
@@ -1009,11 +1225,7 @@ public class GameBoard {
 
         List<float[]> points = new ArrayList<>();
         points.add(new float[]{startX, startY});
-        float traveled = 0f;
         int ticks = 0;
-        // Generous safety cap -- in practice the loop exits far sooner via targetLength, since a
-        // preview only ever needs a short prefix of the shot, not the whole thing playing out.
-        int maxTicks = 600;
         Ball ball = sim.getBallForTests(0);
         // A do-while, not a while: right after importAndReplayForDebug() the ball hasn't actually
         // been dispatched yet (that happens inside update() itself, once fireCounter's dispatch
@@ -1021,29 +1233,35 @@ public class GameBoard {
         // (ballRolling()==false) before the loop body ever runs. Checking ballRolling() as an
         // upfront guard exited before a single tick, producing an empty/near-empty path.
         do {
-            float prevX = ball.getX();
-            float prevY = ball.getY();
             sim.update();
-            float x = ball.getX();
-            float y = ball.getY();
-            traveled += (float) Math.sqrt((x - prevX) * (x - prevX) + (y - prevY) * (y - prevY));
-            points.add(new float[]{x, y});
+            points.add(new float[]{ball.getX(), ball.getY()});
             ticks++;
-        } while (sim.ballRolling() && traveled < targetLength && ticks < maxTicks);
+        } while (sim.ballRolling() && ticks < EXTENDED_PATH_MAX_TICKS);
 
-        // Trim the final segment back so the drawn path ends exactly at targetLength instead of
-        // overshooting by up to one tick's worth of ball movement.
-        if (traveled > targetLength && points.size() >= 2) {
-            float[] last = points.get(points.size() - 1);
-            float[] prev = points.get(points.size() - 2);
-            float segLen = (float) Math.sqrt((last[0] - prev[0]) * (last[0] - prev[0]) + (last[1] - prev[1]) * (last[1] - prev[1]));
-            if (segLen > EPSILON) {
-                float t = Math.max(0f, (segLen - (traveled - targetLength)) / segLen);
-                last[0] = prev[0] + (last[0] - prev[0]) * t;
-                last[1] = prev[1] + (last[1] - prev[1]) * t;
-            }
-        }
         return points;
+    }
+
+    // EXTENDED_PATH bonus: predicts how many blocks the shot lined up right now would clear if
+    // fired immediately -- runs the real shot (all numBalls of it, not just the first ball traced
+    // by computeFullPathPoints()) to completion on the scratch board and reads off its
+    // blocksClearedThisMove. Same headless-physics-tick cost as computeFullPathPoints(); it's a
+    // second, separate simulation run (the first ball's traced path above only ever fires a
+    // single ball, so it can't double as this) but still just numeric ticks with no rendering.
+    // Returns -1 if the aim vector is degenerate.
+    private int predictBlocksCleared(float startX, float dx, float dy) {
+        float len = (float) Math.sqrt(dx * dx + dy * dy);
+        if (len <= EPSILON) return -1;
+
+        GameBoard sim = pathSimulationBoard();
+        sim.importAndReplayForDebug(exportBlocksJson(), startX, dx, dy, numBalls);
+
+        int ticks = 0;
+        do {
+            sim.update();
+            ticks++;
+        } while (sim.ballRolling() && ticks < EXTENDED_PATH_MAX_TICKS);
+
+        return sim.blocksClearedThisMove;
     }
 
     // No-op GameCallbacks for pathSimulationBoard() -- the simulation calls back into this exactly
@@ -1061,6 +1279,57 @@ public class GameBoard {
         @Override public void onRoundEnd(int blocksCleared, int ballsUsed) {}
         @Override public boolean isBonusArmed(Bonus bonus) { return false; }
         @Override public List<Bonus> consumeArmedBonuses() { return Collections.emptyList(); }
+    }
+
+    // (numBalls - nextFireBall) is how many balls of the current shot are still queued up at the
+    // launch point waiting to go; ballsReturnedThisShot is how many already flew back below the
+    // start line and are resting again. Their sum starts at numBalls before any shot, counts down
+    // to 0 as balls are dispatched, then counts back up to numBalls as fired balls return -- rather
+    // than jumping straight back to numBalls the instant the last ball is dispatched.
+    private int ballsRemainingToFire() {
+        // While aiming (nothing fired yet this shot) with EXTRA_BALLS armed, preview the ball
+        // count the bonus will grant on release rather than the still-current numBalls -- reported
+        // requirement: tapping the bonus should show "x20" (etc.) immediately, not only once the
+        // shot actually fires and applyConsumedBonus(EXTRA_BALLS) bumps numBalls for real.
+        if (!ballRolling() && !fire && extraBallsAppliedCount < EXTRA_BALLS_TARGETS.length
+                && game.isBonusArmed(Bonus.EXTRA_BALLS)) {
+            return Math.min(EXTRA_BALLS_TARGETS[extraBallsAppliedCount], maxNumBalls);
+        }
+        return (numBalls - nextFireBall) + ballsReturnedThisShot;
+    }
+
+    // Placed to the right of the start ball by default, but the ball's start position is
+    // draggable across almost the full board width (see MOVE_START_POINT bonus / touchMove()), so
+    // that default spot can push the text past the board's right edge -- and RIGHT_BORDER is only
+    // 10px, so the text lands off the visible screen entirely, not just off the board (reported
+    // bug). Flip the HUD to the ball's left instead whenever it wouldn't fully fit on the right.
+    private void drawLaunchHud(Canvas c) {
+        String ballsText = "x" + ballsRemainingToFire();
+        // EXTENDED_PATH bonus: while actively aiming with it armed, show the predicted block
+        // count for the currently aimed shot (set by drawDirLine(), see aimedBlocksClearedPreview)
+        // instead of blocksClearedThisMove, which still holds the previous shot's result at this
+        // point (only reset once the next shot actually fires, in fire()).
+        String blocksText = aimedBlocksClearedPreview >= 0
+                ? "🧱≈" + aimedBlocksClearedPreview
+                : "🧱 " + blocksClearedThisMove;
+        float gap = 20f;
+        float ballsWidth = launchHudPaint.measureText(ballsText);
+        float blocksWidth = launchHudPaint.measureText(blocksText);
+        float totalWidth = ballsWidth + gap + blocksWidth;
+
+        float rightEdge = offsetX + width;
+        float leftEdge = offsetX;
+        float padding = 5f;
+
+        float x = firePosX + ballRadius * 2 + 15;
+        if (x + totalWidth > rightEdge - padding) {
+            x = firePosX - ballRadius * 2 - 15 - totalWidth;
+        }
+        x = Math.max(leftEdge + padding, Math.min(rightEdge - padding - totalWidth, x));
+
+        float y = firePosY + launchHudPaint.getTextSize() / 3;
+        c.drawText(ballsText, x, y, launchHudPaint);
+        c.drawText(blocksText, x + ballsWidth + gap, y, launchHudPaint);
     }
 
     void update() {
@@ -1199,22 +1468,16 @@ public class GameBoard {
                 }
                 enforceCollisionInvariants(currBall);
 
-                // DRAG_PADDLE bonus: a ball reaching the fire line while the paddle is under it
-                // (and wide enough to still cover this x) bounces back up instead of being caught
-                // by the "ball back on start line" logic below -- checked first, before that logic
-                // gets a chance to stop the ball here.
-                if (paddleActive && currBall.getDy() > 0 && currBall.getY() + ballRadius >= firePosY
-                        && Math.abs(currBall.getX() - paddlePosX) <= paddleWidth / 2f + ballRadius) {
+                // BASELINE_BOUNCE bonus: a ball reaching the fire line bounces back up instead of
+                // being caught by the "ball back on start line" logic below, as long as the shot's
+                // shared reflection budget isn't spent yet -- checked first, before that logic gets
+                // a chance to stop the ball here.
+                if (baselineBounceReflectionsRemaining > 0 && currBall.getDy() > 0
+                        && currBall.getY() + ballRadius >= firePosY) {
                     currBall.setPos(currBall.getX(), firePosY - ballRadius);
                     currBall.setSpeed(currBall.getDx(), -currBall.getDy());
                     recordCollision(false);
-                    // Shrinks per reflection (not on a timer): PADDLE_MAX_HITS hits and it's gone.
-                    paddleHitsRemaining--;
-                    paddleWidth -= paddleShrinkPerHit;
-                    if (paddleHitsRemaining <= 0 || paddleWidth <= 0f) {
-                        paddleActive = false;
-                        paddleWidth = 0f;
-                    }
+                    baselineBounceReflectionsRemaining--;
                 } else if (currBall.getY() > firePosY) {
                     // ball back on start line
                     if (!newFirePosSet) {
@@ -1223,6 +1486,7 @@ public class GameBoard {
                     }
                     currBall.setPos(newFirePosX, firePosY);
                     currBall.setSpeed(0,0);
+                    ballsReturnedThisShot++;
                 }
                 ballAfterMoving.copy(currBall);
 
@@ -2469,6 +2733,9 @@ return false;
     // an overlapping neighbour block).
     private void recordCollision(boolean hitBlock) {
         collisionsSinceLastBlockHit = hitBlock ? 0 : collisionsSinceLastBlockHit + 1;
+        if (hitBlock) {
+            lastCollisionTimeMs = System.currentTimeMillis();
+        }
     }
 
     private void hit(int x, int y) {
@@ -2519,10 +2786,10 @@ return false;
         //freeze("ballAtEnd",0);
         if (freeze) return;
 
-        // DRAG_PADDLE bonus: gone once the move ends, even if it hasn't taken PADDLE_MAX_HITS
-        // reflections yet -- it shouldn't linger on screen (or keep catching balls) once this
-        // shot is over, and fire() already rearms/resets it fresh for whichever shot comes next.
-        paddleActive = false;
+        // BASELINE_BOUNCE bonus: gone once the move ends, even if its reflection budget isn't
+        // spent yet -- it shouldn't linger (or keep catching balls) once this shot is over, and
+        // fire() already rearms/resets it fresh for whichever shot comes next.
+        baselineBounceReflectionsRemaining = 0;
 
         finishMoveRecording();
 
@@ -2655,13 +2922,6 @@ return false;
         return hitsThisMove;
     }
 
-    // DRAG_PADDLE bonus: moves the paddle to follow a finger drag (see touchDown()/touchMove()),
-    // clamped so it can't be dragged off the board. Harmless to call while the bonus isn't active.
-    private void movePaddleTo(float x) {
-        float halfWidth = paddleWidth / 2f;
-        paddlePosX = Math.max(offsetX + halfWidth, Math.min(offsetX + width - halfWidth, x));
-    }
-
     // Text report of the last completed shot (board layout right before it, start x, launch
     // angle, bonuses spent on it) for the burger menu's "Letzten Zug exportieren" action -- meant
     // to be pasted into a debugging conversation. Null if no shot has completed yet.
@@ -2750,23 +3010,28 @@ return false;
         fireCounter = 0;
         fire = true;
         nextFireBall = 0;
+        ballsReturnedThisShot = 0;
         newFirePosSet = false;
         blocksClearedThisMove = 0;
+        // EXTENDED_PATH bonus: clear the aimed-shot preview so drawLaunchHud() switches from the
+        // "🧱≈" approximate count (last computed while aiming, now stale) to the real, growing
+        // blocksClearedThisMove for the shot that's actually firing -- drawDirLine() (the only
+        // other place this gets reset) isn't called anymore once dirLineActive goes false on
+        // release, so without this reset here the stale approx count would keep showing for the
+        // whole roll (reported bug).
+        aimedBlocksClearedPreview = -1;
         hitsThisMove = 0;
         collisionsSinceLastBlockHit = 0;
+        lastCollisionTimeMs = System.currentTimeMillis();
 
         // Reset-then-rearm here (not in applyConsumedBonus(), called earlier for the other
         // bonuses in touchRelease()) so this runs for every shot, including ones that don't spend
-        // DRAG_PADDLE (clearing any paddle left over from a previous shot) and ones fired directly
-        // via importAndReplayForDebug(), which calls fire() without going through touchRelease()
-        // or applyConsumedBonus() at all.
-        paddleActive = consumedBonuses.contains(Bonus.DRAG_PADDLE);
-        if (paddleActive) {
-            paddleWidth = width * PADDLE_INITIAL_WIDTH_FRACTION;
-            paddlePosX = firePosX;
-            paddleHitsRemaining = PADDLE_MAX_HITS;
-            paddleShrinkPerHit = paddleWidth / PADDLE_MAX_HITS;
-        }
+        // BASELINE_BOUNCE (clearing any budget left over from a previous shot) and ones fired
+        // directly via importAndReplayForDebug(), which calls fire() without going through
+        // touchRelease() or applyConsumedBonus() at all. Read after numBalls is final for this shot
+        // (EXTRA_BALLS' applyConsumedBonus() already ran in touchRelease(), before fire()), so a
+        // shot combining both bonuses gets the budget matching however many balls actually fire.
+        baselineBounceReflectionsRemaining = consumedBonuses.contains(Bonus.BASELINE_BOUNCE) ? numBalls : 0;
 
         // store game board for later debugging
         createBoardCopy();
@@ -2820,14 +3085,32 @@ return false;
         return result;
     }
 
+    // MOVE_STOPPER bonus, last-resort path: normally it's armed before a shot and only takes
+    // effect via applyConsumedBonus()/consumeArmedBonuses() on the shot that's about to fire. This
+    // lets the player instead tap it while the current shot's balls are already rolling -- e.g.
+    // once they see a block is about to be left stranded in the bottom row -- and have it still
+    // save that same shot from the game-over check in actionAfterBallRolling(). Returns false if
+    // it's already armed for this shot (nothing left for the tap to spend).
+    public boolean armMoveStopperMidShot() {
+        if (skipNextBoardDrop) return false;
+        skipNextBoardDrop = true;
+        return true;
+    }
+
+    // EXTRA_BALLS bonus: true once all 4 stacked applications have been spent for this level (see
+    // EXTRA_BALLS_TARGETS) -- lets Game refuse to arm it any further so a tap can't burn a bonus
+    // charge for no effect.
+    public boolean isExtraBallsMaxedOut() {
+        return extraBallsAppliedCount >= EXTRA_BALLS_TARGETS.length;
+    }
+
     // Applies the one-off effect of whichever bonus was just spent on this shot (or does nothing
     // if none was armed). EXTENDED_PATH and MOVE_START_POINT aren't handled here -- they act
     // continuously while armed (see drawDirLine() and touchDown()/touchMove()), so there's
     // nothing left to do once the shot fires. LINE_DELETE isn't handled here either -- it fires
     // immediately when armed instead of on the next shot (see Game.toggleArmedBonus() and
-    // triggerLineDeleteBonus()). DRAG_PADDLE also isn't handled here -- unlike these one-off
-    // flags/effects it needs to keep evolving through the whole rolling phase, so it's armed in
-    // fire() instead (see the paddle fields' comment).
+    // triggerLineDeleteBonus()). BASELINE_BOUNCE also isn't handled here -- it needs numBalls
+    // final for this shot, so it's read directly in fire() instead (see the field's comment).
     private void applyConsumedBonus(Bonus bonus) {
         if (bonus == null) return;
         switch (bonus) {
@@ -2835,14 +3118,18 @@ return false;
                 skipNextBoardDrop = true;
                 break;
             case EXTRA_BALLS:
-                while (numBalls < EXTRA_BALLS_TARGET_COUNT && numBalls < maxNumBalls) {
-                    addBall(numBalls);
+                if (extraBallsAppliedCount < EXTRA_BALLS_TARGETS.length) {
+                    int target = EXTRA_BALLS_TARGETS[extraBallsAppliedCount];
+                    extraBallsAppliedCount++;
+                    while (numBalls < target && numBalls < maxNumBalls) {
+                        addBall(numBalls);
+                    }
                 }
                 break;
             case EXTENDED_PATH:
             case MOVE_START_POINT:
             case LINE_DELETE:
-            case DRAG_PADDLE:
+            case BASELINE_BOUNCE:
                 break;
         }
     }
@@ -2853,6 +3140,14 @@ return false;
         touchMinX = minX;
         touchMaxX = maxX;
         touchMinY = minY;
+    }
+
+    // Called once by Game after the canvas size is known (see surfaceCreated()), passing the
+    // canvas y-coordinate where the SCORE/LEVEL/BEST row starts -- see aimCancelY's field comment
+    // and touchRelease() for why (reported requirement: a flat/shallow shot's release point often
+    // lands just below the start line, which used to cancel the shot outright).
+    public void setAimCancelY(float y) {
+        aimCancelY = y;
     }
 
     private float clampTouchX(float x) {
@@ -2866,6 +3161,13 @@ return false;
     public void touchDown(float x, float y) {
         x = clampTouchX(x);
         y = clampTouchY(y);
+
+        // Extended-Path fine-position mode: while its buttons are up, the board ignores every
+        // other touch (aiming, MOVE_START_POINT dragging, ...) -- only the buttons themselves
+        // (routed directly from Game's dispatch, see isFineLeftButtonHit() etc.) can do anything,
+        // until Fire is tapped or the aim is cancelled. Previously a touch landing elsewhere still
+        // reached the aiming code below and reset/overlapped the held preview (reported bug).
+        if (finePositionActive) return;
 
         if (freeze) {
             freeze = false;
@@ -2881,14 +3183,6 @@ return false;
                 balls[b].setPos(firePosX, firePosY);
                 balls[b].setPaint(ballPaint);
             }
-        }
-
-        // DRAG_PADDLE bonus: while active, any touch anywhere just drags the paddle -- takes
-        // priority over both aiming and the "swipe down to abort" gesture below (whose own
-        // startPosXTouch/Y wouldn't get set here, so touchRelease() also bails out early for it).
-        if (paddleActive) {
-            movePaddleTo(x);
-            return;
         }
 
         if (!ballRolling() && !fire) {
@@ -2920,10 +3214,8 @@ return false;
     public void touchMove(float x, float y) {
         x = clampTouchX(x);
         y = clampTouchY(y);
-        if (paddleActive) {
-            movePaddleTo(x);
-            return;
-        }
+        // See touchDown()'s finePositionActive comment: only the buttons respond while they're up.
+        if (finePositionActive) return;
         if (dirLineActive) {
             if (movingStartPoint) {
                 if (y > gameOverLineY()) {
@@ -2957,15 +3249,16 @@ return false;
     public void cancelAim() {
         dirLineActive = false;
         movingStartPoint = false;
+        finePositionActive = false;
     }
 
     public void touchRelease(float x, float y) {
         x = clampTouchX(x);
         y = clampTouchY(y);
-        if (paddleActive) {
-            // Dragging the paddle doesn't fire or abort anything -- see touchDown().
-            return;
-        }
+        // See touchDown()'s finePositionActive comment: only the buttons respond while they're up
+        // -- Game's dispatch already routes a hit on one of them elsewhere before ever calling
+        // this, so reaching here means the release missed all three and should just be ignored.
+        if (finePositionActive) return;
         if (dirLineActive && movingStartPoint) {
             // MOVE_START_POINT bonus: this whole gesture stayed below the game-over line, so it
             // only repositioned the start ball -- don't fire, just wait for the next gesture to
@@ -2973,31 +3266,28 @@ return false;
             dirLineActive = false;
             return;
         }
-        if (dirLineActive && y >= firePosY) {
-            // Release is still at or below the start line (firePosY, where the resting ball
-            // sits) -- the drag never lifted above it, so this isn't a committed aim, just a
-            // finger coming back down near where it started. Cancel instead of firing whatever
-            // clampAimVector() would default to (reported requirement), so the player can simply
-            // touch down again.
+        if (dirLineActive && y >= aimCancelY) {
+            // Release has come back down as far as aimCancelY -- by default the start line
+            // (firePosY, where the resting ball sits), but Game.java raises this to the
+            // score/level/best display instead (see setAimCancelY()) so a flat, shallow shot can
+            // still be released just below the start line without being mistaken for an
+            // abandoned aim. Cancel instead of firing whatever clampAimVector() would default to
+            // (reported requirement), so the player can simply touch down again.
             dirLineActive = false;
             return;
         }
         if (dirLineActive) {
-            if ( !reusePreviousFireSpeed) {
-                firePosX = newFirePosX;
+            float[] v = clampAimVector(x - newFirePosX, y - firePosY);
+            dirLineX = newFirePosX + v[0];
+            dirLineY = firePosY + v[1];
 
-                float[] v = clampAimVector(x - firePosX, y - firePosY);
-                setFireSpeed(v[0], v[1]);
+            if (game.isBonusArmed(Bonus.EXTENDED_PATH)) {
+                // Extended-Path fine-position mode: hold the shot instead of firing right away --
+                // see the class-level finePositionActive comment and confirmFire().
+                finePositionActive = true;
+            } else {
+                confirmFire();
             }
-            // Applied before fire() so EXTRA_BALLS' extra balls are already in place for this
-            // shot's launch sequence. Several bonuses can be armed and spent together.
-            List<Bonus> consumedBonuses = game.consumeArmedBonuses();
-            for (Bonus bonus : consumedBonuses) {
-                applyConsumedBonus(bonus);
-            }
-            fire(consumedBonuses);
-            dirLineActive = false;
-            endOfRollingPhase = false;
         }
 
         if (ballRolling() && !ballDropRunning) {
@@ -3010,6 +3300,26 @@ return false;
                 }
             }
         }
+    }
+
+    // Actually fires the shot using whatever the aim preview (dirLineX/dirLineY) currently points
+    // at -- called directly from touchRelease() when no fine-position hold is needed, or from
+    // confirmFineFire() once the player taps Fire after nudging the preview.
+    private void confirmFire() {
+        if (!reusePreviousFireSpeed) {
+            firePosX = newFirePosX;
+            setFireSpeed(dirLineX - firePosX, dirLineY - firePosY);
+        }
+        // Applied before fire() so EXTRA_BALLS' extra balls are already in place for this shot's
+        // launch sequence. Several bonuses can be armed and spent together.
+        List<Bonus> consumedBonuses = game.consumeArmedBonuses();
+        for (Bonus bonus : consumedBonuses) {
+            applyConsumedBonus(bonus);
+        }
+        fire(consumedBonuses);
+        dirLineActive = false;
+        finePositionActive = false;
+        endOfRollingPhase = false;
     }
 
     public float getBlockX(int x) {
@@ -3129,6 +3439,17 @@ return false;
             blocks[x][yDim - 1] = null;
         }
         createBoardCopy();
+    }
+
+    // LINE_DELETE bonus: deleting the last row can empty the board outside of a shot, so it never
+    // reaches actionAfterBallRolling()'s win check -- without this, the level only completes once
+    // the player fires another (necessarily fruitless) shot. Mirrors the gameBoardEmpty() branch
+    // of actionAfterBallRolling().
+    public void checkLevelCompleteAfterLineDelete() {
+        if (freeze) return;
+        if (gameBoardEmpty()) {
+            game.addAnimation(new LevelCompleteAnimation(this));
+        }
     }
 
     public float getHeight() {
@@ -3402,16 +3723,8 @@ return false;
         return nextFireBall;
     }
 
-    boolean isPaddleActiveForTests() {
-        return paddleActive;
-    }
-
-    float getPaddlePosXForTests() {
-        return paddlePosX;
-    }
-
-    float getPaddleWidthForTests() {
-        return paddleWidth;
+    int getBaselineBounceReflectionsRemainingForTests() {
+        return baselineBounceReflectionsRemaining;
     }
 
     float getBallRadiusForTests() {
@@ -3548,21 +3861,25 @@ return false;
         return freeze;
     }
 
-    // True once the balls have bounced SPEEDUP_TRIGGER_COLLISIONS times in a row (see
-    // recordCollision()) without hitting a block -- draw()/isSpeedUpButtonHit() show and hit-test
-    // the overlay button only while this holds. Also requires balls to actually still be rolling
-    // (nothing to fast-forward through otherwise) and the game not already frozen on a debug
-    // anomaly (that overlay takes priority).
+    // True once either (a) the balls have bounced SPEEDUP_TRIGGER_COLLISIONS times in a row (see
+    // recordCollision()) without hitting a block, or (b) SPEEDUP_TRIGGER_IDLE_MS have passed since
+    // the last block hit (covers a ball flying through open space or bouncing off borders for a
+    // while without ever hitting a block) -- draw()/isSpeedUpButtonHit() show and
+    // hit-test the overlay button only while this holds. Also requires balls to actually still be
+    // rolling (nothing to fast-forward through otherwise) and the game not already frozen on a
+    // debug anomaly (that overlay takes priority).
     public boolean shouldOfferSpeedUp() {
-        return !freeze && ballRolling() && collisionsSinceLastBlockHit >= SPEEDUP_TRIGGER_COLLISIONS;
+        if (freeze || !ballRolling()) return false;
+        return collisionsSinceLastBlockHit >= SPEEDUP_TRIGGER_COLLISIONS
+                || System.currentTimeMillis() - lastCollisionTimeMs >= SPEEDUP_TRIGGER_IDLE_MS;
     }
 
-    // Centered on the board -- computed fresh each call (cheap) so draw() and the touch hit-test
-    // below always agree, instead of the Share Report button's pattern of recomputing the same
-    // literal coordinates in two places.
+    // Top-left corner of the board -- computed fresh each call (cheap) so draw() and the touch
+    // hit-test below always agree, instead of the Share Report button's pattern of recomputing the
+    // same literal coordinates in two places.
     private RectF getSpeedUpButtonRect() {
-        float buttonX = offsetX + width / 2f - SPEEDUP_BUTTON_WIDTH / 2f;
-        float buttonY = offsetY + height / 2f - SPEEDUP_BUTTON_HEIGHT / 2f;
+        float buttonX = offsetX;
+        float buttonY = offsetY;
         speedUpButtonRect.set(buttonX, buttonY, buttonX + SPEEDUP_BUTTON_WIDTH, buttonY + SPEEDUP_BUTTON_HEIGHT);
         return speedUpButtonRect;
     }
@@ -3579,9 +3896,15 @@ return false;
     // the calling (touch-handling) thread -- purely numeric, no drawing, so even the max tick count
     // completes in well under a frame's worth of wall-clock time.
     public void fastForwardToNextBlockHit() {
+        // Stop condition is "a block got hit", tracked via hitsThisMove rather than
+        // collisionsSinceLastBlockHit/lastCollisionTimeMs directly: those two now drive
+        // shouldOfferSpeedUp() independently (collision count OR idle time), and when the button
+        // was triggered by the idle-time path, collisionsSinceLastBlockHit can still be well under
+        // SPEEDUP_TRIGGER_COLLISIONS at the very first border bounce -- looping on that condition
+        // would then exit after a single bounce instead of actually reaching the next block hit.
+        int startingHits = hitsThisMove;
         int ticks = 0;
-        while (!freeze && ballRolling() && collisionsSinceLastBlockHit >= SPEEDUP_TRIGGER_COLLISIONS
-                && ticks < SPEEDUP_MAX_TICKS) {
+        while (!freeze && ballRolling() && hitsThisMove == startingHits && ticks < SPEEDUP_MAX_TICKS) {
             update();
             ticks++;
         }

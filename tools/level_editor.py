@@ -28,13 +28,17 @@ after tracing.
 import argparse
 import colorsys
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import tkinter as tk
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
-from PIL import Image
+from PIL import Image, ImageGrab
 
 BOARD_COLS = 11
 MAX_PLAYABLE_ROWS = 16  # GameBoard reserves the bottom 2 rows of its 18-row board.
@@ -51,10 +55,118 @@ BLOCK_TYPES = ("square",) + TRIANGLE_TYPES
 
 LEVEL_FILE_RE = re.compile(r"level(\d+)\.json$", re.IGNORECASE)
 
+# Matches Game.writeExportFile()'s target on the device (app-specific external storage, readable
+# via `adb pull` without root as long as USB debugging is on) -- see
+# LevelOverviewWindow._import_from_phone() below.
+ANDROID_PACKAGE = "com.jrgames.blockpong"
+REMOTE_EXPORT_PATH = f"/sdcard/Android/data/{ANDROID_PACKAGE}/files/level_export.txt"
+
 
 def _level_sort_key(path):
     m = LEVEL_FILE_RE.match(path.name)
     return (0, int(m.group(1))) if m else (1, path.name.lower())
+
+
+# ---------------------------------------------------------------------------
+# adb helpers for "Import from Phone" -- pulls Game.writeExportFile()'s mirror of whatever was
+# last copied via the app's "Exportieren"/"Alle Level exportieren", so a level built on the phone
+# can be pulled over USB without any manual copy/paste or clipboard-sync app.
+
+def _find_adb():
+    exe = shutil.which("adb")
+    if exe:
+        return exe
+    for var in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        root = os.environ.get(var)
+        if not root:
+            continue
+        candidate = Path(root) / "platform-tools" / ("adb.exe" if sys.platform == "win32" else "adb")
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _adb_list_devices(adb_exe):
+    result = subprocess.run([adb_exe, "devices"], capture_output=True, text=True, timeout=10)
+    devices = []
+    for line in result.stdout.splitlines()[1:]:
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        serial, state = line.split("\t", 1)
+        if state.strip() == "device":
+            devices.append(serial)
+    return devices
+
+
+def _choose_adb_device(parent, devices):
+    dialog = tk.Toplevel(parent)
+    dialog.title("Geraet waehlen")
+    dialog.transient(parent)
+    dialog.grab_set()
+    ttk.Label(dialog, text="Mehrere Geraete gefunden -- welches?").pack(anchor="w", padx=10, pady=(10, 4))
+    choice = {"serial": None}
+
+    def pick(serial):
+        choice["serial"] = serial
+        dialog.destroy()
+
+    for serial in devices:
+        ttk.Button(dialog, text=serial, command=lambda s=serial: pick(s)).pack(fill="x", padx=10, pady=2)
+    ttk.Button(dialog, text="Abbrechen", command=dialog.destroy).pack(fill="x", padx=10, pady=(4, 10))
+    dialog.wait_window()
+    return choice["serial"]
+
+
+def _adb_pull_export_text(parent):
+    """Runs `adb pull` for REMOTE_EXPORT_PATH and returns its text, or None (with an error dialog
+    already shown) if adb/the device/the file aren't available."""
+    adb_exe = _find_adb()
+    if not adb_exe:
+        messagebox.showerror(
+            "Import from Phone",
+            "adb wurde nicht gefunden. Android SDK Platform-Tools installieren und in PATH, "
+            "ANDROID_SDK_ROOT oder ANDROID_HOME verfuegbar machen.",
+            parent=parent)
+        return None
+
+    try:
+        devices = _adb_list_devices(adb_exe)
+    except (OSError, subprocess.SubprocessError) as e:
+        messagebox.showerror("Import from Phone", f"adb devices fehlgeschlagen: {e}", parent=parent)
+        return None
+    if not devices:
+        messagebox.showerror(
+            "Import from Phone",
+            "Kein Geraet gefunden. Handy per USB anschliessen, USB-Debugging aktivieren und den "
+            "Verbindungsdialog auf dem Handy bestaetigen.",
+            parent=parent)
+        return None
+
+    serial = devices[0]
+    if len(devices) > 1:
+        serial = _choose_adb_device(parent, devices)
+        if serial is None:
+            return None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        local_path = Path(tmp) / "level_export.txt"
+        try:
+            result = subprocess.run(
+                [adb_exe, "-s", serial, "pull", REMOTE_EXPORT_PATH, str(local_path)],
+                capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as e:
+            messagebox.showerror("Import from Phone", f"adb pull fehlgeschlagen: {e}", parent=parent)
+            return None
+        if result.returncode != 0 or not local_path.exists():
+            messagebox.showerror(
+                "Import from Phone",
+                "Konnte die Export-Datei nicht vom Handy holen. In der App zuerst im "
+                "Level-Editor \"Exportieren\" oder \"Alle Level exportieren\" antippen, dann hier "
+                "erneut versuchen.\n\n" + (result.stderr.strip() or result.stdout.strip()),
+                parent=parent)
+            return None
+        return local_path.read_text(encoding="utf-8")
 
 
 # Matches the "Spielfeld vor/nach dem Zug" labels GameBoard.getLastMoveReport() prints right
@@ -246,6 +358,15 @@ def value_to_hex_color(value):
     return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
 
 
+# Quick-pick palette shown as clickable swatches next to the custom color picker (see
+# LevelEditorApp._build_layout()'s color section) -- a fixed, recognizable set rather than
+# anything value-derived, for deliberately overriding a block's look independent of its value.
+STANDARD_COLORS = [
+    "#e74c3c", "#e67e22", "#f1c40f", "#2ecc71", "#1abc9c", "#3498db",
+    "#9b59b6", "#e84393", "#ffffff", "#95a5a6", "#34495e", "#000000",
+]
+
+
 def effective_block_color(value, color=None):
     """A block's displayed color: an explicit override (see GameBoard.loadBlocksFromJson()'s
     optional "color" field / Block.overrideColor on the app side) if set, else the usual
@@ -318,106 +439,406 @@ def draw_blocks_static(canvas, blocks, cell_size=COMPARE_CELL_SIZE, rows=MAX_PLA
 # GUI
 # ---------------------------------------------------------------------------
 
-class ImportImageDialog(tk.Toplevel):
-    """Collects gif_to_level-style options, runs convert(), and hands the
-    resulting blocks back to the caller via self.result."""
+class ImageImportWindow(tk.Toplevel):
+    """Interactive image-to-blocks import: load an image (file or clipboard paste), then pan/zoom/
+    rotate it against a live preview of the block grid and pick a background/transparent color by
+    right-clicking the preview, before exporting the currently-aligned view as blocks via
+    self.result -- same (blocks, rows) contract the old plain-settings dialog used, so callers
+    don't need to change. The headless CLI path (convert(), used by main()/_import_image_path())
+    is untouched -- this is purely an interactive alternative for the "Import Image..." menu action.
+
+    Coordinate model: self.rotated_image is self.source_image rotated by self.rotation_deg (PIL
+    rotate(expand=True, fillcolor=transparent), so corners the rotation introduces are transparent
+    rather than showing rotated-away content). self.base_ppc_x/self.base_ppc_y ("pixels per grid
+    column/row" -- fitting the *whole* rotated image to the *whole* grid, recomputed whenever the
+    source image, its rotation, or the column/row count changes) divided by self.zoom_x/self.zoom_y
+    (independently adjustable, see _adjust_zoom()) give the actual source-image-pixel size of one
+    grid cell's sampling window on each axis; self.offset_x/self.offset_y (in rotated-image pixel
+    space) is that window's top-left origin for grid cell (0, 0), shifted by dragging. Any sample
+    window landing outside the rotated image's bounds is simply background/transparent -- that's
+    what lets panning/zooming "move the image around" within the fixed-size grid instead of always
+    covering it edge-to-edge."""
+
+    PREVIEW_CELL_PX = 28
+    ZOOM_MIN, ZOOM_MAX = 0.1, 8.0
+    ZOOM_STEP = 1.15  # multiplicative, per wheel notch / +/- button click
+    # Fixed default grid -- pan/zoom/rotate now let the user fit any image to it manually, so
+    # there's no need to auto-size rows/cols to each image's aspect ratio anymore.
+    DEFAULT_COLS, DEFAULT_ROWS = 11, 17
 
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Import Image")
-        self.resizable(False, False)
-        self.result = None
         self.transient(parent)
         self.grab_set()
+        self.result = None
 
-        self.path_var = tk.StringVar()
-        self.cols_var = tk.IntVar(value=BOARD_COLS)
-        self.rows_var = tk.StringVar(value="")
+        self.source_image = None   # original, unrotated RGBA PIL Image, or None until loaded
+        self.rotated_image = None  # source_image rotated by rotation_deg, RGBA, expand=True
+        self.base_ppc_x = 1.0
+        self.base_ppc_y = 1.0
+        self.zoom_x = 1.0
+        self.zoom_y = 1.0
+        self.rotation_deg = 0.0
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self._pan_last = (0, 0)
+
+        self.cols_var = tk.IntVar(value=self.DEFAULT_COLS)
+        self.rows_var = tk.IntVar(value=self.DEFAULT_ROWS)
         self.method_var = tk.StringVar(value="avg")
         self.value_min_var = tk.IntVar(value=1)
         self.value_max_var = tk.IntVar(value=20)
-        self.frame_var = tk.IntVar(value=0)
-        self.bg_color_var = tk.StringVar(value="")
+        self.bg_color = None  # (r, g, b) or None -- see _pick_bg_color()/_auto_bg_color()
         self.bg_tolerance_var = tk.DoubleVar(value=24.0)
+        self.rotation_var = tk.DoubleVar(value=0.0)
+        self.zoom_x_var = tk.StringVar(value="100%")
+        self.zoom_y_var = tk.StringVar(value="100%")
+        self.bg_status_var = tk.StringVar(value="Background: none picked yet")
+        self.source_label_var = tk.StringVar(value="No image loaded.")
 
-        frm = ttk.Frame(self, padding=10)
-        frm.grid(row=0, column=0, sticky="nsew")
+        self._build_layout()
+        self._redraw_preview()
 
-        row = 0
-        ttk.Label(frm, text="Image file:").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.path_var, width=40).grid(row=row, column=1, columnspan=2, sticky="we")
-        ttk.Button(frm, text="Browse...", command=self._browse).grid(row=row, column=3)
-        row += 1
+        self.cols_var.trace_add("write", lambda *a: self._on_grid_size_changed())
+        self.rows_var.trace_add("write", lambda *a: self._redraw_preview())
 
-        ttk.Label(frm, text="Columns:").grid(row=row, column=0, sticky="w")
-        ttk.Spinbox(frm, from_=1, to=BOARD_COLS, textvariable=self.cols_var, width=6).grid(row=row, column=1, sticky="w")
-        ttk.Label(frm, text="Rows (blank=auto):").grid(row=row, column=2, sticky="w")
-        ttk.Entry(frm, textvariable=self.rows_var, width=6).grid(row=row, column=3, sticky="w")
-        row += 1
+    # -- layout ----------------------------------------------------------
 
-        ttk.Label(frm, text="Merge method:").grid(row=row, column=0, sticky="w")
-        ttk.Combobox(frm, textvariable=self.method_var, values=["avg", "max"], width=6, state="readonly").grid(row=row, column=1, sticky="w")
-        row += 1
+    def _build_layout(self):
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill="both", expand=True)
 
-        ttk.Label(frm, text="Value min:").grid(row=row, column=0, sticky="w")
-        ttk.Spinbox(frm, from_=0, to=99, textvariable=self.value_min_var, width=6).grid(row=row, column=1, sticky="w")
-        ttk.Label(frm, text="Value max:").grid(row=row, column=2, sticky="w")
-        ttk.Spinbox(frm, from_=0, to=99, textvariable=self.value_max_var, width=6).grid(row=row, column=3, sticky="w")
-        row += 1
+        top = ttk.Frame(main)
+        top.pack(fill="x")
+        ttk.Button(top, text="Open Image...", command=self._open_file).pack(side="left")
+        ttk.Button(top, text="Paste from Clipboard", command=self._paste_clipboard).pack(side="left", padx=(6, 0))
+        ttk.Label(top, textvariable=self.source_label_var, foreground="#888888").pack(side="left", padx=(10, 0))
 
-        ttk.Label(frm, text="Frame (0-based):").grid(row=row, column=0, sticky="w")
-        self.frame_spin = ttk.Spinbox(frm, from_=0, to=0, textvariable=self.frame_var, width=6)
-        self.frame_spin.grid(row=row, column=1, sticky="w")
-        self.frame_info = ttk.Label(frm, text="")
-        self.frame_info.grid(row=row, column=2, columnspan=2, sticky="w")
-        row += 1
+        body = ttk.Frame(main)
+        body.pack(fill="both", expand=True, pady=(8, 0))
 
-        ttk.Label(frm, text="Background color (hex, blank=auto):").grid(row=row, column=0, columnspan=2, sticky="w")
-        ttk.Entry(frm, textvariable=self.bg_color_var, width=10).grid(row=row, column=2, sticky="w")
-        row += 1
+        self.canvas = tk.Canvas(
+            body, width=self.cols_var.get() * self.PREVIEW_CELL_PX,
+            height=self.rows_var.get() * self.PREVIEW_CELL_PX,
+            background="#1e1e1e", highlightthickness=1, highlightbackground="#666666")
+        self.canvas.grid(row=0, column=0)
+        self.canvas.bind("<Button-1>", self._on_pan_start)
+        self.canvas.bind("<B1-Motion>", self._on_pan_drag)
+        self.canvas.bind("<Button-3>", self._pick_bg_color)
+        self.canvas.bind("<MouseWheel>", lambda e: self._on_wheel_zoom(e, "y"))
+        self.canvas.bind("<Button-4>", lambda e: self._on_wheel_zoom(e, "y"))
+        self.canvas.bind("<Button-5>", lambda e: self._on_wheel_zoom(e, "y"))
+        self.canvas.bind("<Shift-MouseWheel>", lambda e: self._on_wheel_zoom(e, "x"))
+        self.canvas.bind("<Shift-Button-4>", lambda e: self._on_wheel_zoom(e, "x"))
+        self.canvas.bind("<Shift-Button-5>", lambda e: self._on_wheel_zoom(e, "x"))
 
-        ttk.Label(frm, text="Background tolerance:").grid(row=row, column=0, sticky="w")
-        ttk.Spinbox(frm, from_=0, to=255, textvariable=self.bg_tolerance_var, width=6).grid(row=row, column=1, sticky="w")
-        row += 1
+        side = ttk.Frame(body, padding=(10, 0))
+        side.grid(row=0, column=1, sticky="n")
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=row, column=0, columnspan=4, pady=(10, 0))
-        ttk.Button(btns, text="Import", command=self._do_import).pack(side="left", padx=5)
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left", padx=5)
+        ttk.Label(side, text="Grid size", font=("TkDefaultFont", 9, "bold")).pack(anchor="w")
+        grid_row = ttk.Frame(side)
+        grid_row.pack(anchor="w", pady=(0, 6))
+        ttk.Label(grid_row, text="Cols:").pack(side="left")
+        ttk.Spinbox(grid_row, from_=1, to=BOARD_COLS, textvariable=self.cols_var, width=5).pack(side="left", padx=(2, 8))
+        ttk.Label(grid_row, text="Rows:").pack(side="left")
+        ttk.Spinbox(grid_row, from_=1, to=EDITOR_ROWS, textvariable=self.rows_var, width=5).pack(side="left", padx=(2, 0))
 
-    def _browse(self):
+        ttk.Label(side, text="Zoom", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(6, 0))
+        zoom_x_row = ttk.Frame(side)
+        zoom_x_row.pack(anchor="w")
+        ttk.Label(zoom_x_row, text="X:", width=2).pack(side="left")
+        ttk.Button(zoom_x_row, text="-", width=3, command=lambda: self._adjust_zoom("x", 1 / self.ZOOM_STEP)).pack(side="left")
+        ttk.Label(zoom_x_row, textvariable=self.zoom_x_var, width=6, anchor="center").pack(side="left")
+        ttk.Button(zoom_x_row, text="+", width=3, command=lambda: self._adjust_zoom("x", self.ZOOM_STEP)).pack(side="left")
+        zoom_y_row = ttk.Frame(side)
+        zoom_y_row.pack(anchor="w")
+        ttk.Label(zoom_y_row, text="Y:", width=2).pack(side="left")
+        ttk.Button(zoom_y_row, text="-", width=3, command=lambda: self._adjust_zoom("y", 1 / self.ZOOM_STEP)).pack(side="left")
+        ttk.Label(zoom_y_row, textvariable=self.zoom_y_var, width=6, anchor="center").pack(side="left")
+        ttk.Button(zoom_y_row, text="+", width=3, command=lambda: self._adjust_zoom("y", self.ZOOM_STEP)).pack(side="left")
+        ttk.Button(side, text="Reset view", command=self._reset_view).pack(anchor="w", pady=(2, 0))
+
+        ttk.Label(side, text="Rotate", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(6, 0))
+        rotate_row = ttk.Frame(side)
+        rotate_row.pack(anchor="w")
+        ttk.Button(rotate_row, text="⟲ 90°", width=6, command=lambda: self._nudge_rotation(-90)).pack(side="left")
+        ttk.Button(rotate_row, text="⟳ 90°", width=6, command=lambda: self._nudge_rotation(90)).pack(side="left", padx=(2, 0))
+        ttk.Scale(side, from_=-180, to=180, variable=self.rotation_var, orient="horizontal",
+                  command=self._on_rotation_changed).pack(fill="x", pady=(4, 0))
+
+        ttk.Label(side, text="Background color", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(6, 0))
+        ttk.Label(side, textvariable=self.bg_status_var, foreground="#888888", wraplength=170,
+                  justify="left").pack(anchor="w")
+        ttk.Button(side, text="Auto-detect (corners)", command=self._auto_bg_color).pack(fill="x", pady=(2, 0))
+        ttk.Label(side, text="Tolerance:").pack(anchor="w", pady=(4, 0))
+        ttk.Spinbox(side, from_=0, to=255, textvariable=self.bg_tolerance_var, width=6,
+                    command=self._redraw_preview).pack(anchor="w")
+
+        ttk.Label(side, text="Value range", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(6, 0))
+        value_row = ttk.Frame(side)
+        value_row.pack(anchor="w")
+        ttk.Spinbox(value_row, from_=0, to=99, textvariable=self.value_min_var, width=5,
+                    command=self._redraw_preview).pack(side="left")
+        ttk.Label(value_row, text="to").pack(side="left", padx=4)
+        ttk.Spinbox(value_row, from_=0, to=99, textvariable=self.value_max_var, width=5,
+                    command=self._redraw_preview).pack(side="left")
+
+        ttk.Label(side, text="Merge method:").pack(anchor="w", pady=(6, 0))
+        ttk.Combobox(side, textvariable=self.method_var, values=["avg", "max"], width=6,
+                     state="readonly").pack(anchor="w")
+        self.method_var.trace_add("write", lambda *a: self._redraw_preview())
+        self.bg_tolerance_var.trace_add("write", lambda *a: self._redraw_preview())
+        self.value_min_var.trace_add("write", lambda *a: self._redraw_preview())
+        self.value_max_var.trace_add("write", lambda *a: self._redraw_preview())
+
+        ttk.Label(side, text=(
+            "Left-drag: move image\nRight-click: pick background color\n"
+            "Wheel / Y +/-: zoom Y\nShift+Wheel / X +/-: zoom X"
+        ), justify="left", foreground="#888888").pack(anchor="w", pady=(12, 0))
+
+        btns = ttk.Frame(main)
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="Export as Level", command=self._do_export).pack(side="left")
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left", padx=(6, 0))
+
+    # -- image source ------------------------------------------------------
+
+    def _open_file(self):
         path = filedialog.askopenfilename(
             parent=self,
             filetypes=[("Images", "*.gif *.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")],
         )
         if not path:
             return
-        self.path_var.set(path)
         try:
-            n_frames = getattr(Image.open(path), "n_frames", 1)
-        except Exception:
-            n_frames = 1
-        self.frame_spin.configure(to=max(0, n_frames - 1))
-        self.frame_info.configure(text=f"({n_frames} frame{'s' if n_frames != 1 else ''} in file)")
-
-    def _do_import(self):
-        path = self.path_var.get().strip()
-        if not path:
-            messagebox.showerror("Import Image", "Choose an image file first.", parent=self)
-            return
-        rows_text = self.rows_var.get().strip()
-        rows = int(rows_text) if rows_text else None
-        bg_color = self.bg_color_var.get().strip().lstrip("#") or None
-        try:
-            blocks, _preview, rows_used = convert(
-                path, self.cols_var.get(), rows, self.method_var.get(),
-                self.value_min_var.get(), self.value_max_var.get(),
-                self.frame_var.get(), bg_color, self.bg_tolerance_var.get(),
-            )
+            img = Image.open(path).convert("RGBA")
         except Exception as e:
-            messagebox.showerror("Import Image", f"Conversion failed: {e}", parent=self)
+            messagebox.showerror("Import Image", f"Could not open image:\n{e}", parent=self)
             return
-        self.result = (blocks, rows_used)
+        self._set_source_image(img, Path(path).name)
+
+    def _paste_clipboard(self):
+        try:
+            data = ImageGrab.grabclipboard()
+        except Exception as e:
+            messagebox.showerror("Import Image", f"Could not read the clipboard:\n{e}", parent=self)
+            return
+        if data is None:
+            messagebox.showerror("Import Image", "Clipboard has no image.", parent=self)
+            return
+        if isinstance(data, list):
+            # Windows Explorer "copy" of one or more files, rather than actual image bytes.
+            if not data:
+                messagebox.showerror("Import Image", "Clipboard has no image.", parent=self)
+                return
+            try:
+                img = Image.open(data[0]).convert("RGBA")
+            except Exception as e:
+                messagebox.showerror("Import Image", f"Could not open clipboard file:\n{e}", parent=self)
+                return
+            self._set_source_image(img, Path(data[0]).name)
+        else:
+            self._set_source_image(data.convert("RGBA"), "(clipboard)")
+
+    def _set_source_image(self, img, label):
+        self.source_image = img
+        self.source_label_var.set(f"{label} ({img.width}x{img.height})")
+        self.bg_color = None
+        self.bg_status_var.set("Background: none picked yet")
+        # Grid size (cols/rows) is no longer auto-computed from the image's aspect ratio -- with
+        # pan/zoom/rotate available, whatever grid the user currently has stays put across loads;
+        # only construction sets DEFAULT_COLS/DEFAULT_ROWS.
+        self._reset_view()
+
+    # -- view transform: rotate / zoom / pan --------------------------------
+
+    def _reset_view(self):
+        self.zoom_x = 1.0
+        self.zoom_y = 1.0
+        self.zoom_x_var.set("100%")
+        self.zoom_y_var.set("100%")
+        self.rotation_deg = 0.0
+        self.rotation_var.set(0.0)
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self._rebuild_rotated_image()
+
+    def _rebuild_rotated_image(self):
+        if self.source_image is None:
+            self.rotated_image = None
+            self._redraw_preview()
+            return
+        if self.rotation_deg % 360 == 0:
+            self.rotated_image = self.source_image
+        else:
+            self.rotated_image = self.source_image.rotate(
+                self.rotation_deg, expand=True, resample=Image.BICUBIC, fillcolor=(0, 0, 0, 0))
+        self.base_ppc_x = max(1.0, self.rotated_image.width / self.cols_var.get())
+        self.base_ppc_y = max(1.0, self.rotated_image.height / self.rows_var.get())
+        self._redraw_preview()
+
+    def _on_grid_size_changed(self):
+        # Column/row count redefines what base_ppc_x/base_ppc_y ("pixels per column/row") mean --
+        # rebuild against them.
+        self._rebuild_rotated_image()
+
+    def _nudge_rotation(self, delta):
+        self.rotation_var.set((self.rotation_var.get() + delta + 180) % 360 - 180)
+        self._on_rotation_changed()
+
+    def _on_rotation_changed(self, *_args):
+        self.rotation_deg = self.rotation_var.get()
+        self._rebuild_rotated_image()
+
+    def _adjust_zoom(self, axis, factor):
+        if axis == "x":
+            self.zoom_x = max(self.ZOOM_MIN, min(self.ZOOM_MAX, self.zoom_x * factor))
+            self.zoom_x_var.set(f"{round(self.zoom_x * 100)}%")
+        else:
+            self.zoom_y = max(self.ZOOM_MIN, min(self.ZOOM_MAX, self.zoom_y * factor))
+            self.zoom_y_var.set(f"{round(self.zoom_y * 100)}%")
+        self._redraw_preview()
+
+    def _on_wheel_zoom(self, event, axis):
+        num = getattr(event, "num", None)
+        if num == 4:
+            direction = 1
+        elif num == 5:
+            direction = -1
+        else:
+            direction = 1 if event.delta > 0 else -1
+        self._adjust_zoom(axis, self.ZOOM_STEP if direction > 0 else 1 / self.ZOOM_STEP)
+
+    def _current_ppc_x(self):
+        return max(0.001, self.base_ppc_x / self.zoom_x)
+
+    def _current_ppc_y(self):
+        return max(0.001, self.base_ppc_y / self.zoom_y)
+
+    def _on_pan_start(self, event):
+        self._pan_last = (event.x, event.y)
+
+    def _on_pan_drag(self, event):
+        if self.rotated_image is None:
+            return
+        last_x, last_y = self._pan_last
+        dx_preview, dy_preview = event.x - last_x, event.y - last_y
+        self._pan_last = (event.x, event.y)
+        # Direct-manipulation feel (like dragging a photo with a finger): dragging right should
+        # make the image appear to move right, which means the sampling window's origin moves the
+        # opposite way in source-image space. X/Y scales are independent since zoom_x/zoom_y are.
+        scale_x = self.PREVIEW_CELL_PX / self._current_ppc_x()  # preview px per source px
+        scale_y = self.PREVIEW_CELL_PX / self._current_ppc_y()
+        self.offset_x -= dx_preview / scale_x
+        self.offset_y -= dy_preview / scale_y
+        self._redraw_preview()
+
+    # -- background color pick ----------------------------------------------
+
+    def _pick_bg_color(self, event):
+        if self.rotated_image is None:
+            return
+        gx, gy = event.x // self.PREVIEW_CELL_PX, event.y // self.PREVIEW_CELL_PX
+        ix = int(self.offset_x + (gx + 0.5) * self._current_ppc_x())
+        iy = int(self.offset_y + (gy + 0.5) * self._current_ppc_y())
+        w, h = self.rotated_image.size
+        if not (0 <= ix < w and 0 <= iy < h):
+            return
+        r, g, b, a = self.rotated_image.getpixel((ix, iy))
+        if a < 10:
+            messagebox.showinfo("Import Image", "That spot is already transparent.", parent=self)
+            return
+        self.bg_color = (r, g, b)
+        self.bg_status_var.set(f"Background: custom #{r:02x}{g:02x}{b:02x}")
+        self._redraw_preview()
+
+    def _auto_bg_color(self):
+        if self.source_image is None:
+            return
+        r, g, b, _a = detect_background_color(self.source_image)
+        self.bg_color = (r, g, b)
+        self.bg_status_var.set(f"Background: auto-detected #{r:02x}{g:02x}{b:02x}")
+        self._redraw_preview()
+
+    # -- sampling / preview ---------------------------------------------------
+
+    def _sample_grid(self):
+        """Returns (blocks, cell_colors) for the current pan/zoom/rotation/background settings --
+        cell_colors maps (gx, gy) -> hex color or None (background), for the preview draw. Shares
+        merge_cell_color()/luminance()/is_background() with the headless convert() path, just
+        windowed into rotated_image via offset_x/offset_y/ppc instead of always covering it
+        edge-to-edge.
+
+        Each block also carries its sampled color as an explicit "color" override (same field
+        effective_block_color()/the level editor's color picker already understand) -- the point
+        being that the imported level looks exactly like the source image right away, with the
+        brightness-derived "value" only a rough starting point the user tunes by hand afterward
+        (e.g. via the level editor's Bulk Value +1/-1 buttons) rather than something to get right
+        here."""
+        cols, rows = self.cols_var.get(), self.rows_var.get()
+        ppc_x, ppc_y = self._current_ppc_x(), self._current_ppc_y()
+        img = self.rotated_image
+        w, h = img.size
+        bg_color = self.bg_color
+        value_min, value_max = self.value_min_var.get(), self.value_max_var.get()
+        method = self.method_var.get()
+        tolerance = self.bg_tolerance_var.get()
+
+        blocks = []
+        cell_colors = {}
+        for gy in range(rows):
+            y0, y1 = self.offset_y + gy * ppc_y, self.offset_y + (gy + 1) * ppc_y
+            for gx in range(cols):
+                x0, x1 = self.offset_x + gx * ppc_x, self.offset_x + (gx + 1) * ppc_x
+                px0, px1 = max(0, int(x0)), min(w, max(int(x0) + 1, int(x1)))
+                py0, py1 = max(0, int(y0)), min(h, max(int(y0) + 1, int(y1)))
+                if px1 <= px0 or py1 <= py0:
+                    cell_colors[(gx, gy)] = None
+                    continue
+                cell_pixels = [img.getpixel((x, y)) for y in range(py0, py1) for x in range(px0, px1)]
+                avg_rgba = tuple(sum(c[i] for c in cell_pixels) / len(cell_pixels) for i in range(4))
+                if is_background(avg_rgba, True, bg_color, tolerance):
+                    cell_colors[(gx, gy)] = None
+                    continue
+                color = merge_cell_color(cell_pixels, method)
+                brightness = luminance(color) / 255.0
+                value = round(value_min + brightness * (value_max - value_min))
+                value = max(value_min, min(value_max, value))
+                hex_color = "#%02x%02x%02x" % tuple(round(c) for c in color)
+                blocks.append({"x": gx, "y": gy, "type": "square", "value": value, "color": hex_color})
+                cell_colors[(gx, gy)] = hex_color
+        return blocks, cell_colors
+
+    def _redraw_preview(self, *_args):
+        cols, rows = self.cols_var.get(), self.rows_var.get()
+        self.canvas.configure(width=cols * self.PREVIEW_CELL_PX, height=rows * self.PREVIEW_CELL_PX)
+        self.canvas.delete("all")
+        if self.rotated_image is None:
+            self.canvas.create_text(
+                cols * self.PREVIEW_CELL_PX / 2, rows * self.PREVIEW_CELL_PX / 2,
+                text="Open an image or paste one from the clipboard", fill="#888888",
+                width=cols * self.PREVIEW_CELL_PX - 20)
+            return
+        _blocks, cell_colors = self._sample_grid()
+        for gy in range(rows):
+            for gx in range(cols):
+                x0, y0 = gx * self.PREVIEW_CELL_PX, gy * self.PREVIEW_CELL_PX
+                x1, y1 = x0 + self.PREVIEW_CELL_PX, y0 + self.PREVIEW_CELL_PX
+                color = cell_colors.get((gx, gy))
+                self.canvas.create_rectangle(x0, y0, x1, y1, fill=(color or "#1e1e1e"), outline="#3a3a3a")
+
+    def _do_export(self):
+        if self.rotated_image is None:
+            messagebox.showerror("Import Image", "Open an image or paste one from the clipboard first.", parent=self)
+            return
+        blocks, _cell_colors = self._sample_grid()
+        if not blocks and not messagebox.askyesno(
+                "Import Image",
+                "No blocks would be created with the current view/background settings -- "
+                "export an empty level anyway?", parent=self):
+            return
+        self.result = (blocks, self.rows_var.get())
         self.destroy()
 
 
@@ -459,14 +880,21 @@ class PasteJsonDialog(tk.Toplevel):
     """Lets the user paste a "Letzten Zug exportieren (Debug)" report (or raw
     {"blocks": [...]} JSON) copied from the app, and opens a read-only BoardCompareWindow showing
     every board snapshot found in it (typically "vor"/"nach dem Zug") side by side -- for visually
-    inspecting a reported bug's board state, not editing it."""
+    inspecting a reported bug's board state, not editing it.
 
-    def __init__(self, parent):
+    Also doubles as the review step for "Import from Phone" (see
+    LevelOverviewWindow._import_from_phone()): when opened with initial_text, that's shown instead
+    of the live clipboard, but the rest of the flow (Visualize / Save All to Assets) is identical --
+    adb pull just replaces manual copy/paste."""
+
+    def __init__(self, parent, initial_text=None, on_saved=None):
         super().__init__(parent)
         self.title("Paste Debug JSON")
         self.geometry("640x480")
         self.transient(parent)
         self.grab_set()
+        self.on_saved = on_saved  # called after a successful Save All to Assets, e.g. to refresh
+        # a LevelOverviewWindow's thumbnails -- see LevelOverviewWindow._import_from_phone().
 
         frm = ttk.Frame(self, padding=10)
         frm.pack(fill="both", expand=True)
@@ -481,10 +909,13 @@ class PasteJsonDialog(tk.Toplevel):
         scrollbar.pack(side="right", fill="y")
         self.text.configure(yscrollcommand=scrollbar.set)
 
-        try:
-            self.text.insert("1.0", self.clipboard_get())
-        except tk.TclError:
-            pass
+        if initial_text is not None:
+            self.text.insert("1.0", initial_text)
+        else:
+            try:
+                self.text.insert("1.0", self.clipboard_get())
+            except tk.TclError:
+                pass
         self.text.focus_set()
 
         btns = ttk.Frame(frm)
@@ -530,6 +961,8 @@ class PasteJsonDialog(tk.Toplevel):
             with open(path, "w") as f:
                 json.dump({"blocks": sorted_blocks}, f, indent=2)
         messagebox.showinfo("Save All to Assets", f"Wrote {len(levels)} level file(s).", parent=self)
+        if self.on_saved:
+            self.on_saved()
 
     def _do_visualize(self):
         content = self.text.get("1.0", "end")
@@ -546,7 +979,8 @@ class LevelOverviewWindow(tk.Toplevel):
     """Scrollable matrix of small thumbnails, one per authored (non-random-slot) level found in
     assets/levels/ -- 9 per row, since that's exactly how many designed levels sit between two
     random-level slots (see is_random_level_slot()). Meant for spotting sparse/boring levels at a
-    glance and jumping straight to editing one by clicking its thumbnail."""
+    glance and jumping straight to editing one by clicking its thumbnail. Thumbnails can also be
+    dragged to a new position to reorder levels (see _reorder())."""
 
     THUMB_COLS = 9
     CELL_PX = 6  # one board cell, shrunk down, per thumbnail pixel
@@ -561,11 +995,16 @@ class LevelOverviewWindow(tk.Toplevel):
         self.title("Level Overview")
         self.geometry("900x700")
 
+        # Tracked on the app so show_level_overview() can raise this same window instead of
+        # stacking up duplicates -- the overview is meant to stay open alongside the editor now
+        # (picking a level to edit no longer closes it, see _switch_to_editor()), so there needs to
+        # be exactly one at a time to switch back to.
+        self.app._overview_window = self
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._build_menu()
+
         if is_entry_view:
-            # This is the whole app's landing view (main window still withdrawn) -- closing it via
-            # the window manager needs to fall back to showing the blank editor instead of leaving
-            # the process running with no visible window at all.
-            self.protocol("WM_DELETE_WINDOW", self._close_to_blank_editor)
             toolbar = ttk.Frame(self)
             toolbar.pack(fill="x", side="top")
             ttk.Button(toolbar, text="Neues Level...", command=self._new_level).pack(side="left", padx=6, pady=4)
@@ -582,20 +1021,131 @@ class LevelOverviewWindow(tk.Toplevel):
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Button-4>", self._on_wheel)
         self.canvas.bind("<Button-5>", self._on_wheel)
-        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Button-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
 
-        self._thumb_rects = []  # (path, x0, y0, x1, y1)
+        self._levels = []  # [(n, path), ...] in display order
+        self._thumb_rects = []  # (idx, path, x0, y0, x1, y1)
+        self._drag_idx = None  # index (into _levels/_thumb_rects) currently held down, or None
+        self._drag_moved = False
+        self._drag_indicator = None  # canvas item id of the drop-target highlight
+        self._drag_target_idx = None
         self._populate()
 
-    def _close_to_blank_editor(self):
+    def _on_close(self):
+        # Entry view: the main window is still withdrawn at this point (nothing was ever opened
+        # for editing), so falling back to the blank editor keeps the process from ending up with
+        # no visible window at all if the user closes this via the window manager.
+        if self.is_entry_view:
+            self.app._overview_window = None
+            self.app.root.deiconify()
+            self.destroy()
+            return
+        if self.app.root.state() == "withdrawn":
+            # The editor window isn't gone, just hidden -- LevelEditorApp.on_exit() withdraws it
+            # instead of destroying it whenever an Overview is open (see its comment). If this
+            # Overview is the only other window, closing it here would leave mainloop() running
+            # forever with nothing on screen, so finish the exit that on_exit() deferred.
+            if not self.app._confirm_discard():
+                return
+            self.app._overview_window = None
+            self.destroy()
+            self.app.root.destroy()
+            return
+        self.app._overview_window = None
         self.destroy()
-        self.app.root.deiconify()
+
+    def _exit_app(self):
+        # File > Exit here must end the whole process -- unlike LevelEditorApp.on_exit() (bound
+        # to the plain editor window's own close button), which deliberately only withdraws the
+        # editor and leaves an already-open Overview running. Wiring this menu item to on_exit()
+        # directly hit exactly that withdraw-only branch (since the Overview -- this very window
+        # -- always counts as "open" while its own menu is being used), so Exit appeared to do
+        # nothing at all from here. Still goes through the same discard-unsaved-changes guard.
+        if not self.app._confirm_discard():
+            return
+        self.app.root.destroy()
+
+    def _switch_to_editor(self):
+        # Brings the editor window to the front without closing the overview -- both stay open so
+        # switching back is just a window away (or show_level_overview()'s sidebar button/shortcut,
+        # which raises this same instance instead of opening a duplicate).
+        # Root can be withdrawn either because this is the very first open (is_entry_view) or
+        # because LevelEditorApp.on_exit() hid it earlier while this Overview stayed open --
+        # either way, actually opening a level here means it must become visible again.
+        if self.app.root.state() == "withdrawn":
+            self.app.root.deiconify()
+        if self.is_entry_view:
+            # The "no visible window at all" safety net in _on_close() only makes sense before
+            # any level has ever actually been opened -- once real editing has happened, closing
+            # the Overview later must not resurrect a level the user may have since saved and
+            # deliberately hidden again via LevelEditorApp.on_exit(). Without clearing this here,
+            # _on_close() kept deiconify()-ing the editor on *every* future close of this Overview
+            # instance, not just the first one.
+            self.is_entry_view = False
+        self.app.root.lift()
+        self.app.root.focus_force()
+        # focus_force() only gives the *window* OS focus -- Tk separately tracks which widget
+        # inside it has keyboard focus, and that's whatever it happened to be the last time this
+        # window was focused (nothing, the first time, or the Overview if the two windows have
+        # been toggled back and forth). The arrow-key/Ctrl+Arrow/Shift+Arrow/Backspace bindings
+        # are all on self.app.canvas specifically, so without this they silently do nothing.
+        self.app.canvas.focus_set()
+
+    def _build_menu(self):
+        # The Level Overview is the level-management hub, so the full File menu lives here rather
+        # than on the plain drawing canvas (LevelEditorApp._build_menu()) -- New/Open land a level
+        # into the (possibly hidden, see is_entry_view) editor window and switch to it, same as
+        # picking a thumbnail (_open_level()) already does; Save/Save As/Export act on whatever's
+        # currently loaded there without needing to switch windows. Import Image lives on the
+        # editor window instead (see LevelEditorApp._build_menu()) -- unlike New/Open it produces
+        # content you then need to hand-clean-up on the canvas, so it belongs where that happens.
+        menubar = tk.Menu(self)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="New", command=self._new_level, accelerator="Ctrl+N")
+        file_menu.add_command(label="Open Level JSON...", command=self._file_open, accelerator="Ctrl+O")
+        file_menu.add_command(label="Paste Debug JSON...", command=self._paste_debug_json, accelerator="Ctrl+Shift+V")
+        file_menu.add_command(label="Import from Phone (adb)...", command=self._import_from_phone, accelerator="Ctrl+Shift+I")
+        file_menu.add_separator()
+        file_menu.add_command(label="Save", command=self.app.save, accelerator="Ctrl+S")
+        file_menu.add_command(label="Save As...", command=self.app.save_as)
+        file_menu.add_command(label="Export to assets/levels/level<N>.json...", command=self.app.export_to_assets)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._exit_app)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        self.config(menu=menubar)
+        self.bind("<Control-n>", lambda e: self._new_level())
+        self.bind("<Control-o>", lambda e: self._file_open())
+        self.bind("<Control-Shift-V>", lambda e: self._paste_debug_json())
+        self.bind("<Control-Shift-v>", lambda e: self._paste_debug_json())
+        self.bind("<Control-Shift-I>", lambda e: self._import_from_phone())
+        self.bind("<Control-Shift-i>", lambda e: self._import_from_phone())
+        self.bind("<Control-s>", lambda e: self.app.save())
 
     def _new_level(self):
-        self.app.new_level()
-        if self.is_entry_view:
-            self.app.root.deiconify()
-        self.destroy()
+        if not self.app.new_level():
+            return  # user cancelled the discard-unsaved-changes prompt -- stay in the overview
+        self._switch_to_editor()
+
+    def _file_open(self):
+        if not self.app.open_level():
+            return  # dialog cancelled, load failed, or discard declined -- stay in the overview
+        self._switch_to_editor()
+
+    def _paste_debug_json(self):
+        self.app.paste_debug_json(self)
+
+    def _import_from_phone(self):
+        # Parented to this window (not app.root, which may be withdrawn in entry view) and wired
+        # to refresh the thumbnail grid once the pulled level(s) are actually saved to assets/ --
+        # otherwise the overview would keep showing stale thumbnails until reopened.
+        content = _adb_pull_export_text(self)
+        if content is None:
+            return
+        PasteJsonDialog(self, initial_text=content, on_saved=self._refresh)
 
     def _populate(self):
         files = sorted(ASSETS_LEVELS_DIR.glob("level*.json"), key=_level_sort_key) if ASSETS_LEVELS_DIR.exists() else []
@@ -605,6 +1155,9 @@ class LevelOverviewWindow(tk.Toplevel):
             if not m or is_random_level_slot(int(m.group(1))):
                 continue
             levels.append((int(m.group(1)), p))
+
+        self._levels = levels
+        self._thumb_rects = []
 
         if not levels:
             self.canvas.create_text(20, 20, text="No authored levels found.", fill="#aaaaaa", anchor="nw")
@@ -620,14 +1173,18 @@ class LevelOverviewWindow(tk.Toplevel):
             row = idx // self.THUMB_COLS
             x0 = self.GAP_X + col * cell_w
             y0 = self.GAP_Y + self.LABEL_H + row * cell_h
-            self._draw_thumbnail(n, path, x0, y0, thumb_w, thumb_h)
+            self._draw_thumbnail(idx, n, path, x0, y0, thumb_w, thumb_h)
 
         total_rows = (len(levels) + self.THUMB_COLS - 1) // self.THUMB_COLS
         total_w = self.GAP_X + self.THUMB_COLS * cell_w
         total_h = self.GAP_Y + self.LABEL_H + total_rows * cell_h
         self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
 
-    def _draw_thumbnail(self, n, path, x0, y0, w, h):
+    def _refresh(self):
+        self.canvas.delete("all")
+        self._populate()
+
+    def _draw_thumbnail(self, idx, n, path, x0, y0, w, h):
         self.canvas.create_text(x0 + w / 2, y0 - 2, text=str(n), fill="#aaaaaa", anchor="s", font=("TkDefaultFont", 7))
         self.canvas.create_rectangle(x0, y0, x0 + w, y0 + h, outline="#555555", fill="#111111")
 
@@ -650,23 +1207,120 @@ class LevelOverviewWindow(tk.Toplevel):
                 cx0, cy0, cx0 + self.CELL_PX, cy0 + self.CELL_PX,
                 outline="", fill=effective_block_color(value, b.get("color")))
 
-        self._thumb_rects.append((path, x0, y0, x0 + w, y0 + h))
+        self._thumb_rects.append((idx, path, x0, y0, x0 + w, y0 + h))
 
-    def _on_click(self, event):
+    # -- click vs. drag-to-reorder ------------------------------------------
+    #
+    # A plain click (mouse down + up with negligible movement) opens the level under the
+    # cursor, same as before. Once the drag exceeds a small pixel threshold it's treated as a
+    # reorder instead: the thumbnail nearest the cursor is highlighted as the drop target, and
+    # on release the dragged level is moved to that position in the grid (see _reorder()).
+
+    DRAG_THRESHOLD_PX = 4
+
+    def _thumb_index_at(self, cx, cy):
+        for idx, path, x0, y0, x1, y1 in self._thumb_rects:
+            if x0 <= cx <= x1 and y0 <= cy <= y1:
+                return idx
+        return None
+
+    def _nearest_thumb_index(self, cx, cy):
+        best_idx, best_dist = None, None
+        for idx, path, x0, y0, x1, y1 in self._thumb_rects:
+            ccx, ccy = (x0 + x1) / 2, (y0 + y1) / 2
+            d = (ccx - cx) ** 2 + (ccy - cy) ** 2
+            if best_dist is None or d < best_dist:
+                best_dist, best_idx = d, idx
+        return best_idx
+
+    def _on_press(self, event):
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
-        for path, x0, y0, x1, y1 in self._thumb_rects:
-            if x0 <= cx <= x1 and y0 <= cy <= y1:
-                self._open_level(path)
+        self._press_pos = (cx, cy)
+        self._drag_idx = self._thumb_index_at(cx, cy)
+        self._drag_moved = False
+        self._drag_target_idx = None
+
+    def _on_drag_motion(self, event):
+        if self._drag_idx is None:
+            return
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        if not self._drag_moved:
+            if abs(cx - self._press_pos[0]) < self.DRAG_THRESHOLD_PX and abs(cy - self._press_pos[1]) < self.DRAG_THRESHOLD_PX:
                 return
+            self._drag_moved = True
+        self._update_drag_indicator(self._nearest_thumb_index(cx, cy))
+
+    def _update_drag_indicator(self, target_idx):
+        if self._drag_indicator is not None:
+            self.canvas.delete(self._drag_indicator)
+            self._drag_indicator = None
+        self._drag_target_idx = target_idx
+        if target_idx is None:
+            return
+        for idx, path, x0, y0, x1, y1 in self._thumb_rects:
+            if idx == target_idx:
+                self._drag_indicator = self.canvas.create_rectangle(
+                    x0 - 3, y0 - 3, x1 + 3, y1 + 3, outline="#4aa3ff", width=3)
+                break
+
+    def _on_release(self, event):
+        if self._drag_idx is None:
+            return
+        if self._drag_indicator is not None:
+            self.canvas.delete(self._drag_indicator)
+            self._drag_indicator = None
+        if self._drag_moved:
+            if self._drag_target_idx is not None and self._drag_target_idx != self._drag_idx:
+                self._reorder(self._drag_idx, self._drag_target_idx)
+        else:
+            for idx, path, x0, y0, x1, y1 in self._thumb_rects:
+                if idx == self._drag_idx:
+                    self._open_level(path)
+                    break
+        self._drag_idx = None
+        self._drag_moved = False
+        self._drag_target_idx = None
+
+    def _reorder(self, from_idx, to_idx):
+        # Level numbers double as their filenames (GameBoard loads "level<N>.json" by number), and
+        # random-level slots (is_random_level_slot()) sit fixed between them without a file at all.
+        # So "moving" a level can't rename files across a shifting range -- instead the set of
+        # number-slots stays exactly as-is, and only the *content* assigned to each slot is
+        # permuted (list.insert semantics: remove the dragged item, insert it at the target index,
+        # everything between the two positions shifts by one). All source content is read up front
+        # so overwriting slot i can't clobber content still needed for slot i+1.
+        paths = [p for _, p in self._levels]
+        contents = [p.read_text(encoding="utf-8") for p in paths]
+
+        order = list(range(len(paths)))
+        moved = order.pop(from_idx)
+        order.insert(to_idx, moved)
+
+        lo, hi = min(from_idx, to_idx), max(from_idx, to_idx)
+        touched = set()
+        for i in range(lo, hi + 1):
+            if order[i] != i:
+                paths[i].write_text(contents[order[i]], encoding="utf-8")
+                touched.add(paths[i])
+
+        # The editor window behind this overview may already have one of the just-rewritten
+        # levels open; its in-memory grid would otherwise silently go stale (and a later Save
+        # would clobber the reorder for that slot). Reload it from disk, discarding any unsaved
+        # edits after asking -- same prompt used when switching levels via the dropdown.
+        current = self.app.current_path
+        if current is not None and current in touched:
+            self.app._confirm_discard()
+            self.app._load_level_file(current)
+
+        self._refresh()
 
     def _open_level(self, path):
         if not self.app._confirm_discard():
             return
         self.app._load_level_file(path)
-        if self.is_entry_view:
-            self.app.root.deiconify()
-        self.destroy()
+        self._switch_to_editor()
 
     def _on_wheel(self, event):
         if event.num == 4:
@@ -684,6 +1338,25 @@ class LevelEditorApp:
         self.selected = None  # (x, y) or None
         self.current_path = None
         self.dirty = False
+        self._overview_window = None  # the one live LevelOverviewWindow, if any -- see show_level_overview()
+
+        # Undo/redo: each entry is a full snapshot of self.grid taken right before a mutation, so
+        # undo/redo just swaps the whole grid back and forth -- see _push_undo()/_undo()/_redo().
+        # Reset whenever a different level's content replaces the grid wholesale (_load_blocks(),
+        # new_level()) since undoing past a "loaded a different file" boundary makes no sense.
+        self._undo_stack = []
+        self._redo_stack = []
+        self._dragging = False  # coalesces one mouse-drag's cell-by-cell paints/erases into a
+        # single undo step -- see _end_drag().
+        self._eyedropper_picked = False  # whether this drag has already picked up a source color
+        # for the Color Picker tool -- see _paint_eyedropper()/_end_drag().
+        self._press_pos = (0, 0)
+        self._drag_confirmed = False  # whether this press has moved enough to count as a real
+        # drag yet -- see _on_canvas_press()/_on_canvas_drag()/PAINT_DRAG_THRESHOLD_PX.
+        self._clone_source = None  # Clone Stamp tool: armed source cell, or None -- see
+        # _clone_press()/_clone_drag()/_clone_apply().
+        self._clone_offset = None  # Clone Stamp tool: fixed (dx, dy) from source to destination,
+        # set by the destination-picking click; None until then.
 
         self._build_menu()
         self._build_layout()
@@ -708,23 +1381,25 @@ class LevelEditorApp:
     # -- layout ------------------------------------------------------------
 
     def _build_menu(self):
+        # Most of the File menu lives on LevelOverviewWindow now (see its _build_menu()) -- the
+        # Level Overview is the level-management hub, so New/Open/etc. fit better there than on
+        # this plain drawing canvas. Import Image and Save/Save As are the exceptions: Import
+        # Image produces content you then need to hand-clean-up right here on the canvas, and
+        # Save/Save As are common enough mid-edit that reaching for the Overview just for those
+        # (even with Ctrl+S already bound here, see below) would be annoying.
         menubar = tk.Menu(self.root)
 
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="New", command=self.new_level, accelerator="Ctrl+N")
-        file_menu.add_command(label="Open Level JSON...", command=self.open_level, accelerator="Ctrl+O")
         file_menu.add_command(label="Import Image...", command=self.import_image, accelerator="Ctrl+I")
-        file_menu.add_command(label="Paste Debug JSON...", command=self.paste_debug_json, accelerator="Ctrl+Shift+V")
-        file_menu.add_command(label="Level Overview...", command=self.show_level_overview, accelerator="Ctrl+Shift+O")
         file_menu.add_separator()
         file_menu.add_command(label="Save", command=self.save, accelerator="Ctrl+S")
         file_menu.add_command(label="Save As...", command=self.save_as)
-        file_menu.add_command(label="Export to assets/levels/level<N>.json...", command=self.export_to_assets)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.on_exit)
         menubar.add_cascade(label="File", menu=file_menu)
 
         edit_menu = tk.Menu(menubar, tearoff=0)
+        edit_menu.add_command(label="Undo", command=self._undo, accelerator="Ctrl+Z")
+        edit_menu.add_command(label="Redo", command=self._redo, accelerator="Ctrl+Y")
+        edit_menu.add_separator()
         edit_menu.add_command(label="Clear All", command=self.clear_all)
         menubar.add_cascade(label="Edit", menu=edit_menu)
 
@@ -737,6 +1412,10 @@ class LevelEditorApp:
         self.root.bind("<Control-Shift-O>", lambda e: self.show_level_overview())
         self.root.bind("<Control-Shift-o>", lambda e: self.show_level_overview())
         self.root.bind("<Control-s>", lambda e: self.save())
+        self.root.bind("<Control-z>", lambda e: self._undo())
+        self.root.bind("<Control-y>", lambda e: self._redo())
+        self.root.bind("<Control-Shift-Z>", lambda e: self._redo())
+        self.root.bind("<Control-Shift-z>", lambda e: self._redo())
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
 
     def _build_layout(self):
@@ -746,10 +1425,11 @@ class LevelEditorApp:
         self.canvas = tk.Canvas(main, width=BOARD_COLS * CELL_SIZE, height=EDITOR_ROWS * CELL_SIZE,
                                  background="#1e1e1e", highlightthickness=1, highlightbackground="#666666")
         self.canvas.grid(row=0, column=0, padx=8, pady=8)
-        self.canvas.bind("<Button-1>", self._paint)
-        self.canvas.bind("<B1-Motion>", self._paint)
-        self.canvas.bind("<Button-3>", self._erase)
-        self.canvas.bind("<B3-Motion>", self._erase)
+        self.canvas.bind("<Button-1>", self._on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._end_drag)
+        self.canvas.bind("<Button-3>", self._copy_block)
+        self.canvas.bind("<B3-Motion>", self._copy_block)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Button-4>", self._on_wheel)
@@ -761,11 +1441,16 @@ class LevelEditorApp:
         self.canvas.bind("<Down>", lambda e: self._move_selection(0, 1))
         self.canvas.bind("<Shift-Left>", lambda e: self._cycle_type(-1))
         self.canvas.bind("<Shift-Right>", lambda e: self._cycle_type(1))
+        self.canvas.bind("<Shift-Up>", lambda e: self._adjust_selected_value(1))
+        self.canvas.bind("<Shift-Down>", lambda e: self._adjust_selected_value(-1))
         self.canvas.bind("<Control-Left>", lambda e: self._move_selected_block(-1, 0))
         self.canvas.bind("<Control-Right>", lambda e: self._move_selected_block(1, 0))
         self.canvas.bind("<Control-Up>", lambda e: self._move_selected_block(0, -1))
         self.canvas.bind("<Control-Down>", lambda e: self._move_selected_block(0, 1))
         self.canvas.bind("<BackSpace>", lambda e: self._delete_selected())
+        self.canvas.bind("<Return>", self._overwrite_selected)
+        self.canvas.bind("<KP_Enter>", self._overwrite_selected)
+        self.canvas.bind("<space>", self._overwrite_selected)
         self.canvas.focus_set()
 
         sidebar = ttk.Frame(main, padding=(8, 8))
@@ -789,9 +1474,14 @@ class LevelEditorApp:
         tools = [
             ("square", "Square"), ("tl", "◤ Triangle TL"), ("tr", "◥ Triangle TR"),
             ("bl", "◣ Triangle BL"), ("br", "◢ Triangle BR"), ("eraser", "Eraser"),
+            ("colorpicker", "🎨 Color Picker"), ("clone", "📋 Clone Stamp"),
         ]
         for value, label in tools:
             ttk.Radiobutton(sidebar, text=label, value=value, variable=self.tool_var).pack(anchor="w")
+        self.clone_status_var = tk.StringVar(value="")
+        ttk.Label(sidebar, textvariable=self.clone_status_var, foreground="#888888",
+                  font=("TkDefaultFont", 8), wraplength=140, justify="left").pack(anchor="w", pady=(0, 4))
+        self.tool_var.trace_add("write", lambda *args: self._update_clone_status())
 
         ttk.Separator(sidebar, orient="horizontal").pack(fill="x", pady=8)
 
@@ -813,6 +1503,19 @@ class LevelEditorApp:
         ttk.Label(sidebar, textvariable=self.color_status_var, foreground="#888888",
                   font=("TkDefaultFont", 8)).pack(anchor="w")
         ttk.Button(sidebar, text="Reset color to value", command=self._reset_color).pack(fill="x", pady=(2, 0))
+
+        # Quick-pick palette (STANDARD_COLORS) -- same effect as picking a color via the swatch's
+        # dialog (_apply_color()), just without opening it. 6 columns x 2 rows.
+        palette = ttk.Frame(sidebar)
+        palette.pack(pady=(6, 0))
+        PALETTE_SWATCH_PX = 18
+        for idx, hexcode in enumerate(STANDARD_COLORS):
+            row, col = divmod(idx, 6)
+            sw = tk.Canvas(palette, width=PALETTE_SWATCH_PX, height=PALETTE_SWATCH_PX,
+                            highlightthickness=1, highlightbackground="#666666", cursor="hand2")
+            sw.create_rectangle(0, 0, PALETTE_SWATCH_PX, PALETTE_SWATCH_PX, fill=hexcode, outline="")
+            sw.grid(row=row, column=col, padx=1, pady=1)
+            sw.bind("<Button-1>", lambda e, c=hexcode: self._apply_color(c))
         self._update_swatch()
 
         ttk.Separator(sidebar, orient="horizontal").pack(fill="x", pady=8)
@@ -831,12 +1534,25 @@ class LevelEditorApp:
         ttk.Button(shift_grid, text="↓", width=3,
                    command=lambda: self.shift_all(0, 1)).grid(row=2, column=1)
 
+        ttk.Label(sidebar, text="Bulk Value", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(8, 0))
+        bulk_value_row = ttk.Frame(sidebar)
+        bulk_value_row.pack(pady=(2, 0))
+        ttk.Button(bulk_value_row, text="Alle Werte -1", width=12,
+                   command=lambda: self.bump_all_values(-1)).pack(side="left")
+        ttk.Button(bulk_value_row, text="Alle Werte +1", width=12,
+                   command=lambda: self.bump_all_values(1)).pack(side="left", padx=(4, 0))
+
         ttk.Label(sidebar, text=(
-            "Left-drag: paint\nRight-drag: erase\nWheel: adjust value\n\n"
+            "Left-drag: paint (overwrites)\nRight-drag: copy a block's\nshape/value/color, then\n"
+            "left-click places copies\nWheel: adjust value\n\n"
+            "Color Picker tool: first block\ntouched picks up its color,\n"
+            "rest of the drag applies it\n(type/value untouched)\n\n"
             "Click a cell to select it, then:\n"
             "Arrows: move selection\n1-9: set value\n"
             "Shift+←/→: cycle block type\n"
-            "Ctrl+Arrows: move the block\nBackspace: delete"
+            "Ctrl+Arrows: move the block\nBackspace: delete\n\n"
+            "(Erase: select the Eraser\ntool, or Backspace)\n\n"
+            "Ctrl+Z: undo\nCtrl+Y / Ctrl+Shift+Z: redo"
         ), justify="left", foreground="#888888").pack(anchor="w", pady=(16, 0))
 
         status = ttk.Frame(self.root)
@@ -859,27 +1575,34 @@ class LevelEditorApp:
         self.swatch.create_text(35, 16, text=str(value), fill=contrasting_text_color(color))
         self.color_status_var.set(f"Color: custom {self.current_color}" if self.current_color else "Color: auto (from value)")
 
-    def _pick_color(self):
-        # Click the swatch to pick a color independent of the block's point value -- see
-        # effective_block_color(). Applies to the currently selected placed block (if any), and
-        # becomes the color new blocks are painted with from here on (like current_value).
-        initial = self.current_color or value_to_hex_color(self.current_value.get())
-        _rgb, hexcode = colorchooser.askcolor(color=initial, title="Pick block color", parent=self.root)
-        if hexcode is None:
-            return
+    def _apply_color(self, hexcode):
+        # Shared by the custom color-picker dialog (_pick_color()) and the STANDARD_COLORS
+        # palette swatches -- see effective_block_color(). Applies to the currently selected
+        # placed block (if any), and becomes the color new blocks are painted with from here on
+        # (like current_value).
         self.current_color = hexcode.lower()
         if self.selected is not None and self.selected in self.grid:
+            self._push_undo()
             self.grid[self.selected]["color"] = self.current_color
             self._mark_dirty()
             self._redraw()
         self._update_swatch()
 
+    def _pick_color(self):
+        # Click the swatch to open the full color-picker dialog.
+        initial = self.current_color or value_to_hex_color(self.current_value.get())
+        _rgb, hexcode = colorchooser.askcolor(color=initial, title="Pick block color", parent=self.root)
+        if hexcode is None:
+            return
+        self._apply_color(hexcode)
+
     def _reset_color(self):
         self.current_color = None
-        if self.selected is not None and self.selected in self.grid:
-            if self.grid[self.selected].pop("color", None) is not None:
-                self._mark_dirty()
-                self._redraw()
+        if self.selected is not None and self.selected in self.grid and "color" in self.grid[self.selected]:
+            self._push_undo()
+            del self.grid[self.selected]["color"]
+            self._mark_dirty()
+            self._redraw()
         self._update_swatch()
 
     # -- drawing -------------------------------------------------------
@@ -931,6 +1654,48 @@ class LevelEditorApp:
             return gx, gy
         return None
 
+    PAINT_DRAG_THRESHOLD_PX = 4
+
+    def _on_canvas_press(self, event):
+        # A plain click (press+release with no real movement) on an *occupied* cell with the
+        # square/triangle paint tools only selects it, same as before overwrite-on-click existed
+        # -- otherwise just clicking around to look at an already-authored level silently stomps
+        # blocks whose type/value/color happen to differ from whatever the sidebar's current tool
+        # state is, marking the level dirty despite the user never having intended to edit
+        # anything (reported: "ich hatte nichts editiert"). Only once the mouse actually moves
+        # past the threshold (_on_canvas_drag()) does it commit to painting. Eraser/Color Picker
+        # are exempt: selecting either of those tools is already a deliberate choice, so a single
+        # click acting immediately is expected, not a surprise -- same as before. Clone Stamp is
+        # exempt too, for the same reason: once armed, every press/drag is a deliberate stamp --
+        # see _clone_press().
+        cell = self._cell_at(event)
+        if cell is None:
+            return
+        self._press_pos = (event.x, event.y)
+        self._drag_confirmed = False
+        if self.tool_var.get() == "clone":
+            self._drag_confirmed = True
+            self._clone_press(cell)
+            return
+        if cell not in self.grid or self.tool_var.get() in ("eraser", "colorpicker"):
+            self._drag_confirmed = True
+            self._paint(event)
+            return
+        self.canvas.focus_set()
+        self.selected = cell
+        self._redraw()
+
+    def _on_canvas_drag(self, event):
+        if self.tool_var.get() == "clone":
+            self._clone_drag(event)
+            return
+        if not self._drag_confirmed:
+            px, py = self._press_pos
+            if abs(event.x - px) < self.PAINT_DRAG_THRESHOLD_PX and abs(event.y - py) < self.PAINT_DRAG_THRESHOLD_PX:
+                return  # still within the original press -- not a real drag yet
+            self._drag_confirmed = True
+        self._paint(event)
+
     def _paint(self, event):
         cell = self._cell_at(event)
         if cell is None:
@@ -939,13 +1704,14 @@ class LevelEditorApp:
         self.selected = cell
         tool = self.tool_var.get()
         if tool == "eraser":
-            if self.grid.pop(cell, None) is not None:
+            if cell in self.grid:
+                self._push_drag_undo()
+                del self.grid[cell]
                 self._mark_dirty()
             self._redraw()
             return
-        if cell in self.grid:
-            # An occupied cell is only selected, never repainted -- use the
-            # eraser or the keyboard (1-9 / Shift+Left/Right) to change it.
+        if tool == "colorpicker":
+            self._paint_eyedropper(cell)
             self._redraw()
             return
         try:
@@ -953,19 +1719,142 @@ class LevelEditorApp:
         except tk.TclError:
             self._redraw()
             return
-        self.grid[cell] = self._new_block_info(tool, value)
+        new_info = self._new_block_info(tool, value)
+        if self.grid.get(cell) == new_info:
+            # Already exactly this type/value/color -- nothing to do, and more importantly nothing
+            # to push onto the undo stack for (a drag re-painting the same block repeatedly would
+            # otherwise burn through undo steps that revert to an identical state).
+            self._redraw()
+            return
+        self._push_drag_undo()
+        self.grid[cell] = new_info
         self._mark_dirty()
         self._redraw()
 
-    def _erase(self, event):
+    def _copy_block(self, event):
+        # Right-click "picks up" a placed block's full spec (shape, value, color) into the current
+        # tool state -- switches tool_var to its type, current_value to its value, current_color
+        # to its color (None if it was auto/value-derived, same either way visually since value
+        # came along too) -- so a plain left-click/drag afterward (paint() already overwrites
+        # occupied cells) stamps out copies of it, same as any other paint. Purely a read-only
+        # pickup: never touches the grid, so there's nothing to undo here.
         cell = self._cell_at(event)
         if cell is None:
             return
         self.canvas.focus_set()
+        if self.tool_var.get() == "clone":
+            # Re-pick the clone source instead of touching tool_var -- switching tools out from
+            # under the Clone Stamp on a stray right-click would be surprising, and unlike the
+            # other tools, Clone Stamp needs its own always-available re-pick gesture (left-click
+            # is already spoken for: it's the destination once armed, see _clone_press()).
+            if cell in self.grid:
+                self._clone_source = cell
+                self._clone_offset = None
+                self.selected = cell
+                self._redraw()
+                self._update_clone_status()
+            return
         self.selected = cell
-        if self.grid.pop(cell, None) is not None:
-            self._mark_dirty()
+        if cell not in self.grid:
+            return
+        info = self.grid[cell]
+        self.tool_var.set(info["type"])
+        self.current_value.set(info["value"])
+        self.current_color = info.get("color")
+        self._update_swatch()
         self._redraw()
+
+    def _paint_eyedropper(self, cell):
+        # Color Picker tool: the first block touched in a drag (mouse-down, or wherever the drag
+        # first crosses a block if it started over empty cells) is the *source* -- its effective
+        # color (explicit override, else value-derived) is picked up into current_color, same as
+        # picking a palette swatch, but nothing about that block itself changes. Every block
+        # touched afterward in the same drag is the *target*: only its color changes to match,
+        # its type and value are left exactly as they were -- that's the whole point versus just
+        # painting over it with the current tool.
+        if not self._eyedropper_picked:
+            if cell in self.grid:
+                # Deliberately not routed through _apply_color() -- that method also writes to
+                # self.grid[self.selected], and _paint() already set self.selected to this same
+                # source cell, which would spuriously touch/undo-push the source block itself.
+                self.current_color = effective_block_color(self.grid[cell]["value"], self.grid[cell].get("color"))
+                self._update_swatch()
+                self._eyedropper_picked = True
+            return
+        if cell in self.grid and self.grid[cell].get("color") != self.current_color:
+            self._push_drag_undo()
+            self.grid[cell]["color"] = self.current_color
+            self._mark_dirty()
+
+    def _clone_press(self, cell):
+        # Clone Stamp setup, two left-clicks: 1) an occupied cell arms it as the *source*; 2) an
+        # empty cell fixes the *destination*, pinning the (dx, dy) offset between them and
+        # stamping immediately via _clone_apply(). Right-click (_copy_block()) re-picks the
+        # source at any time, armed or not.
+        self.canvas.focus_set()
+        if self._clone_offset is None:
+            if cell in self.grid:
+                self._clone_source = cell
+                self.selected = cell
+                self._redraw()
+            elif self._clone_source is not None:
+                sx, sy = self._clone_source
+                dx, dy = cell[0] - sx, cell[1] - sy
+                if dx or dy:
+                    self._clone_offset = (dx, dy)
+                    self._clone_apply(cell)
+            self._update_clone_status()
+            return
+        # Armed: cursor is the *destination* -- every press/drag stamps at the cell under it,
+        # sampling from the source cell the fixed offset away. Overwrites whatever's already at
+        # the destination, same as the normal paint tools.
+        self._clone_apply(cell)
+
+    def _clone_drag(self, event):
+        if self._clone_offset is None:
+            return
+        cell = self._cell_at(event)
+        if cell is None:
+            return
+        self._clone_apply(cell)
+
+    def _clone_apply(self, dest_cell):
+        # Cursor drives the *destination*; the source is computed backwards from the fixed
+        # offset, so it visibly moves in lockstep with the cursor (self.selected -- the yellow
+        # selection frame -- is pointed at it every step, even when there's nothing there to
+        # copy) as the drag crosses the board, continuously sampling whatever's currently at that
+        # shifted position and stamping it at the destination.
+        dx, dy = self._clone_offset
+        source_cell = (dest_cell[0] - dx, dest_cell[1] - dy)
+        self.selected = source_cell
+        if not (0 <= source_cell[0] < BOARD_COLS and 0 <= source_cell[1] < EDITOR_ROWS):
+            self._redraw()
+            return
+        info = self.grid.get(source_cell)
+        if info is None:
+            self._redraw()
+            return
+        new_info = dict(info)
+        if self.grid.get(dest_cell) == new_info:
+            self._redraw()
+            return
+        self._push_drag_undo()
+        self.grid[dest_cell] = new_info
+        self._mark_dirty()
+        self._redraw()
+
+    def _update_clone_status(self):
+        if self.tool_var.get() != "clone":
+            self.clone_status_var.set("")
+            return
+        if self._clone_source is None:
+            self.clone_status_var.set("Click a block to set as clone source.")
+        elif self._clone_offset is None:
+            self.clone_status_var.set("Click an empty cell to set the destination.")
+        else:
+            dx, dy = self._clone_offset
+            self.clone_status_var.set(
+                f"Armed (offset {dx:+d},{dy:+d}) -- click/drag to stamp, right-click to re-pick source.")
 
     # -- keyboard interaction ---------------------------------------------
 
@@ -983,9 +1872,27 @@ class LevelEditorApp:
     def _cycle_type(self, direction):
         if self.selected is None or self.selected not in self.grid:
             return "break"
+        self._push_undo()
         info = self.grid[self.selected]
         idx = BLOCK_TYPES.index(info["type"])
         info["type"] = BLOCK_TYPES[(idx + direction) % len(BLOCK_TYPES)]
+        self._mark_dirty()
+        self._redraw()
+        return "break"
+
+    def _adjust_selected_value(self, delta):
+        # Shift-Up/Down: raise/lower the *selected* block's point value, mirroring Shift-Left/
+        # Right's _cycle_type() for type. Same 0..99 clamp and delete-at-0 as the mouse-wheel
+        # value adjust (_on_wheel) for a block under the cursor -- 0 points isn't a valid block.
+        if self.selected is None or self.selected not in self.grid:
+            return "break"
+        info = self.grid[self.selected]
+        value = max(0, min(99, info["value"] + delta))
+        self._push_undo()
+        if value == 0:
+            del self.grid[self.selected]
+        else:
+            info["value"] = value
         self._mark_dirty()
         self._redraw()
         return "break"
@@ -999,6 +1906,7 @@ class LevelEditorApp:
             return "break"
         if (nx, ny) in self.grid:
             return "break"
+        self._push_undo()
         self.grid[(nx, ny)] = self.grid.pop(self.selected)
         self.selected = (nx, ny)
         self._mark_dirty()
@@ -1014,6 +1922,7 @@ class LevelEditorApp:
     def _set_selected_value(self, value):
         if self.selected is None:
             return
+        self._push_undo()
         if self.selected in self.grid:
             self.grid[self.selected]["value"] = value
         else:
@@ -1025,9 +1934,34 @@ class LevelEditorApp:
         self._redraw()
 
     def _delete_selected(self):
-        if self.selected is not None and self.grid.pop(self.selected, None) is not None:
+        if self.selected is not None and self.selected in self.grid:
+            self._push_undo()
+            del self.grid[self.selected]
             self._mark_dirty()
             self._redraw()
+        return "break"
+
+    def _overwrite_selected(self, event=None):
+        # Enter/Space: stamp the currently *selected* cell with the sidebar's current
+        # tool/value/color, without needing a drag gesture -- selecting (a plain click,
+        # see _on_canvas_press) never mutates a block, so this is the explicit action to
+        # apply the tool to it instead. Same skip-if-identical / undo semantics as _paint.
+        if self.selected is None:
+            return "break"
+        tool = self.tool_var.get()
+        if tool in ("eraser", "colorpicker"):
+            return "break"
+        try:
+            value = self.current_value.get()
+        except tk.TclError:
+            return "break"
+        new_info = self._new_block_info(tool, value)
+        if self.grid.get(self.selected) == new_info:
+            return "break"
+        self._push_undo()
+        self.grid[self.selected] = new_info
+        self._mark_dirty()
+        self._redraw()
         return "break"
 
     def _on_keypress(self, event):
@@ -1050,6 +1984,7 @@ class LevelEditorApp:
             return
         if cell in self.grid:
             value = max(0, min(99, self.grid[cell]["value"] + direction))
+            self._push_undo()
             if value == 0:
                 del self.grid[cell]
             else:
@@ -1066,6 +2001,55 @@ class LevelEditorApp:
     def _on_motion(self, event):
         cell = self._cell_at(event)
         self.hover_var.set(f"Cell: ({cell[0]}, {cell[1]})" if cell else "")
+
+    # -- undo/redo ----------------------------------------------------
+
+    UNDO_LIMIT = 200
+
+    def _snapshot_grid(self):
+        return {cell: dict(info) for cell, info in self.grid.items()}
+
+    def _push_undo(self):
+        self._undo_stack.append(self._snapshot_grid())
+        if len(self._undo_stack) > self.UNDO_LIMIT:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _push_drag_undo(self):
+        # Only the first mutation of an unbroken mouse drag pushes a snapshot -- see
+        # _end_drag() -- so a whole paint/erase stroke undoes as one step instead of one per cell.
+        if not self._dragging:
+            self._push_undo()
+            self._dragging = True
+
+    def _reset_undo_history(self):
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+
+    def _end_drag(self, event=None):
+        self._dragging = False
+        self._eyedropper_picked = False
+        self._drag_confirmed = False
+
+    def _undo(self):
+        if not self._undo_stack:
+            return "break"
+        self._redo_stack.append(self._snapshot_grid())
+        self.grid = self._undo_stack.pop()
+        self.selected = None
+        self._mark_dirty()
+        self._redraw()
+        return "break"
+
+    def _redo(self):
+        if not self._redo_stack:
+            return "break"
+        self._undo_stack.append(self._snapshot_grid())
+        self.grid = self._redo_stack.pop()
+        self.selected = None
+        self._mark_dirty()
+        self._redraw()
+        return "break"
 
     # -- file actions -------------------------------------------------
 
@@ -1141,6 +2125,7 @@ class LevelEditorApp:
         return True
 
     def _load_blocks(self, blocks):
+        self._reset_undo_history()
         self.grid.clear()
         for b in blocks:
             x, y, block_type, value = b["x"], b["y"], b["type"], b["value"]
@@ -1162,11 +2147,12 @@ class LevelEditorApp:
             self._load_blocks(data["blocks"])
         except Exception as e:
             messagebox.showerror("Open Level", f"Failed to load {path}:\n{e}")
-            return
+            return False
         self.current_path = path
         self.dirty = False
         self._redraw()
         self._update_title()
+        return True
 
     def _import_image_path(self, path):
         try:
@@ -1181,43 +2167,65 @@ class LevelEditorApp:
         self._update_title()
 
     def new_level(self):
+        # Returns whether a (blank) level actually became the current one, e.g. for
+        # LevelOverviewWindow._new_level() to decide whether to switch to the editor window.
         if not self._confirm_discard():
-            return
+            return False
+        self._reset_undo_history()
         self.grid.clear()
         self.current_path = None
         self.dirty = False
         self._redraw()
         self._update_title()
+        return True
 
     def open_level(self):
         if not self._confirm_discard():
-            return
+            return False
         initial_dir = str(ASSETS_LEVELS_DIR) if ASSETS_LEVELS_DIR.exists() else str(REPO_ROOT)
         path = filedialog.askopenfilename(filetypes=[("Level JSON", "*.json")], initialdir=initial_dir)
         if not path:
-            return
-        self._load_level_file(Path(path))
+            return False
+        return self._load_level_file(Path(path))
 
     def import_image(self):
         if not self._confirm_discard():
-            return
-        dialog = ImportImageDialog(self.root)
+            return False
+        dialog = ImageImportWindow(self.root)
         self.root.wait_window(dialog)
         if dialog.result is None:
-            return
+            return False
         blocks, _rows = dialog.result
         self._load_blocks(blocks)
-        self.current_path = None
+        # current_path is deliberately left as-is: importing an image while editing an existing
+        # level (opened from the Overview) replaces that level's content, it doesn't detach into
+        # a new unsaved one -- Ctrl+S should overwrite the same file, same as any other edit. If
+        # there was no level open yet (a blank "New" level, current_path already None), this stays
+        # None either way, same as before.
         self.dirty = True
         self._redraw()
         self._update_title()
+        return True
 
-    def paste_debug_json(self):
+    def paste_debug_json(self, parent=None):
         # Purely a read-only viewer (see BoardCompareWindow) -- doesn't touch self.grid, so
-        # there's nothing to discard/confirm here, unlike import_image()/open_level().
-        PasteJsonDialog(self.root)
+        # there's nothing to discard/confirm here, unlike import_image()/open_level(). parent
+        # defaults to self.root, but LevelOverviewWindow's File menu passes itself so the dialog
+        # stacks over the overview instead of a possibly-withdrawn root (entry view).
+        PasteJsonDialog(parent or self.root)
 
     def show_level_overview(self, is_entry_view=False):
+        # The overview stays open once opened (see LevelOverviewWindow._switch_to_editor()) rather
+        # than closing itself when a level is picked for editing, so this raises the one existing
+        # window instead of stacking up a duplicate -- e.g. from the sidebar "Übersicht..." button
+        # while already mid-edit.
+        win = self._overview_window
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            win._refresh()
+            return
         # Read-only until a thumbnail is clicked (see LevelOverviewWindow._open_level(), which
         # goes through the same _confirm_discard()/_load_level_file() path as picking a level from
         # the sidebar dropdown) -- so nothing to discard/confirm just to open the window itself.
@@ -1227,6 +2235,7 @@ class LevelEditorApp:
         if not self.grid:
             return
         if messagebox.askyesno("Clear All", "Remove all blocks from the level?"):
+            self._push_undo()
             self.grid.clear()
             self._mark_dirty()
             self._redraw()
@@ -1239,10 +2248,23 @@ class LevelEditorApp:
             if not (0 <= nx < BOARD_COLS and 0 <= ny < EDITOR_ROWS):
                 messagebox.showinfo("Shift All", "Cannot shift: a block would move outside the board.")
                 return
+        self._push_undo()
         self.grid = {(x + dx, y + dy): info for (x, y), info in self.grid.items()}
         if self.selected is not None:
             sx, sy = self.selected
             self.selected = (sx + dx, sy + dy)
+        self._mark_dirty()
+        self._redraw()
+
+    def bump_all_values(self, delta):
+        if not self.grid:
+            return
+        new_values = {cell: max(1, min(99, info["value"] + delta)) for cell, info in self.grid.items()}
+        if all(new_values[cell] == info["value"] for cell, info in self.grid.items()):
+            return  # every block already clamped at the 1/99 boundary -- nothing to do or undo
+        self._push_undo()
+        for cell, info in self.grid.items():
+            info["value"] = new_values[cell]
         self._mark_dirty()
         self._redraw()
 
@@ -1257,12 +2279,21 @@ class LevelEditorApp:
         with open(path, "w") as f:
             json.dump({"blocks": blocks}, f, indent=2)
 
+    def _refresh_overview_if_open(self):
+        # Keeps the Overview's thumbnails in sync with whatever this window just wrote to disk --
+        # otherwise it would keep showing stale content until manually reopened. No-op if the
+        # Overview isn't currently open.
+        win = self._overview_window
+        if win is not None and win.winfo_exists():
+            win._refresh()
+
     def save(self):
         if self.current_path is None:
             return self.save_as()
         self._write_json(self.current_path)
         self.dirty = False
         self._update_title()
+        self._refresh_overview_if_open()
         return True
 
     def save_as(self):
@@ -1284,6 +2315,7 @@ class LevelEditorApp:
         self.dirty = False
         self._refresh_level_list()
         self._update_title()
+        self._refresh_overview_if_open()
         return True
 
     def export_to_assets(self):
@@ -1301,9 +2333,21 @@ class LevelEditorApp:
         self.dirty = False
         self._refresh_level_list()
         self._update_title()
+        self._refresh_overview_if_open()
         messagebox.showinfo("Export to assets", f"Wrote {len(self.grid)} blocks to {path}")
 
     def on_exit(self):
+        # self.root is the actual Tk() interpreter root (see launch_gui()) -- destroying it tears
+        # down every Toplevel that belongs to it, the Level Overview included, even though that
+        # window is meant to survive the editor closing (it stays open across editing sessions).
+        # So if the overview is currently open, Exit here only withdraws the editor window
+        # (nothing is lost: self.grid stays exactly as-is in memory, and reopening a level from
+        # the overview already goes through _confirm_discard() on its own) rather than ending the
+        # whole process.
+        overview = self._overview_window
+        if overview is not None and overview.winfo_exists():
+            self.root.withdraw()
+            return
         if not self._confirm_discard():
             return
         self.root.destroy()

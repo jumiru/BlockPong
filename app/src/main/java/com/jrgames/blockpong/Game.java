@@ -11,6 +11,7 @@ import android.net.Uri;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.os.Build;
@@ -55,7 +56,7 @@ import java.util.regex.Pattern;
  * Game manages all objects in the game and is responsible for updating all states
  * and renders all objects to the screen
  */
-public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoard.GameCallbacks, LevelEditor.EditorCallbacks {
+public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoard.GameCallbacks, LevelEditor.EditorCallbacks, LevelOverview.OverviewCallbacks {
 
     private static final int LEFT_BORDER = 10;
     private static final int RIGHT_BORDER = 10;
@@ -67,12 +68,13 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // back-gesture on the sides and the notification-shade swipe on top stealing an in-progress
     // aim) from two different angles, so they share one constant.
     private static final int EDGE_DEAD_ZONE_DP = 24;
-    // Gap between the board's bottom edge (where the ball rests on the fire line) and the bonus
-    // button row drawn below it, in the reserved footer area.
-    private static final int BONUS_ROW_TOP_MARGIN = 20;
+    // Gap between the board's bottom edge (where the ball rests on the fire line), the LEVEL/
+    // SCORE/BEST boxes right below it, and the bonus button row below that -- same gap reused for
+    // both. The stat boxes sit closest to the board (not the bonus row) so a finger repositioning
+    // the start ball (MOVE_START_POINT bonus) has a clear, uncluttered strip right below the board
+    // instead of landing on the bonus buttons (reported requirement).
+    private static final int FOOTER_ROW_GAP = 20;
     private static final int BONUS_ROW_HEIGHT = 110;
-    // Gap between the bonus row and the LEVEL/SCORE/BEST boxes below it.
-    private static final int BONUS_ROW_BOTTOM_MARGIN = 20;
     private static final int STATS_BOX_HEIGHT = 150;
     // A move (one shot until all balls are back at rest) earns random bonuses once it clears
     // enough blocks -- more bonuses at higher tiers (see bonusesForBlocksCleared()), not additive
@@ -168,6 +170,9 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     private boolean replaying;
     private int replayFrameIndex;
     private int replayTickCounter;
+    // Set by the pause button/step buttons below; while true update() no longer auto-advances
+    // replayFrameIndex, so the frame-back/frame-forward buttons can single-step for debugging.
+    private boolean replayPaused;
 
     // "Import & Replay (Debug)" dialog state: the pasted text survives closing/reopening the
     // dialog (so the same board+shot can be tried again -- e.g. normal speed, then slow motion,
@@ -182,6 +187,12 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // see draw()/update()/handleTouchEvent(). null until first opened.
     private boolean levelEditorActive;
     private LevelEditor levelEditor;
+
+    // "Level-Übersicht" screen (burger menu): full-screen takeover like levelEditorActive/
+    // showingStats above -- a scrollable grid of level thumbnails to browse and jump from, see
+    // draw()/update()/handleTouchEvent() and LevelOverview. null until first opened.
+    private boolean levelOverviewActive;
+    private LevelOverview levelOverview;
 
     // "Probespielen" (test play a level being edited, see LevelEditor's action row): while active,
     // the editor screen is hidden and gameplay runs completely normally against the editor's
@@ -298,6 +309,15 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             float deadZonePx = EDGE_DEAD_ZONE_DP * density;
             gameBoard.setTouchDeadZone(deadZonePx, canvasWidth - deadZonePx, deadZonePx);
 
+            // A released aim only counts as abandoned once the finger comes back down as far as
+            // the bottom of the whole footer (SCORE/LEVEL/BEST + bonus row) -- not merely back to
+            // the ball's own start line -- so a flat/shallow shot (reported requirement) can still
+            // be released just below the start line instead of being mistaken for an abandoned
+            // aim. Uses bonusRowBottom(), not getStatBoxRect(0).top, since the stat boxes were
+            // moved to sit directly below the board (see statsRowTop()) -- the footer's bottom
+            // edge is what preserves the original generous margin.
+            gameBoard.setAimCancelY(bonusRowBottom());
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 // Tell the system not to steal the edge back-gesture along the sides of the play
                 // area -- aiming can legitimately start close to the screen edge, which otherwise
@@ -354,7 +374,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                     Color.rgb(233, 30, 99),  // LINE_DELETE - pink
                     Color.rgb(76, 175, 80),  // EXTRA_BALLS - green
                     Color.rgb(156, 39, 176), // MOVE_START_POINT - purple
-                    Color.rgb(0, 188, 212),  // DRAG_PADDLE - cyan
+                    Color.rgb(0, 188, 212),  // BASELINE_BOUNCE - cyan
             };
             bonusColorPaints = new Paint[Bonus.values().length];
             for (int i = 0; i < bonusColorPaints.length; i++) {
@@ -517,6 +537,12 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             if (event.getAction() == MotionEvent.ACTION_DOWN) {
                 if (isMenuButtonHit(event.getX(), event.getY())) {
                     showBurgerMenu();
+                } else if (getReplayControlButtonRect(0).contains(event.getX(), event.getY())) {
+                    stepReplayFrame(-1);
+                } else if (getReplayControlButtonRect(1).contains(event.getX(), event.getY())) {
+                    replayPaused = !replayPaused;
+                } else if (getReplayControlButtonRect(2).contains(event.getX(), event.getY())) {
+                    stepReplayFrame(1);
                 } else {
                     replaying = false;
                 }
@@ -554,6 +580,24 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             return true;
         }
 
+        // Level-Übersicht screen: the menu button still opens the burger menu, dragging scrolls the
+        // thumbnail grid, and a tap either hits "Schliessen" or jumps straight to the tapped level
+        // (see LevelOverview.handleTouchUp()).
+        if (levelOverviewActive) {
+            if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                if (isMenuButtonHit(event.getX(), event.getY())) {
+                    showBurgerMenu();
+                } else {
+                    levelOverview.handleTouchDown(event.getX(), event.getY());
+                }
+            } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
+                levelOverview.handleTouchMove(event.getX(), event.getY());
+            } else if (event.getAction() == MotionEvent.ACTION_UP) {
+                levelOverview.handleTouchUp(event.getX(), event.getY());
+            }
+            return true;
+        }
+
         switch (event.getAction()) {
             case MotionEvent.ACTION_UP:
                 System.out.println("ACTION_UP at (" + event.getX() + ", " + event.getY() + ")");
@@ -566,6 +610,21 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 // current boring stretch instead of forwarding the tap as an aim release.
                 if (gameBoard != null && gameBoard.isSpeedUpButtonHit(event.getX(), event.getY())) {
                     gameBoard.fastForwardToNextBlockHit();
+                    return true;
+                }
+                // Extended-Path fine-position buttons (see GameBoard.finePositionActive): nudge
+                // the held preview left/right, or commit it -- instead of forwarding the tap as a
+                // fresh aim release.
+                if (gameBoard != null && gameBoard.isFineLeftButtonHit(event.getX(), event.getY())) {
+                    gameBoard.nudgeFineAimLeft();
+                    return true;
+                }
+                if (gameBoard != null && gameBoard.isFineRightButtonHit(event.getX(), event.getY())) {
+                    gameBoard.nudgeFineAimRight();
+                    return true;
+                }
+                if (gameBoard != null && gameBoard.isFineFireButtonHit(event.getX(), event.getY())) {
+                    gameBoard.confirmFineFire();
                     return true;
                 }
                 // Check if a bonus button was hit -- arms/disarms it for the next shot instead of
@@ -625,6 +684,11 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                     return true;
                 }
                 if (gameBoard != null && gameBoard.isSpeedUpButtonHit(event.getX(), event.getY())) {
+                    return true;
+                }
+                if (gameBoard != null && (gameBoard.isFineLeftButtonHit(event.getX(), event.getY())
+                        || gameBoard.isFineRightButtonHit(event.getX(), event.getY())
+                        || gameBoard.isFineFireButtonHit(event.getX(), event.getY()))) {
                     return true;
                 }
                 cancelBonusLongPress();
@@ -820,9 +884,15 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             gameBoard.drawReplayFrame(canvas, replayFrameIndex);
             canvas.drawRect(blackRect, blackPaint);
             drawStatsFooter(canvas);
-            canvas.drawText("REPLAY  SLOW x" + REPLAY_SLOW_MOTION_FACTOR, 50, 1700, debugPaint);
+            int frameCount = gameBoard == null ? 0 : gameBoard.getLastMoveFrameCount();
+            canvas.drawText("REPLAY  SLOW x" + REPLAY_SLOW_MOTION_FACTOR
+                    + (replayPaused ? "  PAUSED" : "")
+                    + "   Frame " + (replayFrameIndex + 1) + "/" + frameCount, 50, 1700, debugPaint);
+            drawReplayControls(canvas);
         } else if (showingStats) {
             drawStatsScreen(canvas);
+        } else if (levelOverviewActive) {
+            levelOverview.draw(canvas);
         } else if (levelEditorActive) {
             levelEditor.draw(canvas);
         } else {
@@ -830,8 +900,8 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             gameBoard.draw(canvas);
             canvas.drawRect(blackRect, blackPaint);
 
-            drawBonusRow(canvas);
             drawStatsFooter(canvas);
+            drawBonusRow(canvas);
 
             // animations
             synchronized (ongoingAnimations) {
@@ -861,18 +931,22 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         updateTick++;
 
         if (replaying) {
-            replayTickCounter++;
-            if (replayTickCounter % REPLAY_SLOW_MOTION_FACTOR == 0) {
-                if (gameBoard == null) {
-                    replaying = false;
-                } else if (replayFrameIndex < gameBoard.getLastMoveFrameCount() - 1) {
-                    replayFrameIndex++;
+            // Paused (see the pause button in drawReplayControls()): hold the current frame and
+            // only move via the explicit frame-back/frame-forward buttons in handleTouchEvent().
+            if (!replayPaused) {
+                replayTickCounter++;
+                if (replayTickCounter % REPLAY_SLOW_MOTION_FACTOR == 0) {
+                    if (gameBoard == null) {
+                        replaying = false;
+                    } else if (replayFrameIndex < gameBoard.getLastMoveFrameCount() - 1) {
+                        replayFrameIndex++;
+                    }
+                    // else: last frame reached -- hold there instead of auto-clearing "replaying".
+                    // It must only end via the explicit tap onTouchEvent() already handles (same as
+                    // skipping it early), otherwise a tap meant to dismiss the finished replay can
+                    // land just after it auto-clears and get misread as a live aim/fire on the actual
+                    // board underneath -- launching an unwanted ball (reported bug).
                 }
-                // else: last frame reached -- hold there instead of auto-clearing "replaying".
-                // It must only end via the explicit tap onTouchEvent() already handles (same as
-                // skipping it early), otherwise a tap meant to dismiss the finished replay can
-                // land just after it auto-clears and get misread as a live aim/fire on the actual
-                // board underneath -- launching an unwanted ball (reported bug).
             }
             return;
         }
@@ -882,8 +956,11 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             return;
         }
 
-        // ...and while the Level-Editor is up.
+        // ...and while the Level-Editor or Level-Übersicht is up.
         if (levelEditorActive) {
+            return;
+        }
+        if (levelOverviewActive) {
             return;
         }
 
@@ -1125,10 +1202,34 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             spendLineDeleteBonus();
             return;
         }
+        // MOVE_STOPPER, last-resort path: while the current shot's balls are still rolling, spend
+        // it immediately onto that same shot instead of arming it for the next one (see
+        // GameBoard.armMoveStopperMidShot()) -- lets the player rescue a move they see going wrong
+        // (a block about to be stranded in the bottom row) before it ends in game over.
+        if (bonus == Bonus.MOVE_STOPPER && gameBoard != null && gameBoard.ballRolling() && !gameBoard.isFrozen()) {
+            spendMoveStopperMidShot();
+            return;
+        }
+        // EXTRA_BALLS is stackable (see GameBoard.applyConsumedBonus()) but only up to 4 times per
+        // level -- refuse to arm it once that cap is reached so a tap can't spend a bonus charge
+        // for no effect.
+        if (bonus == Bonus.EXTRA_BALLS && gameBoard != null && gameBoard.isExtraBallsMaxedOut()) {
+            armedBonuses.remove(bonus);
+            return;
+        }
         if (armedBonuses.contains(bonus)) {
             armedBonuses.remove(bonus);
         } else if (bonusCounts[bonus.ordinal()] > 0) {
             armedBonuses.add(bonus);
+        }
+    }
+
+    // See toggleArmedBonus()'s MOVE_STOPPER branch above. Only spends the bonus if
+    // armMoveStopperMidShot() actually had something to arm (not already armed for this shot).
+    private void spendMoveStopperMidShot() {
+        if (bonusCounts[Bonus.MOVE_STOPPER.ordinal()] <= 0) return;
+        if (gameBoard.armMoveStopperMidShot()) {
+            bonusCounts[Bonus.MOVE_STOPPER.ordinal()]--;
         }
     }
 
@@ -1226,6 +1327,86 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         canvas.drawLine(cx - barHalfWidth, bottom, cx + barHalfWidth, bottom, menuIconPaint);
     }
 
+    // Debug playback controls for "Replay in Zeitlupe": frame-back, pause/play, frame-forward,
+    // laid out as a row of three buttons in the top-left corner -- mirroring how the burger menu
+    // button already sits on top of the board's top-right corner -- so a reported bug can be
+    // pinned down to the exact recorded frame it appears on. The bottom footer (score/level/best,
+    // see drawStatsFooter()) leaves too little vertical room there for a second button row.
+    private static final float REPLAY_CONTROL_GAP = 15f;
+
+    // index: 0 = frame back, 1 = pause/play, 2 = frame forward.
+    private RectF getReplayControlButtonRect(int index) {
+        float left = MENU_BUTTON_MARGIN + index * (MENU_BUTTON_SIZE + REPLAY_CONTROL_GAP);
+        float top = MENU_BUTTON_MARGIN;
+        return new RectF(left, top, left + MENU_BUTTON_SIZE, top + MENU_BUTTON_SIZE);
+    }
+
+    // Moves the paused replay by exactly one recorded frame in either direction, clamped to the
+    // recording's bounds. Stepping implies pausing -- otherwise a step taken while playing would
+    // immediately be overtaken by the next auto-advance tick and look like it did nothing.
+    private void stepReplayFrame(int delta) {
+        if (gameBoard == null) return;
+        replayPaused = true;
+        int lastIndex = gameBoard.getLastMoveFrameCount() - 1;
+        replayFrameIndex = Math.max(0, Math.min(lastIndex, replayFrameIndex + delta));
+    }
+
+    private void drawReplayControls(Canvas canvas) {
+        drawReplayControlButton(canvas, getReplayControlButtonRect(0), ReplayControlIcon.STEP_BACK);
+        drawReplayControlButton(canvas, getReplayControlButtonRect(1),
+                replayPaused ? ReplayControlIcon.PLAY : ReplayControlIcon.PAUSE);
+        drawReplayControlButton(canvas, getReplayControlButtonRect(2), ReplayControlIcon.STEP_FORWARD);
+    }
+
+    private enum ReplayControlIcon { STEP_BACK, PAUSE, PLAY, STEP_FORWARD }
+
+    private void drawReplayControlButton(Canvas canvas, RectF rect, ReplayControlIcon icon) {
+        canvas.drawRoundRect(rect, 16, 16, menuButtonPaint);
+
+        float cx = rect.centerX();
+        float cy = rect.centerY();
+        float halfW = rect.width() * 0.16f;
+        float halfH = rect.height() * 0.22f;
+
+        switch (icon) {
+            case PAUSE:
+                canvas.drawLine(cx - halfW, cy - halfH, cx - halfW, cy + halfH, menuIconPaint);
+                canvas.drawLine(cx + halfW, cy - halfH, cx + halfW, cy + halfH, menuIconPaint);
+                break;
+            case PLAY: {
+                Path p = new Path();
+                p.moveTo(cx - halfW, cy - halfH);
+                p.lineTo(cx - halfW, cy + halfH);
+                p.lineTo(cx + halfW, cy);
+                p.close();
+                canvas.drawPath(p, bonusIconFillPaint);
+                break;
+            }
+            case STEP_BACK: {
+                // "|<" -- bar at the left edge, triangle pointing left toward it.
+                canvas.drawLine(cx - halfW, cy - halfH, cx - halfW, cy + halfH, menuIconPaint);
+                Path p = new Path();
+                p.moveTo(cx - halfW * 0.2f, cy);
+                p.lineTo(cx + halfW, cy - halfH);
+                p.lineTo(cx + halfW, cy + halfH);
+                p.close();
+                canvas.drawPath(p, bonusIconFillPaint);
+                break;
+            }
+            case STEP_FORWARD: {
+                // ">|" -- bar at the right edge, triangle pointing right toward it.
+                canvas.drawLine(cx + halfW, cy - halfH, cx + halfW, cy + halfH, menuIconPaint);
+                Path p = new Path();
+                p.moveTo(cx + halfW * 0.2f, cy);
+                p.lineTo(cx - halfW, cy - halfH);
+                p.lineTo(cx - halfW, cy + halfH);
+                p.close();
+                canvas.drawPath(p, bonusIconFillPaint);
+                break;
+            }
+        }
+    }
+
     private void showBurgerMenu() {
         List<String> items = new ArrayList<>();
 
@@ -1256,6 +1437,10 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         if (levelPickerIdx != -1) {
             items.add("Zu einem früheren Level zurückkehren");
         }
+        final int levelOverviewIdx = testPlayActive ? -1 : items.size();
+        if (!testPlayActive) {
+            items.add("Level-Übersicht");
+        }
         final int levelEditorIdx = testPlayActive ? -1 : items.size();
         if (!testPlayActive) {
             items.add("Level-Editor");
@@ -1278,11 +1463,52 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                         showImportReplayDialog();
                     } else if (which == levelPickerIdx) {
                         showLevelPicker();
+                    } else if (which == levelOverviewIdx) {
+                        showLevelOverview();
                     } else if (which == levelEditorIdx) {
                         showLevelEditorEntry();
                     }
                 })
                 .show();
+    }
+
+    // Burger menu action: opens the Level-Übersicht (see LevelOverview), a scrollable grid of every
+    // known level's thumbnail to browse and jump from -- disabled during Probespielen for the same
+    // reason "Level-Editor"/"Zu einem frueheren Level" are (see showBurgerMenu()'s comment).
+    private void showLevelOverview() {
+        if (levelOverview == null) {
+            levelOverview = new LevelOverview(this);
+        }
+        levelOverview.open(canvasWidth, canvasHeight, level);
+        levelOverviewActive = true;
+    }
+
+    // ---- LevelOverview.OverviewCallbacks ----
+
+    @Override
+    public String loadLevelJsonForThumbnail(int level) {
+        return loadLevelJson(level);
+    }
+
+    @Override
+    public boolean isRandomLevel(int level) {
+        return isRandomLevelSlot(level);
+    }
+
+    @Override
+    public int getCurrentLevel() {
+        return level;
+    }
+
+    @Override
+    public void goToLevelFromOverview(int level) {
+        goToLevel(level);
+        levelOverviewActive = false;
+    }
+
+    @Override
+    public void closeOverview() {
+        levelOverviewActive = false;
     }
 
     // Burger menu action: pick an existing level to edit, or create a new one (appended after the
@@ -1317,6 +1543,10 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         labels.add("Alle Level exportieren");
         rowEnabled.add(true);
         rowLevel.add(-1);
+        final int resetOverridesIdx = labels.size();
+        labels.add("Level-Overrides zurücksetzen...");
+        rowEnabled.add(true);
+        rowLevel.add(-1);
 
         ArrayAdapter<String> adapter = new ArrayAdapter<String>(getContext(), android.R.layout.simple_list_item_1, labels) {
             @Override
@@ -1327,9 +1557,17 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             @NonNull
             @Override
             public android.view.View getView(int position, android.view.View convertView, @NonNull ViewGroup parent) {
-                android.view.View v = super.getView(position, convertView, parent);
+                // convertView is intentionally ignored (always inflate fresh) instead of hardcoding a
+                // text color: the AlertDialog follows the device's day/night theme, so a hardcoded
+                // WHITE was invisible against the light theme's white background (only readable in
+                // dark mode) -- letting simple_list_item_1's default color apply adapts to both.
+                // Reusing convertView would also leak a disabled row's GRAY onto a recycled enabled
+                // row further down the list once it scrolls.
+                android.view.View v = super.getView(position, null, parent);
                 TextView tv = (TextView) v;
-                tv.setTextColor(rowEnabled.get(position) ? Color.WHITE : Color.GRAY);
+                if (!rowEnabled.get(position)) {
+                    tv.setTextColor(Color.GRAY);
+                }
                 tv.setEnabled(rowEnabled.get(position));
                 return v;
             }
@@ -1345,11 +1583,53 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                         showNewLevelDialog(known);
                     } else if (which == exportAllIdx) {
                         exportAllLevels(known);
+                    } else if (which == resetOverridesIdx) {
+                        showResetOverridesConfirm();
                     } else {
                         openLevelEditorFor(rowLevel.get(which));
                     }
                 })
                 .show();
+    }
+
+    // "Level-Overrides zurücksetzen": on-device Level-Editor edits are saved as override files
+    // under internal storage (see writeLevelOverride()/loadLevelJson()), which always win over the
+    // level<N>.json bundled in the APK's assets/ -- including a freshly rebuilt/reinstalled APK,
+    // since a normal app update never touches internal storage (reported confusion: exporting
+    // updated levels from tools/level_editor.py into a new APK build didn't change what showed up
+    // in-game, because a stale on-device override from an earlier edit kept shadowing the new
+    // asset). This lets that be fixed from the device itself instead of needing "Clear storage"/
+    // reinstall via Android settings -- confirmed first since it discards those overrides for good;
+    // "Alle Level exportieren" grabs a safety-copy of the current effective (override-preferring)
+    // content beforehand if that's wanted.
+    private void showResetOverridesConfirm() {
+        File overrideDir = new File(getContext().getFilesDir(), "levels");
+        File[] files = overrideDir.listFiles();
+        int count = files == null ? 0 : files.length;
+        if (count == 0) {
+            Toast.makeText(getContext(), "Keine lokalen Level-Overrides vorhanden.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new AlertDialog.Builder(getContext())
+                .setTitle("Level-Overrides zurücksetzen")
+                .setMessage(count + " lokal bearbeitete(s) Level gefunden. Diese werden verworfen, danach "
+                        + "gelten wieder die im APK gebündelten Level. Nicht rückgängig zu machen -- vorher "
+                        + "ggf. \"Alle Level exportieren\" nutzen, um den aktuellen Stand zu sichern.")
+                .setPositiveButton("Zurücksetzen", (dialog, which) -> resetAllLevelOverrides())
+                .setNegativeButton("Abbrechen", null)
+                .show();
+    }
+
+    private void resetAllLevelOverrides() {
+        File overrideDir = new File(getContext().getFilesDir(), "levels");
+        File[] files = overrideDir.listFiles();
+        int deleted = 0;
+        if (files != null) {
+            for (File f : files) {
+                if (f.delete()) deleted++;
+            }
+        }
+        Toast.makeText(getContext(), deleted + " lokale(s) Level-Override(s) zurückgesetzt.", Toast.LENGTH_LONG).show();
     }
 
     // "Alle Level exportieren": bundles every known level (assets + Level-Editor overrides, see
@@ -1868,6 +2148,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         replaying = true;
         replayFrameIndex = 0;
         replayTickCounter = 0;
+        replayPaused = false;
     }
 
     private void toggleDebugMode() {
@@ -2048,7 +2329,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             case LINE_DELETE: return "Line Delete";
             case EXTRA_BALLS: return "Extra viele Bälle";
             case MOVE_START_POINT: return "Startpunkt verschieben";
-            case DRAG_PADDLE: return "Zieh-Paddle";
+            case BASELINE_BOUNCE: return "Grundlinien-Rückprall";
         }
         return bonus.name();
     }
@@ -2065,8 +2346,8 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 return "Der nächste Schuss wird mit deutlich mehr Bällen (20) abgefeuert.";
             case MOVE_START_POINT:
                 return "Du kannst frei bestimmen, von wo aus der nächste Ball abgeschossen wird.";
-            case DRAG_PADDLE:
-                return "Nach dem Abschuss erscheint auf Höhe der Startlinie ein Balken, der Bälle nach oben zurückwirft. Ziehe mit dem Finger nach links oder rechts, um ihn zu verschieben. Mit jedem Treffer wird er kleiner, bis er nach 10 Treffern (oder am Ende des Zugs) verschwindet.";
+            case BASELINE_BOUNCE:
+                return "Für diesen Zug wirft die Startlinie Bälle, die sie erreichen, nach oben zurück statt sie liegen zu lassen -- so oft, wie Bälle abgeschossen werden.";
         }
         return "";
     }
@@ -2227,6 +2508,25 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         if (clipboard != null) {
             clipboard.setPrimaryClip(ClipData.newPlainText("BlockPong Level JSON", json));
         }
+        writeExportFile(json);
+    }
+
+    // Mirrors every clipboard export to a fixed file under this app's external storage
+    // (adb pull /sdcard/Android/data/com.jrgames.blockpong/files/level_export.txt) so
+    // tools/level_editor.py's "Import from Phone (adb)..." can fetch it over USB debugging without
+    // any manual copy/paste or clipboard-sync app -- see LevelOverviewWindow counterpart on the
+    // desktop side. Overwritten on every export; failure here is non-fatal since the clipboard
+    // copy above already succeeded.
+    private void writeExportFile(String json) {
+        File dir = getContext().getExternalFilesDir(null);
+        if (dir == null) {
+            return;
+        }
+        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(new File(dir, "level_export.txt"))) {
+            fos.write(json.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            Log.w("BlockPong", "Could not write level export file", e);
+        }
     }
 
     @Override
@@ -2242,9 +2542,11 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         levelEditorActive = false;
     }
 
-    // 2048-style stat boxes (LEVEL / SCORE / BEST), drawn below the bonus row in the reserved
-    // footer area -- the aim line always points up into the board (see
-    // GameBoard.clampAimVector), so it never reaches down here regardless of drag distance.
+    // 2048-style stat boxes (LEVEL / SCORE / BEST), drawn directly below the board -- closer than
+    // the bonus row (see bonusRowTop()) so the strip right below the board, where a finger
+    // repositioning the start ball naturally lands, isn't cluttered with bonus buttons. The aim
+    // line always points up into the board (see GameBoard.clampAimVector), so it never reaches
+    // down here regardless of drag distance.
     private void drawStatsFooter(Canvas canvas) {
         RectF scoreBox = getStatBoxRect(0);
         RectF levelBox = getStatBoxRect(1);
@@ -2255,10 +2557,19 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         drawStatBox(canvas, bestBox, "BEST", String.valueOf(bestScore));
     }
 
+    private int statsRowTop() {
+        int boardBottom = TOP_BORDER + (canvasHeight - TOP_BORDER - BOTTOM_BORDER);
+        return boardBottom + FOOTER_ROW_GAP;
+    }
+
+    private int statsRowBottom() {
+        return statsRowTop() + STATS_BOX_HEIGHT;
+    }
+
     // index: 0=SCORE, 1=LEVEL, 2=BEST.
     private RectF getStatBoxRect(int index) {
-        int boxTop = bonusRowBottom() + BONUS_ROW_BOTTOM_MARGIN;
-        int boxBottom = boxTop + STATS_BOX_HEIGHT;
+        int boxTop = statsRowTop();
+        int boxBottom = statsRowBottom();
         int gap = 15;
         int boxWidth = (canvasWidth - LEFT_BORDER - RIGHT_BORDER - 2 * gap) / 3;
         int left = LEFT_BORDER + index * (boxWidth + gap);
@@ -2274,8 +2585,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     }
 
     private int bonusRowTop() {
-        int boardBottom = TOP_BORDER + (canvasHeight - TOP_BORDER - BOTTOM_BORDER);
-        return boardBottom + BONUS_ROW_TOP_MARGIN;
+        return statsRowBottom() + FOOTER_ROW_GAP;
     }
 
     private int bonusRowBottom() {
@@ -2300,8 +2610,9 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         return null;
     }
 
-    // Row of bonus buttons between the board's fire line and the LEVEL/SCORE/BEST boxes. Gray
-    // when the player holds none of that bonus, colored once they have at least one; a red badge
+    // Row of bonus buttons below the LEVEL/SCORE/BEST boxes (see statsRowTop()/bonusRowTop() for
+    // why the stat boxes sit closer to the board). Gray when the player holds none of that bonus,
+    // colored once they have at least one; a red badge
     // with a white count sits on the top-right corner when count > 0. The currently armed bonus
     // (see toggleArmedBonus()) gets a highlighted border. Bonus effects themselves aren't wired
     // up yet -- this only tracks acquisition and the "armed for next shot" selection.

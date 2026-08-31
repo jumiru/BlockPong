@@ -444,7 +444,12 @@ public class LevelEditor {
     }
 
     private void onExport() {
-        callbacks.exportJsonToClipboard(toJson());
+        // Wrapped in the same "Level N (JSON, kompatibel mit tools/level_editor.py):" label
+        // Game.exportAllLevels() uses for each of its entries, so a single-level export round-trips
+        // through the desktop tool's "Save All to Assets" the same way a bulk export does -- no
+        // separate unlabeled-JSON path to keep in sync on the Python side.
+        callbacks.exportJsonToClipboard(
+                "Level " + targetLevel + " (JSON, kompatibel mit tools/level_editor.py):\n" + toJson().trim() + "\n");
         callbacks.showToast("Level-JSON in die Zwischenablage kopiert.");
     }
 

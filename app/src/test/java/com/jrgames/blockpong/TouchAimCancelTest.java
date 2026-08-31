@@ -39,6 +39,42 @@ public class TouchAimCancelTest {
         assertTrue("a normal drag above the start line should still fire", gb.ballRolling());
     }
 
+    // Reported requirement change: Game.java raises the cancel threshold from the start line down
+    // to the SCORE/LEVEL/BEST row (see Game.setAimCancelY()/GameBoard.setAimCancelY()) so a flat,
+    // shallow shot can be released a bit below the start line without being mistaken for an
+    // abandoned aim.
+    @Test
+    public void releaseBelowStartLineButAboveCancelY_stillFiresNormally() {
+        GameBoard gb = new GameBoard(new TestGameCallbacks(), 660f, 900f, 0f, 0f);
+        gb.clearBoardForTests();
+
+        float firePosY = gb.getFirePosYForTests();
+        float startX = gb.getFirePosXForTests();
+        gb.setAimCancelY(firePosY + 200f);
+
+        gb.touchDown(startX, firePosY);
+        gb.touchRelease(startX + 300f, firePosY + 100f);
+
+        for (int i = 0; i < 10; i++) gb.update();
+        assertTrue("release below the start line but above the raised cancel threshold should still fire", gb.ballRolling());
+    }
+
+    @Test
+    public void releaseAtOrBelowRaisedCancelY_stillCancels() {
+        GameBoard gb = new GameBoard(new TestGameCallbacks(), 660f, 900f, 0f, 0f);
+        gb.clearBoardForTests();
+
+        float firePosY = gb.getFirePosYForTests();
+        float startX = gb.getFirePosXForTests();
+        gb.setAimCancelY(firePosY + 200f);
+
+        gb.touchDown(startX, firePosY);
+        gb.touchRelease(startX + 20f, firePosY + 250f);
+
+        for (int i = 0; i < 10; i++) gb.update();
+        assertFalse("release at or below the raised cancel threshold should still cancel", gb.ballRolling());
+    }
+
     @Test
     public void releaseAboveStartLine_stillFiresNormally() {
         GameBoard gb = new GameBoard(new TestGameCallbacks(), 660f, 900f, 0f, 0f);

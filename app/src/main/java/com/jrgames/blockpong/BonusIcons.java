@@ -3,7 +3,6 @@ package com.jrgames.blockpong;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
-import android.graphics.RectF;
 
 // Shared vector-icon glyphs for each Bonus type, drawn centered at (cx, cy) with "radius" r.
 // Used by both Game's bonus row (small, steady-state) and BonusAwardAnimation's pop-in
@@ -95,27 +94,13 @@ final class BonusIcons {
                 canvas.drawCircle(cx - r * 0.1f, cy - r * 0.1f, r * 0.09f, highlightPaint);
                 break;
             }
-            case DRAG_PADDLE: {
-                // A thick paddle at the bottom that slides left/right (by dragging a finger),
-                // with a ball bouncing straight back up off it -- distinct from MOVE_START_POINT's
-                // thin rail-with-ball-on-it glyph above.
-                float barY = cy + r * 0.65f;
-                float barHalfWidth = r * 0.55f;
-                float barHeight = r * 0.22f;
-                RectF bar = new RectF(cx - barHalfWidth, barY - barHeight / 2f,
-                        cx + barHalfWidth, barY + barHeight / 2f);
-                canvas.drawRoundRect(bar, barHeight / 2f, barHeight / 2f, fillPaint);
-                drawFilledTriangle(canvas,
-                        cx - r * 0.95f, barY,
-                        cx - r * 0.68f, barY - r * 0.18f,
-                        cx - r * 0.68f, barY + r * 0.18f,
-                        fillPaint);
-                drawFilledTriangle(canvas,
-                        cx + r * 0.95f, barY,
-                        cx + r * 0.68f, barY - r * 0.18f,
-                        cx + r * 0.68f, barY + r * 0.18f,
-                        fillPaint);
-                canvas.drawLine(cx, barY - barHeight / 2f - r * 0.05f, cx, cy - r * 0.55f, strokePaint);
+            case BASELINE_BOUNCE: {
+                // A solid baseline with a ball bouncing straight back up off it -- distinct from
+                // MOVE_START_POINT's thin rail-with-ball-resting-on-it glyph above (this one shows
+                // motion away from the line, not a ball sitting still on it).
+                float barY = cy + r * 0.6f;
+                canvas.drawLine(cx - r * 0.85f, barY, cx + r * 0.85f, barY, strokePaint);
+                canvas.drawLine(cx, barY - r * 0.08f, cx, cy - r * 0.55f, strokePaint);
                 canvas.drawCircle(cx, cy - r * 0.75f, r * 0.22f, strokePaint);
                 canvas.drawCircle(cx, cy - r * 0.75f, r * 0.08f, fillPaint);
                 break;
