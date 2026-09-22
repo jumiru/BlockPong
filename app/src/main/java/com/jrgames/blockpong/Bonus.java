@@ -6,7 +6,7 @@ package com.jrgames.blockpong;
 public enum Bonus {
     MOVE_STOPPER,       // skips the next automatic board-drop-by-one-row
     EXTENDED_PATH,      // lengthens the aim preview line
-    LINE_DELETE,        // fires immediately on tap: removes one of the top-3 rows by value, rows below slide up
+    LINE_DELETE,        // fires immediately on tap: removes a random row weighted by its block count, rows below slide up
     EXTRA_BALLS,        // fires with many more balls (20) for one shot
     MOVE_START_POINT,   // lets the player freely choose the fire position
     BASELINE_BOUNCE     // for the rest of the shot, balls reaching the start line bounce back

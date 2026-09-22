@@ -113,6 +113,10 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // see recordHitStatistics(). Kept separate from PREFS_KEY_SHOT_HISTOGRAMS since a shot can
     // hit far more blocks than it clears (chipping a block's value without destroying it).
     private static final String PREFS_KEY_HIT_HISTOGRAMS = "hit_histograms";
+    // Mini-Blöcke counterparts of the two keys above (see miniShotHistograms/miniHitHistograms'
+    // field comment) -- a separate pool, not an extra bucket in the normal one.
+    private static final String PREFS_KEY_MINI_SHOT_HISTOGRAMS = "mini_shot_histograms";
+    private static final String PREFS_KEY_MINI_HIT_HISTOGRAMS = "mini_hit_histograms";
     // Manual save slots (long-press SCORE): independent of the auto-save above -- the player
     // explicitly picks when to save/load, e.g. as a checkpoint before a risky shot. Each slot's
     // prefs keys are "slot_<index>_<field>" (see slotKey()); a missing "level" key means empty.
@@ -141,6 +145,9 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     private Paint bonusBadgePaint;
     private Paint bonusBadgeTextPaint;
     private Paint statsTitlePaint;
+    private Paint statsTabActivePaint;
+    private Paint statsTabInactivePaint;
+    private Paint statsTabTextPaint;
     private Paint statsDropdownPaint;
     private Paint statsDropdownTextPaint;
     private Paint statsBarPaint;
@@ -157,6 +164,9 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // (replaces the old two-finger-tap cycling through 1x/2x/4x/8x).
     private static final int DEBUG_SLOW_MOTION_FACTOR = 4;
     private static final int REPLAY_SLOW_MOTION_FACTOR = 6;
+    // How many GameBoard.update() ticks run per rendered frame on a Mini-Blöcke board -- see the
+    // call site in update() for why the ball would otherwise visibly crawl on that finer grid.
+    private static final int MINI_BLOCK_TICKS_PER_FRAME = 2;
     // Duration (in update() ticks, ~60/s -- see GameLoop) of BonusAwardAnimation's pop-in/hold/
     // fade-out celebration.
     private static final int BONUS_AWARD_ANIMATION_DURATION = 100;
@@ -217,6 +227,9 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // target (see showStatsBallsPicker()). null once no shot has been recorded yet for any bucket.
     private boolean showingStats;
     private Integer statsSelectedBallsUsed;
+    // Which histogram pool the screen is currently showing -- toggled via the "Normal"/"Mini-
+    // Blöcke" tab pair (see getStatsModeTabRect()/toggleStatsMode()).
+    private boolean statsShowingMiniBlocks;
     // ballsUsed -> (bin index = blocksCleared / SHOT_HISTOGRAM_BIN_SIZE) -> shot count. Collected
     // across all games, persisted in saveState()/surfaceCreated().
     private final TreeMap<Integer, TreeMap<Integer, Integer>> shotHistograms = new TreeMap<>();
@@ -225,6 +238,13 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // updated from the same onRoundEnd() call), so it always has the same set of ballsUsed keys;
     // the ballsUsed dropdown/picker only needs to consult shotHistograms.
     private final TreeMap<Integer, TreeMap<Integer, Integer>> hitHistograms = new TreeMap<>();
+    // Mini-Blöcke counterparts of shotHistograms/hitHistograms, kept as an entirely separate pool
+    // (not just another ballsUsed bucket in the normal one): a Mini-Blöcke shot defaults to 20
+    // balls instead of 10, block values are single-digit, and the finer/denser grid clears very
+    // differently, so mixing the two would make both histograms' bins meaningless. Recorded
+    // whenever onRoundEnd() fires while isMiniBlockLevel() is true -- see recordShotStatistics().
+    private final TreeMap<Integer, TreeMap<Integer, Integer>> miniShotHistograms = new TreeMap<>();
+    private final TreeMap<Integer, TreeMap<Integer, Integer>> miniHitHistograms = new TreeMap<>();
 
     boolean gameOver;
 
@@ -232,7 +252,30 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         return level;
     }
 
+    // GameCallbacks: whether the current level is a "Mini-Blöcke" slot -- see
+    // isMiniBlockLevelSlot()/GameBoard.applyBoardConfig().
+    @Override
+    public boolean isMiniBlockLevel() {
+        return isMiniBlockLevelSlot(level);
+    }
+
     private int level;
+
+    void setLevelForTests(int level) {
+        this.level = level;
+    }
+
+    // Total shot count recorded across every bin of one ballsUsed bucket, in either the Mini-
+    // Blöcke pool or the normal one -- see recordShotStatistics()/miniShotHistograms' field
+    // comment. 0 if that bucket has no recorded shots at all.
+    int getShotCountForTests(boolean mini, int ballsUsed) {
+        TreeMap<Integer, Integer> bins = (mini ? miniShotHistograms : shotHistograms).get(ballsUsed);
+        if (bins == null) return 0;
+        int total = 0;
+        for (int count : bins.values()) total += count;
+        return total;
+    }
+
     private boolean gameWon;
     private int score;
     private int bestScore;
@@ -242,9 +285,6 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // for a critical situation). LINE_DELETE never appears here: it fires immediately on tap
     // instead of being armed (see toggleArmedBonus()).
     private final EnumSet<Bonus> armedBonuses = EnumSet.noneOf(Bonus.class);
-    // Set by consumeArmedBonuses() when the shot currently in flight spent at least one bonus;
-    // read (and reset) by onRoundEnd() so that shot can't also earn a new one.
-    private boolean bonusUsedThisShot;
     private final Random bonusRandom = new Random();
     // Tracks a press-and-hold on a bonus button: a Runnable fires the explanation dialog as soon
     // as the long-press timeout elapses (while still held down), rather than waiting for
@@ -343,6 +383,8 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
 
             loadHistogram(prefs.getString(PREFS_KEY_SHOT_HISTOGRAMS, null), shotHistograms);
             loadHistogram(prefs.getString(PREFS_KEY_HIT_HISTOGRAMS, null), hitHistograms);
+            loadHistogram(prefs.getString(PREFS_KEY_MINI_SHOT_HISTOGRAMS, null), miniShotHistograms);
+            loadHistogram(prefs.getString(PREFS_KEY_MINI_HIT_HISTOGRAMS, null), miniHitHistograms);
 
             blackPaint = new Paint();
             blackPaint.setColor(Color.BLACK);
@@ -431,6 +473,18 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             statsTitlePaint.setTextSize(48);
             statsTitlePaint.setFakeBoldText(true);
             statsTitlePaint.setAntiAlias(true);
+
+            statsTabActivePaint = new Paint();
+            statsTabActivePaint.setColor(Color.rgb(45, 40, 80));
+
+            statsTabInactivePaint = new Paint();
+            statsTabInactivePaint.setColor(Color.rgb(20, 18, 35));
+
+            statsTabTextPaint = new Paint();
+            statsTabTextPaint.setColor(Color.WHITE);
+            statsTabTextPaint.setTextSize(30);
+            statsTabTextPaint.setTextAlign(Paint.Align.CENTER);
+            statsTabTextPaint.setAntiAlias(true);
 
             statsDropdownPaint = new Paint();
             statsDropdownPaint.setColor(Color.rgb(45, 40, 80));
@@ -564,14 +618,19 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             return true;
         }
 
-        // Statistik screen: the menu button still opens the burger menu, tapping the ballsUsed
-        // chip opens its picker (only if there's more than one bucket to switch between), and any
-        // other tap closes the screen -- same "tap anywhere to leave" pattern as replaying above.
+        // Statistik screen: the menu button still opens the burger menu, tapping a "Normal"/"Mini-
+        // Blöcke" tab switches the active pool (see toggleStatsMode()), tapping the ballsUsed chip
+        // opens its picker (only if there's more than one bucket to switch between), and any other
+        // tap closes the screen -- same "tap anywhere to leave" pattern as replaying above.
         if (showingStats) {
             if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                boolean tappedNormalTab = getStatsModeTabRect(false).contains(event.getX(), event.getY());
+                boolean tappedMiniTab = getStatsModeTabRect(true).contains(event.getX(), event.getY());
                 if (isMenuButtonHit(event.getX(), event.getY())) {
                     showBurgerMenu();
-                } else if (shotHistograms.size() > 1 && getStatsDropdownRect().contains(event.getX(), event.getY())) {
+                } else if (tappedNormalTab || tappedMiniTab) {
+                    if (tappedMiniTab != statsShowingMiniBlocks) toggleStatsMode();
+                } else if (activeShotHistograms().size() > 1 && getStatsDropdownRect().contains(event.getX(), event.getY())) {
                     showStatsBallsPicker();
                 } else {
                     showingStats = false;
@@ -987,7 +1046,18 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
 
 
         // game updates
-        gameBoard.update();
+        // Mini-Blöcke levels run GameBoard.update() (the same collision-safe tick used everywhere,
+        // including the "Speed-up" overlay's fastForwardToNextBlockHit()) a few extra times per
+        // rendered frame -- reported as feeling slow otherwise: normSpeed there is necessarily much
+        // lower in absolute pixels than the normal board's (see GameBoard.MINI_NORM_SPEED), since it
+        // has to stay well under that finer grid's smaller blockWidth to avoid tunneling through a
+        // block in a single tick, so at one tick per frame the ball visibly crawls across the same
+        // physical screen width. Running the tick more than once doesn't loosen that per-tick safety
+        // margin at all -- it just replays the exact same tested step more often per frame.
+        int ticksThisFrame = isMiniBlockLevel() ? MINI_BLOCK_TICKS_PER_FRAME : 1;
+        for (int tick = 0; tick < ticksThisFrame; tick++) {
+            gameBoard.update();
+        }
 
         // "Abspielen in Zeitlupe" in the Import & Replay dialog: once the shot fired from there
         // (identified by the move-completion count moving past what it was right before firing --
@@ -1045,6 +1115,8 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 .putString(PREFS_KEY_SAVED_BONUS_COUNTS, serializeBonusCounts())
                 .putString(PREFS_KEY_SHOT_HISTOGRAMS, serializeHistogram(shotHistograms))
                 .putString(PREFS_KEY_HIT_HISTOGRAMS, serializeHistogram(hitHistograms))
+                .putString(PREFS_KEY_MINI_SHOT_HISTOGRAMS, serializeHistogram(miniShotHistograms))
+                .putString(PREFS_KEY_MINI_HIT_HISTOGRAMS, serializeHistogram(miniHitHistograms))
                 .apply();
     }
 
@@ -1087,12 +1159,16 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         }
     }
 
-    // Tallies one finished shot into the histograms for its ballsUsed bucket (see onRoundEnd()).
-    private void recordShotStatistics(int ballsUsed, int blocksCleared, int blocksHit) {
+    // Tallies one finished shot into the histograms for its ballsUsed bucket (see onRoundEnd()) --
+    // the Mini-Blöcke pool if the shot was played on a Mini-Blöcke level, the normal pool otherwise
+    // (see miniShotHistograms' field comment for why they're kept apart).
+    private void recordShotStatistics(int ballsUsed, int blocksCleared, int blocksHit, boolean mini) {
+        TreeMap<Integer, TreeMap<Integer, Integer>> shotTarget = mini ? miniShotHistograms : shotHistograms;
+        TreeMap<Integer, TreeMap<Integer, Integer>> hitTarget = mini ? miniHitHistograms : hitHistograms;
         int clearedBin = blocksCleared / SHOT_HISTOGRAM_BIN_SIZE;
-        shotHistograms.computeIfAbsent(ballsUsed, k -> new TreeMap<>()).merge(clearedBin, 1, Integer::sum);
+        shotTarget.computeIfAbsent(ballsUsed, k -> new TreeMap<>()).merge(clearedBin, 1, Integer::sum);
         int hitBin = blocksHit / HIT_HISTOGRAM_BIN_SIZE;
-        hitHistograms.computeIfAbsent(ballsUsed, k -> new TreeMap<>()).merge(hitBin, 1, Integer::sum);
+        hitTarget.computeIfAbsent(ballsUsed, k -> new TreeMap<>()).merge(hitBin, 1, Integer::sum);
     }
 
     public void setGameOver(boolean win) {
@@ -1127,29 +1203,24 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     }
 
     // Called by GameBoard once a move (all balls back at rest) ends. Tallies the shot into the
-    // statistics histogram, then awards random bonuses per bonusesForBlocksCleared() -- unless this
-    // same shot already spent a bonus (see consumeArmedBonuses()), so bonus shots can't chain into
-    // more bonuses.
+    // statistics histogram, then awards random bonuses per bonusesForBlocksCleared() -- also for
+    // shots that spent a bonus themselves (reported requirement; they used to get nothing).
     @Override
     public void onRoundEnd(int blocksCleared, int ballsUsed) {
         int blocksHit = gameBoard == null ? blocksCleared : gameBoard.getHitsThisMove();
         // Probespielen: test shots aren't representative real play, so they're kept out of the
         // persisted shot/hit histograms (see showStatsScreen()).
         if (!testPlayActive) {
-            recordShotStatistics(ballsUsed, blocksCleared, blocksHit);
+            recordShotStatistics(ballsUsed, blocksCleared, blocksHit, isMiniBlockLevel());
         }
-        boolean bonusSpentThisShot = bonusUsedThisShot;
-        bonusUsedThisShot = false;
-        if (!bonusSpentThisShot) {
-            int bonusesToAward = bonusesForBlocksCleared(blocksCleared);
-            for (int i = 0; i < bonusesToAward; i++) {
-                Bonus awarded = pickRandomBonus();
-                bonusCounts[awarded.ordinal()]++;
-                if (gameBoard != null) {
-                    addAnimation(new BonusAwardAnimation(gameBoard, BONUS_AWARD_ANIMATION_DURATION,
-                            awarded, bonusColorPaints[awarded.ordinal()].getColor(), bonusTitle(awarded),
-                            i * BONUS_AWARD_STAGGER_TICKS));
-                }
+        int bonusesToAward = bonusesForBlocksCleared(blocksCleared);
+        for (int i = 0; i < bonusesToAward; i++) {
+            Bonus awarded = pickRandomBonus();
+            bonusCounts[awarded.ordinal()]++;
+            if (gameBoard != null) {
+                addAnimation(new BonusAwardAnimation(gameBoard, BONUS_AWARD_ANIMATION_DURATION,
+                        awarded, bonusColorPaints[awarded.ordinal()].getColor(), bonusTitle(awarded),
+                        i * BONUS_AWARD_STAGGER_TICKS));
             }
         }
     }
@@ -1181,6 +1252,11 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     // is allowed -- see armedBonuses) and returns them so GameBoard can apply each one's one-off
     // effect (see GameBoard.applyConsumedBonus()).
     @Override
+    public void refundBonus(Bonus bonus) {
+        bonusCounts[bonus.ordinal()]++;
+    }
+
+    @Override
     public List<Bonus> consumeArmedBonuses() {
         if (armedBonuses.isEmpty()) return Collections.emptyList();
         List<Bonus> consumed = new ArrayList<>(armedBonuses);
@@ -1189,7 +1265,6 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             if (bonusCounts[idx] > 0) bonusCounts[idx]--;
         }
         armedBonuses.clear();
-        bonusUsedThisShot = true;
         return consumed;
     }
 
@@ -1206,8 +1281,22 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         // it immediately onto that same shot instead of arming it for the next one (see
         // GameBoard.armMoveStopperMidShot()) -- lets the player rescue a move they see going wrong
         // (a block about to be stranded in the bottom row) before it ends in game over.
+        // A second tap while it's still pending (not yet applied at move end) takes it back.
         if (bonus == Bonus.MOVE_STOPPER && gameBoard != null && gameBoard.ballRolling() && !gameBoard.isFrozen()) {
-            spendMoveStopperMidShot();
+            if (gameBoard.disarmMoveStopperMidShot()) {
+                bonusCounts[Bonus.MOVE_STOPPER.ordinal()]++;
+            } else {
+                spendMoveStopperMidShot();
+            }
+            return;
+        }
+        // BASELINE_BOUNCE, same last-resort mid-shot path as MOVE_STOPPER just above (see
+        // GameBoard.armBaselineBounceMidShot()) -- lets the player arm it once the balls are
+        // already rolling, budgeted at one reflection per ball in the shot that's already firing,
+        // instead of only being selectable before a shot starts. Stackable mid-shot: each further
+        // tap adds another numBalls reflections (before the shot, a tap just toggles as usual).
+        if (bonus == Bonus.BASELINE_BOUNCE && gameBoard != null && gameBoard.ballRolling() && !gameBoard.isFrozen()) {
+            spendBaselineBounceMidShot();
             return;
         }
         // EXTRA_BALLS is stackable (see GameBoard.applyConsumedBonus()) but only up to 4 times per
@@ -1233,13 +1322,23 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         }
     }
 
+    // See toggleArmedBonus()'s BASELINE_BOUNCE branch above. Only spends the bonus if
+    // armBaselineBounceMidShot() actually armed something.
+    private void spendBaselineBounceMidShot() {
+        if (bonusCounts[Bonus.BASELINE_BOUNCE.ordinal()] <= 0) return;
+        if (gameBoard.armBaselineBounceMidShot()) {
+            bonusCounts[Bonus.BASELINE_BOUNCE.ordinal()]--;
+        }
+    }
+
     // LINE_DELETE bonus: unlike the others, it isn't armed for a later shot -- tapping its button
     // spends it and applies the effect immediately (see GameBoard.triggerLineDeleteBonus()), so it
     // only works between shots while the board is idle.
     private void spendLineDeleteBonus() {
         if (gameBoard == null || gameBoard.ballRolling() || gameBoard.isFrozen()) return;
-        bonusCounts[Bonus.LINE_DELETE.ordinal()]--;
-        gameBoard.triggerLineDeleteBonus();
+        if (gameBoard.triggerLineDeleteBonus()) {
+            bonusCounts[Bonus.LINE_DELETE.ordinal()]--;
+        }
     }
 
     private StatBox getStatBoxHit(float x, float y) {
@@ -1496,6 +1595,11 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     }
 
     @Override
+    public boolean isMiniBlockLevel(int level) {
+        return isMiniBlockLevelSlot(level);
+    }
+
+    @Override
     public int getCurrentLevel() {
         return level;
     }
@@ -1520,7 +1624,10 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
 
         // Rows cover every level 1..maxKnown so the reserved random-level slots (10, 20, 30, ...)
         // show up too, greyed out and unselectable, instead of just silently not being listed --
-        // see isRandomLevelSlot().
+        // see isRandomLevelSlot(). Mini-Blöcke slots (isMiniBlockLevelSlot()) get a row too, even
+        // before anything's been authored there -- otherwise they'd be invisible in this list and
+        // only reachable via "Neues Level erstellen..." -> "Einfuegen an Position..." by typing the
+        // exact number from memory.
         List<Integer> rowLevel = new ArrayList<>(); // -1 for the trailing "action" rows
         List<String> labels = new ArrayList<>();
         List<Boolean> rowEnabled = new ArrayList<>();
@@ -1530,7 +1637,18 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 rowEnabled.add(false);
                 rowLevel.add(lvl);
             } else if (known.contains(lvl)) {
-                labels.add("Level " + lvl + " bearbeiten");
+                // Mini-Blöcke levels (isMiniBlockLevelSlot()) are perfectly normal, editable levels
+                // -- just labeled so it's clear the finer grid/smaller ball applies there.
+                String suffix = isMiniBlockLevelSlot(lvl) ? " (Mini-Blöcke) bearbeiten" : " bearbeiten";
+                labels.add("Level " + lvl + suffix);
+                rowEnabled.add(true);
+                rowLevel.add(lvl);
+            } else if (isMiniBlockLevelSlot(lvl)) {
+                // Not authored yet -- tapping this opens the (blank) editor for it directly, same
+                // as any other "edit" row: openLevelEditorFor()/LevelEditor.openForEdit() handle a
+                // level with no existing content just fine (Speichern then writes it fresh, no
+                // shift needed since the slot was already free).
+                labels.add("Level " + lvl + " (Mini-Blöcke, noch leer) erstellen");
                 rowEnabled.add(true);
                 rowLevel.add(lvl);
             }
@@ -1980,13 +2098,53 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         }
     }
 
-    // Opens the Statistik screen (burger menu), defaulting to the smallest ballsUsed bucket with
-    // data if none is selected yet (or the previous selection no longer has any data).
+    // Opens the Statistik screen (burger menu). Defaults to the Normal pool, unless it has no data
+    // at all yet but the Mini-Blöcke one does -- then opens straight into whichever tab actually
+    // has something to show, same "no dead end" reasoning as refreshStatsSelectedBallsUsed()'s
+    // ballsUsed default.
     private void showStatsScreen() {
-        if (statsSelectedBallsUsed == null || !shotHistograms.containsKey(statsSelectedBallsUsed)) {
-            statsSelectedBallsUsed = shotHistograms.isEmpty() ? null : shotHistograms.firstKey();
+        if (shotHistograms.isEmpty() && !miniShotHistograms.isEmpty()) {
+            statsShowingMiniBlocks = true;
         }
+        refreshStatsSelectedBallsUsed();
         showingStats = true;
+    }
+
+    // The histogram pool the screen is currently showing -- see statsShowingMiniBlocks.
+    private TreeMap<Integer, TreeMap<Integer, Integer>> activeShotHistograms() {
+        return statsShowingMiniBlocks ? miniShotHistograms : shotHistograms;
+    }
+
+    private TreeMap<Integer, TreeMap<Integer, Integer>> activeHitHistograms() {
+        return statsShowingMiniBlocks ? miniHitHistograms : hitHistograms;
+    }
+
+    // Defaults/repairs statsSelectedBallsUsed against the currently active pool (see
+    // activeShotHistograms()) -- called both when the screen opens and whenever the "Normal"/
+    // "Mini-Blöcke" tab switches, since the two pools don't share ballsUsed buckets.
+    private void refreshStatsSelectedBallsUsed() {
+        TreeMap<Integer, TreeMap<Integer, Integer>> active = activeShotHistograms();
+        if (statsSelectedBallsUsed == null || !active.containsKey(statsSelectedBallsUsed)) {
+            statsSelectedBallsUsed = active.isEmpty() ? null : active.firstKey();
+        }
+    }
+
+    // "Normal"/"Mini-Blöcke" tab pair above the ballsUsed dropdown (see onTouchEvent()); miniSide
+    // picks which half of the pair this rect is for.
+    private RectF getStatsModeTabRect(boolean miniSide) {
+        float width = 360f;
+        float left = (canvasWidth - width) / 2f;
+        float top = 170f;
+        float half = width / 2f;
+        return miniSide
+                ? new RectF(left + half, top, left + width, top + 40f)
+                : new RectF(left, top, left + half, top + 40f);
+    }
+
+    private void toggleStatsMode() {
+        statsShowingMiniBlocks = !statsShowingMiniBlocks;
+        statsSelectedBallsUsed = null;
+        refreshStatsSelectedBallsUsed();
     }
 
     // Dropdown-style tap target above the histogram showing the currently selected ballsUsed
@@ -1999,7 +2157,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
     }
 
     private void showStatsBallsPicker() {
-        Integer[] keys = shotHistograms.keySet().toArray(new Integer[0]);
+        Integer[] keys = activeShotHistograms().keySet().toArray(new Integer[0]);
         String[] items = new String[keys.length];
         for (int i = 0; i < keys.length; i++) {
             items[i] = keys[i] + " Bälle";
@@ -2019,11 +2177,20 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         canvas.drawColor(Color.BLACK);
         canvas.drawText("Statistik", 50, 150, statsTitlePaint);
 
+        RectF normalTab = getStatsModeTabRect(false);
+        RectF miniTab = getStatsModeTabRect(true);
+        canvas.drawRoundRect(normalTab, 12, 12, statsShowingMiniBlocks ? statsTabInactivePaint : statsTabActivePaint);
+        canvas.drawRoundRect(miniTab, 12, 12, statsShowingMiniBlocks ? statsTabActivePaint : statsTabInactivePaint);
+        canvas.drawText("Normal", normalTab.centerX(), normalTab.centerY() + 10, statsTabTextPaint);
+        canvas.drawText("Mini-Blöcke", miniTab.centerX(), miniTab.centerY() + 10, statsTabTextPaint);
+
+        TreeMap<Integer, TreeMap<Integer, Integer>> activeShots = activeShotHistograms();
+
         RectF dropdown = getStatsDropdownRect();
         canvas.drawRoundRect(dropdown, 16, 16, statsDropdownPaint);
         String dropdownText = statsSelectedBallsUsed == null
                 ? "-"
-                : statsSelectedBallsUsed + " Bälle" + (shotHistograms.size() > 1 ? " ▾" : "");
+                : statsSelectedBallsUsed + " Bälle" + (activeShots.size() > 1 ? " ▾" : "");
         canvas.drawText(dropdownText, dropdown.centerX(), dropdown.centerY() + 12, statsDropdownTextPaint);
 
         if (statsSelectedBallsUsed == null) {
@@ -2037,7 +2204,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         float slotHeight = (slotsBottom - slotsTop - slotGap) / 2f;
 
         drawHistogramChart(canvas, "Steine entfernt pro Schuss",
-                shotHistograms.get(statsSelectedBallsUsed), SHOT_HISTOGRAM_BIN_SIZE,
+                activeShots.get(statsSelectedBallsUsed), SHOT_HISTOGRAM_BIN_SIZE,
                 slotsTop, slotsTop + slotHeight, statsBarPaint,
                 new int[]{BLOCKS_CLEARED_BONUS_THRESHOLD, BLOCKS_CLEARED_BONUS_THRESHOLD_2, BLOCKS_CLEARED_BONUS_THRESHOLD_3},
                 new String[]{"1 Bonus ab " + BLOCKS_CLEARED_BONUS_THRESHOLD,
@@ -2045,7 +2212,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                         "3 Boni ab " + BLOCKS_CLEARED_BONUS_THRESHOLD_3});
 
         drawHistogramChart(canvas, "Treffer pro Schuss",
-                hitHistograms.get(statsSelectedBallsUsed), HIT_HISTOGRAM_BIN_SIZE,
+                activeHitHistograms().get(statsSelectedBallsUsed), HIT_HISTOGRAM_BIN_SIZE,
                 slotsTop + slotHeight + slotGap, slotsBottom, statsBarPaint2,
                 null, null);
     }
@@ -2341,7 +2508,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             case EXTENDED_PATH:
                 return "Die Vorschau-Ziellinie wird länger, um weiter oben liegende Bereiche besser anpeilen zu können.";
             case LINE_DELETE:
-                return "Wird sofort beim Antippen ausgeführt: eine der drei wertvollsten Reihen wird zufällig gelöscht, die darunterliegenden Reihen rutschen nach oben.";
+                return "Wird sofort beim Antippen ausgeführt: eine zufällige Reihe wird gelöscht – je mehr Blöcke sie hat, desto wahrscheinlicher, die darunterliegenden Reihen rutschen nach oben.";
             case EXTRA_BALLS:
                 return "Der nächste Schuss wird mit deutlich mehr Bällen (20) abgefeuert.";
             case MOVE_START_POINT:
@@ -2369,7 +2536,12 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             return testPlayJson;
         }
         // Every 10th level is deliberately random (see isRandomLevelSlot()) -- short-circuit to
-        // null unconditionally so it stays random even if a stray override somehow exists.
+        // null unconditionally so it stays random even if a stray override somehow exists. Mini-
+        // Blöcke levels (isMiniBlockLevelSlot()) are NOT reserved this way -- they're regular
+        // authored/editable levels, just with GameBoard's finer grid/smaller ball applied (see
+        // GameCallbacks.isMiniBlockLevel()); they fall through to the normal override/asset lookup
+        // below like any other level, and simply fall back to GameBoard.randomBoard() (still with
+        // the Mini-Blöcke board config) until someone actually authors content for that slot.
         if (isRandomLevelSlot(level)) {
             return null;
         }
@@ -2399,9 +2571,21 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
         return level % 10 == 0;
     }
 
-    // Smallest level number >= level that isn't a random-level slot -- used for the default
-    // "append" target and while shifting levels during "insert at position" so nothing ever lands
-    // on a reserved slot.
+    // Every 5th level that isn't already a random-level slot (5, 15, 25, ...) is a "Mini-Blöcke"
+    // level: GameBoard.applyBoardConfig() switches to a much finer grid and a smaller ball for it
+    // (see GameCallbacks.isMiniBlockLevel()), and its palette is square-only (see
+    // LevelEditor.EditorCallbacks.isMiniBlockLevel()) -- collision is simpler to reason about
+    // without triangle geometry at that scale. UNLIKE isRandomLevelSlot(), this is NOT a reserved
+    // slot: it's a perfectly normal, authored/editable level that just always uses the finer board
+    // config. Regularly spaced the same way the random slots are, but never forced to null here --
+    // it goes through the exact same override/asset lookup as any other level, falling back to
+    // GameBoard.randomBoard() (still with the Mini-Blöcke config) only until someone authors it.
+    static boolean isMiniBlockLevelSlot(int level) {
+        return level % 5 == 0 && level % 10 != 0;
+    }
+
+    // Smallest level number >= level that isn't a random-level slot -- used for the default "append"
+    // target and while shifting levels during "insert at position" so nothing ever lands on one.
     private static int nextEditableSlot(int level) {
         while (isRandomLevelSlot(level)) level++;
         return level;
@@ -2623,7 +2807,7 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
             int count = bonusCounts[bonus.ordinal()];
             Paint background = count > 0 ? bonusColorPaints[bonus.ordinal()] : bonusGrayPaint;
             canvas.drawRoundRect(box, 20, 20, background);
-            if (armedBonuses.contains(bonus)) {
+            if (armedBonuses.contains(bonus) || isBonusActiveMidShot(bonus)) {
                 canvas.drawRoundRect(box, 20, 20, bonusArmedBorderPaint);
             }
             drawBonusIcon(canvas, bonus, box);
@@ -2634,6 +2818,17 @@ public class Game extends SurfaceView implements SurfaceHolder.Callback, GameBoa
                 canvas.drawCircle(badgeCx, badgeCy, badgeRadius, bonusBadgePaint);
                 canvas.drawText(String.valueOf(count), badgeCx, badgeCy + 10, bonusBadgeTextPaint);
             }
+        }
+    }
+
+    // Bonuses spent mid-shot (or consumed at fire) aren't in armedBonuses anymore, but should still
+    // look active while they're in effect for the move in progress.
+    private boolean isBonusActiveMidShot(Bonus bonus) {
+        if (gameBoard == null) return false;
+        switch (bonus) {
+            case MOVE_STOPPER:    return gameBoard.isMoveStopperPending();
+            case BASELINE_BOUNCE: return gameBoard.getBaselineBounceReflectionsRemaining() > 0;
+            default:              return false;
         }
     }
 

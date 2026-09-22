@@ -21,10 +21,18 @@ import java.util.List;
 // instead of parsed blocks, but are still tappable since they're perfectly playable.
 public class LevelOverview {
 
-    // Matches LevelEditor.GRID_COLS/GRID_ROWS (== GameBoard's authored-level grid), used purely as
-    // the aspect ratio each thumbnail's blocks are laid out against.
+    // Matches LevelEditor's NORMAL_GRID_COLS/GRID_ROWS (== GameBoard's normal authored-level grid),
+    // used both as the aspect ratio EVERY thumbnail card is laid out against (uniform regardless of
+    // the level's own grid, so the masonry layout stays regular) and as the coordinate space a
+    // normal level's blocks are parsed/drawn against. A Mini-Blöcke level (see
+    // OverviewCallbacks.isMiniBlockLevel()) uses MINI_GRID_COLS_THUMB/ROWS_THUMB instead for the
+    // latter (matching LevelEditor's own MINI_GRID_COLS/ROWS) so its blocks are parsed/drawn at
+    // their correct relative positions instead of being clipped to the normal grid's smaller
+    // bounds -- they still land inside the SAME uniformly-shaped card, just packed in smaller.
     private static final int GRID_COLS_THUMB = 11;
     private static final int GRID_ROWS_THUMB = 16;
+    private static final int MINI_GRID_COLS_THUMB = 27;
+    private static final int MINI_GRID_ROWS_THUMB = 42;
     private static final int COLUMNS = 3;
     private static final float CELL_MARGIN = 18f;
     private static final float LABEL_HEIGHT = 50f;
@@ -38,6 +46,11 @@ public class LevelOverview {
         List<Integer> listKnownLevels();
         String loadLevelJsonForThumbnail(int level);
         boolean isRandomLevel(int level);
+        // "Mini-Blöcke" slot (see Game.isMiniBlockLevelSlot()): a perfectly normal, authored/
+        // editable level like any other, just laid out on GameBoard's finer grid -- its thumbnail
+        // parses/draws blocks against MINI_GRID_COLS_THUMB/ROWS_THUMB instead of the normal grid,
+        // and its card label gets a "(Mini)" suffix (see open()/drawCard()).
+        boolean isMiniBlockLevel(int level);
         int getCurrentLevel();
         void goToLevelFromOverview(int level);
         void closeOverview();
@@ -61,8 +74,14 @@ public class LevelOverview {
 
     private List<Integer> levels = new ArrayList<>();
     // Parallel to levels: parsed blocks as {x, y, shapeCode, value} rows, or null for a
-    // random-level slot (no fixed layout exists to preview).
+    // random-level slot (Game.isRandomLevelSlot(), no fixed layout to preview -- renders as a dice
+    // placeholder instead, see drawRandomPlaceholder()).
     private List<List<int[]>> blocksByLevel = new ArrayList<>();
+    // Parallel to levels: true for a Mini-Blöcke level (see OverviewCallbacks.isMiniBlockLevel()) --
+    // it's still parsed/drawn as real blocks like any other authored level, just against
+    // MINI_GRID_COLS_THUMB/ROWS_THUMB instead of the normal grid (see parseBlocks()/drawBlocks()),
+    // and gets a "(Mini)" suffix on its card label (see drawCard()).
+    private List<Boolean> miniByLevel = new ArrayList<>();
     private int currentLevelHighlight;
 
     private int canvasWidth;
@@ -144,18 +163,23 @@ public class LevelOverview {
 
         levels = callbacks.listKnownLevels();
         blocksByLevel = new ArrayList<>(levels.size());
+        miniByLevel = new ArrayList<>(levels.size());
         for (int lvl : levels) {
+            boolean mini = callbacks.isMiniBlockLevel(lvl);
+            miniByLevel.add(mini);
             if (callbacks.isRandomLevel(lvl)) {
                 blocksByLevel.add(null);
             } else {
                 String json = callbacks.loadLevelJsonForThumbnail(lvl);
-                blocksByLevel.add(json != null ? parseBlocks(json) : new ArrayList<>());
+                int cols = mini ? MINI_GRID_COLS_THUMB : GRID_COLS_THUMB;
+                int rows = mini ? MINI_GRID_ROWS_THUMB : GRID_ROWS_THUMB;
+                blocksByLevel.add(json != null ? parseBlocks(json, cols, rows) : new ArrayList<>());
             }
         }
         scrollToLevel(currentLevel);
     }
 
-    private List<int[]> parseBlocks(String json) {
+    private List<int[]> parseBlocks(String json, int cols, int rows) {
         List<int[]> result = new ArrayList<>();
         try {
             JSONObject root = new JSONObject(json);
@@ -164,7 +188,7 @@ public class LevelOverview {
                 JSONObject b = arr.getJSONObject(i);
                 int x = b.getInt("x");
                 int y = b.getInt("y");
-                if (x < 0 || x >= GRID_COLS_THUMB || y < 0 || y >= GRID_ROWS_THUMB) continue;
+                if (x < 0 || x >= cols || y < 0 || y >= rows) continue;
                 int value = b.getInt("value");
                 int shape = shapeCode(b.getString("type"));
                 result.add(new int[]{x, y, shape, value});
@@ -317,16 +341,18 @@ public class LevelOverview {
         boolean isCurrent = (lvl == currentLevelHighlight);
         RectF thumb = new RectF(card.left, card.top, card.right, card.bottom - LABEL_HEIGHT);
 
+        boolean mini = miniByLevel.get(idx);
         c.drawRect(thumb, isCurrent ? currentCellBgPaint : cellBgPaint);
         List<int[]> blocks = blocksByLevel.get(idx);
         if (blocks == null) {
             drawRandomPlaceholder(c, thumb);
         } else {
-            drawBlocks(c, thumb, blocks);
+            drawBlocks(c, thumb, blocks, mini ? MINI_GRID_COLS_THUMB : GRID_COLS_THUMB,
+                    mini ? MINI_GRID_ROWS_THUMB : GRID_ROWS_THUMB);
         }
         c.drawRect(thumb, isCurrent ? currentBorderPaint : cellBorderPaint);
 
-        String text = "Level " + lvl;
+        String text = "Level " + lvl + (mini ? " (Mini)" : "");
         c.drawText(text, card.centerX(), card.bottom - LABEL_HEIGHT / 2f + 12,
                 isCurrent ? currentLabelPaint : labelPaint);
     }
@@ -336,9 +362,9 @@ public class LevelOverview {
         c.drawText("Level", thumb.centerX(), thumb.centerY() + 40, randomLabelPaint);
     }
 
-    private void drawBlocks(Canvas c, RectF thumb, List<int[]> blocks) {
-        float cellW = thumb.width() / GRID_COLS_THUMB;
-        float cellH = thumb.height() / GRID_ROWS_THUMB;
+    private void drawBlocks(Canvas c, RectF thumb, List<int[]> blocks, int cols, int rows) {
+        float cellW = thumb.width() / cols;
+        float cellH = thumb.height() / rows;
         for (int[] b : blocks) {
             float left = thumb.left + b[0] * cellW;
             float top = thumb.top + b[1] * cellH;

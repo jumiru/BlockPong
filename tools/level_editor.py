@@ -47,6 +47,17 @@ EDITOR_ROWS = 20  # Editor's drawable grid height. Larger than MAX_PLAYABLE_ROWS
                    # below that line won't appear in-game; the canvas marks that boundary.
 CELL_SIZE = 44
 
+# "Mini-Bloecke" levels (see is_mini_block_level_slot()) use GameBoard's finer grid -- see
+# GameBoard.MINI_X_DIM/MINI_Y_DIM in the app. MINI_MAX_PLAYABLE_ROWS mirrors MAX_PLAYABLE_ROWS'
+# "-2" convention (authored levels never populate the bottom two rows); MINI_EDITOR_ROWS keeps the
+# same +4 rows of below-the-boundary drawing slack as EDITOR_ROWS does over MAX_PLAYABLE_ROWS.
+MINI_BOARD_COLS = 27
+MINI_MAX_PLAYABLE_ROWS = 42
+MINI_EDITOR_ROWS = 46
+# Mini-Bloecke block values are capped at a single digit (see GameBoard.MINI_MAX_VALUE) so the
+# number painted on a block stays legible at this finer grid's smaller cell size.
+MINI_MAX_VALUE = 9
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ASSETS_LEVELS_DIR = REPO_ROOT / "app" / "src" / "main" / "assets" / "levels"
 
@@ -283,7 +294,8 @@ def merge_cell_color(pixels, method):
     return max(((p[0], p[1], p[2]) for p in pixels), key=luminance)
 
 
-def convert(image_path, cols, rows, method, value_min, value_max, frame_index, bg_color_hex, bg_tolerance):
+def convert(image_path, cols, rows, method, value_min, value_max, frame_index, bg_color_hex, bg_tolerance,
+            max_playable_rows=MAX_PLAYABLE_ROWS):
     img = load_frame(image_path, frame_index)
     has_alpha = "A" in Image.open(image_path).convert("RGBA").getbands() and img.getextrema()[3][0] < 255
 
@@ -298,10 +310,10 @@ def convert(image_path, cols, rows, method, value_min, value_max, frame_index, b
     w, h = img.size
     if rows is None:
         rows = max(1, round(cols * h / w))
-    if rows > MAX_PLAYABLE_ROWS:
-        print(f"Warning: {rows} rows requested, but only the top {MAX_PLAYABLE_ROWS} are playable "
-              f"(GameBoard reserves the bottom 2 rows) -- clipping to {MAX_PLAYABLE_ROWS}.", file=sys.stderr)
-        rows = MAX_PLAYABLE_ROWS
+    if rows > max_playable_rows:
+        print(f"Warning: {rows} rows requested, but only the top {max_playable_rows} are playable "
+              f"(GameBoard reserves the bottom 2 rows) -- clipping to {max_playable_rows}.", file=sys.stderr)
+        rows = max_playable_rows
 
     pixels = img.load()
     blocks = []
@@ -334,6 +346,14 @@ def is_random_level_slot(n):
     """Every 10th level is deliberately left without a level file so GameBoard.randomBoard()
     generates it -- see Game.isRandomLevelSlot() in the app. Never editable/generatable here."""
     return n % 10 == 0
+
+
+def is_mini_block_level_slot(n):
+    """Every 5th-not-10th level uses GameBoard's finer "Mini-Bloecke" grid/smaller ball (see
+    Game.isMiniBlockLevelSlot() in the app) -- unlike is_random_level_slot(), this is a perfectly
+    normal, authorable level, just always edited/rendered on the bigger grid regardless of what's
+    currently stored there."""
+    return n % 5 == 0 and n % 10 != 0
 
 
 def resolve_output_path(args):
@@ -450,7 +470,8 @@ class ImageImportWindow(tk.Toplevel):
     Coordinate model: self.rotated_image is self.source_image rotated by self.rotation_deg (PIL
     rotate(expand=True, fillcolor=transparent), so corners the rotation introduces are transparent
     rather than showing rotated-away content). self.base_ppc_x/self.base_ppc_y ("pixels per grid
-    column/row" -- fitting the *whole* rotated image to the *whole* grid, recomputed whenever the
+    column/row" -- fitting the *whole* rotated image into the grid with one uniform scale so its
+    aspect ratio is kept, centered by _reset_view(); recomputed whenever the
     source image, its rotation, or the column/row count changes) divided by self.zoom_x/self.zoom_y
     (independently adjustable, see _adjust_zoom()) give the actual source-image-pixel size of one
     grid cell's sampling window on each axis; self.offset_x/self.offset_y (in rotated-image pixel
@@ -466,12 +487,21 @@ class ImageImportWindow(tk.Toplevel):
     # there's no need to auto-size rows/cols to each image's aspect ratio anymore.
     DEFAULT_COLS, DEFAULT_ROWS = 11, 17
 
-    def __init__(self, parent):
+    def __init__(self, parent, max_cols=BOARD_COLS, max_rows=EDITOR_ROWS,
+                 default_cols=None, default_rows=None, max_value=99):
+        # max_cols/max_rows/default_cols/default_rows/max_value let LevelEditorApp.import_image()
+        # widen the Cols/Rows spinboxes (and cap the Value spinboxes) to GameBoard's Mini-Bloecke
+        # grid/single-digit values when the level currently open is a Mini-Bloecke slot --
+        # otherwise an import into one could never use more than the normal board's 11 columns, or
+        # would import values ("17") too wide for that grid's smaller cells to show legibly.
         super().__init__(parent)
         self.title("Import Image")
         self.transient(parent)
         self.grab_set()
         self.result = None
+        self.max_cols = max_cols
+        self.max_rows = max_rows
+        self.max_value = max_value
 
         self.source_image = None   # original, unrotated RGBA PIL Image, or None until loaded
         self.rotated_image = None  # source_image rotated by rotation_deg, RGBA, expand=True
@@ -484,11 +514,11 @@ class ImageImportWindow(tk.Toplevel):
         self.offset_y = 0.0
         self._pan_last = (0, 0)
 
-        self.cols_var = tk.IntVar(value=self.DEFAULT_COLS)
-        self.rows_var = tk.IntVar(value=self.DEFAULT_ROWS)
+        self.cols_var = tk.IntVar(value=default_cols if default_cols is not None else self.DEFAULT_COLS)
+        self.rows_var = tk.IntVar(value=default_rows if default_rows is not None else self.DEFAULT_ROWS)
         self.method_var = tk.StringVar(value="avg")
         self.value_min_var = tk.IntVar(value=1)
-        self.value_max_var = tk.IntVar(value=20)
+        self.value_max_var = tk.IntVar(value=min(20, max_value))
         self.bg_color = None  # (r, g, b) or None -- see _pick_bg_color()/_auto_bg_color()
         self.bg_tolerance_var = tk.DoubleVar(value=24.0)
         self.rotation_var = tk.DoubleVar(value=0.0)
@@ -540,9 +570,9 @@ class ImageImportWindow(tk.Toplevel):
         grid_row = ttk.Frame(side)
         grid_row.pack(anchor="w", pady=(0, 6))
         ttk.Label(grid_row, text="Cols:").pack(side="left")
-        ttk.Spinbox(grid_row, from_=1, to=BOARD_COLS, textvariable=self.cols_var, width=5).pack(side="left", padx=(2, 8))
+        ttk.Spinbox(grid_row, from_=1, to=self.max_cols, textvariable=self.cols_var, width=5).pack(side="left", padx=(2, 8))
         ttk.Label(grid_row, text="Rows:").pack(side="left")
-        ttk.Spinbox(grid_row, from_=1, to=EDITOR_ROWS, textvariable=self.rows_var, width=5).pack(side="left", padx=(2, 0))
+        ttk.Spinbox(grid_row, from_=1, to=self.max_rows, textvariable=self.rows_var, width=5).pack(side="left", padx=(2, 0))
 
         ttk.Label(side, text="Zoom", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(6, 0))
         zoom_x_row = ttk.Frame(side)
@@ -578,10 +608,10 @@ class ImageImportWindow(tk.Toplevel):
         ttk.Label(side, text="Value range", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(6, 0))
         value_row = ttk.Frame(side)
         value_row.pack(anchor="w")
-        ttk.Spinbox(value_row, from_=0, to=99, textvariable=self.value_min_var, width=5,
+        ttk.Spinbox(value_row, from_=0, to=self.max_value, textvariable=self.value_min_var, width=5,
                     command=self._redraw_preview).pack(side="left")
         ttk.Label(value_row, text="to").pack(side="left", padx=4)
-        ttk.Spinbox(value_row, from_=0, to=99, textvariable=self.value_max_var, width=5,
+        ttk.Spinbox(value_row, from_=0, to=self.max_value, textvariable=self.value_max_var, width=5,
                     command=self._redraw_preview).pack(side="left")
 
         ttk.Label(side, text="Merge method:").pack(anchor="w", pady=(6, 0))
@@ -663,6 +693,16 @@ class ImageImportWindow(tk.Toplevel):
         self.offset_x = 0.0
         self.offset_y = 0.0
         self._rebuild_rotated_image()
+        self._center_image()
+
+    def _center_image(self):
+        # Center the fitted image in the grid -- with a uniform scale (see _rebuild_rotated_image())
+        # one axis generally has slack, which would otherwise all end up on the right/bottom.
+        if self.rotated_image is None:
+            return
+        self.offset_x = (self.rotated_image.width - self.cols_var.get() * self._current_ppc_x()) / 2
+        self.offset_y = (self.rotated_image.height - self.rows_var.get() * self._current_ppc_y()) / 2
+        self._redraw_preview()
 
     def _rebuild_rotated_image(self):
         if self.source_image is None:
@@ -674,8 +714,14 @@ class ImageImportWindow(tk.Toplevel):
         else:
             self.rotated_image = self.source_image.rotate(
                 self.rotation_deg, expand=True, resample=Image.BICUBIC, fillcolor=(0, 0, 0, 0))
-        self.base_ppc_x = max(1.0, self.rotated_image.width / self.cols_var.get())
-        self.base_ppc_y = max(1.0, self.rotated_image.height / self.rows_var.get())
+        # Uniform scale on both axes ("contain" fit): board cells are square in-game (GameBoard's
+        # blockHeight = blockWidth), so this keeps the image's original aspect ratio -- up to
+        # whole-cell rounding -- instead of stretching it to the grid. zoom_x/zoom_y can still
+        # distort it deliberately.
+        ppc = max(1.0, self.rotated_image.width / self.cols_var.get(),
+                  self.rotated_image.height / self.rows_var.get())
+        self.base_ppc_x = ppc
+        self.base_ppc_y = ppc
         self._redraw_preview()
 
     def _on_grid_size_changed(self):
@@ -859,6 +905,20 @@ class BoardCompareWindow(tk.Toplevel):
             info_text = "    ".join(f"{label}: {value}" for label, value in metadata)
             ttk.Label(outer, text=info_text, font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(0, 8))
 
+        # The report's "Level: N" field (see extract_report_metadata()) tells us whether this shot
+        # was played on GameBoard's Mini-Bloecke grid -- without it, a Mini-Bloecke board would
+        # render as if most of its blocks were out of range (they'd simply be clipped, see
+        # draw_blocks_static()'s bounds check).
+        cols, rows = BOARD_COLS, MAX_PLAYABLE_ROWS
+        for label, value in metadata:
+            if label == "Level":
+                try:
+                    if is_mini_block_level_slot(int(value)):
+                        cols, rows = MINI_BOARD_COLS, MINI_MAX_PLAYABLE_ROWS
+                except ValueError:
+                    pass
+                break
+
         panels = ttk.Frame(outer)
         panels.pack(fill="both", expand=True)
 
@@ -867,11 +927,11 @@ class BoardCompareWindow(tk.Toplevel):
             panel.pack(side="left", anchor="n")
             ttk.Label(panel, text=label, font=("TkDefaultFont", 9, "bold")).pack(anchor="w")
             canvas = tk.Canvas(
-                panel, width=BOARD_COLS * COMPARE_CELL_SIZE, height=MAX_PLAYABLE_ROWS * COMPARE_CELL_SIZE,
+                panel, width=cols * COMPARE_CELL_SIZE, height=rows * COMPARE_CELL_SIZE,
                 background="#1e1e1e", highlightthickness=1, highlightbackground="#666666",
             )
             canvas.pack(pady=(4, 0))
-            draw_blocks_static(canvas, blocks)
+            draw_blocks_static(canvas, blocks, rows=rows, cols=cols)
 
         ttk.Button(outer, text="Close", command=self.destroy).pack(anchor="e", pady=(10, 0))
 
@@ -1009,6 +1069,15 @@ class LevelOverviewWindow(tk.Toplevel):
             toolbar.pack(fill="x", side="top")
             ttk.Button(toolbar, text="Neues Level...", command=self._new_level).pack(side="left", padx=6, pady=4)
 
+        # Quick-create row for empty Mini-Bloecke slots (see is_mini_block_level_slot()) -- unlike
+        # random-level slots, these are perfectly normal, authorable levels that just don't have a
+        # file yet, so they're worth surfacing even though the thumbnail grid below only ever shows
+        # levels that already have one. Kept as its own always-visible bar (not thumbnails mixed
+        # into the draggable grid) so _reorder()'s file-permutation logic never has to deal with a
+        # "slot" that has no file behind it.
+        self._mini_bar = ttk.Frame(self)
+        self._mini_bar.pack(fill="x", side="top")
+
         container = ttk.Frame(self)
         container.pack(fill="both", expand=True)
 
@@ -1032,6 +1101,7 @@ class LevelOverviewWindow(tk.Toplevel):
         self._drag_indicator = None  # canvas item id of the drop-target highlight
         self._drag_target_idx = None
         self._populate()
+        self._refresh_mini_bar()
 
     def _on_close(self):
         # Entry view: the main window is still withdrawn at this point (nothing was ever opened
@@ -1183,6 +1253,35 @@ class LevelOverviewWindow(tk.Toplevel):
     def _refresh(self):
         self.canvas.delete("all")
         self._populate()
+        self._refresh_mini_bar()
+
+    # Lists every not-yet-authored Mini-Bloecke slot as a small button -- clicking one starts a
+    # blank level already targeted at that number (see LevelEditorApp._new_level_for()). Looks 10
+    # levels past the highest known one too, so at least the next slot is always offered even in a
+    # brand new project with no authored levels at all yet.
+    MINI_BAR_LOOKAHEAD = 10
+    MINI_BAR_BUTTONS_PER_ROW = 15
+
+    def _refresh_mini_bar(self):
+        for child in self._mini_bar.winfo_children():
+            child.destroy()
+        known = {n for n, _ in self._levels}
+        max_num = max(known, default=0) + self.MINI_BAR_LOOKAHEAD
+        empty_mini = [n for n in range(1, max_num + 1) if is_mini_block_level_slot(n) and n not in known]
+        if not empty_mini:
+            return
+        ttk.Label(self._mini_bar, text="Leere Mini-Bloecke-Slots (Klick = neu anlegen):").grid(
+            row=0, column=0, columnspan=self.MINI_BAR_BUTTONS_PER_ROW, sticky="w", padx=6, pady=(4, 0))
+        for i, n in enumerate(empty_mini):
+            row, col = 1 + i // self.MINI_BAR_BUTTONS_PER_ROW, i % self.MINI_BAR_BUTTONS_PER_ROW
+            ttk.Button(self._mini_bar, text=str(n), width=4,
+                       command=lambda n=n: self._new_mini_level(n)).grid(row=row, column=col, padx=2, pady=2)
+
+    def _new_mini_level(self, n):
+        if not self.app._confirm_discard():
+            return
+        self.app._new_level_for(n)
+        self._switch_to_editor()
 
     def _draw_thumbnail(self, idx, n, path, x0, y0, w, h):
         self.canvas.create_text(x0 + w / 2, y0 - 2, text=str(n), fill="#aaaaaa", anchor="s", font=("TkDefaultFont", 7))
@@ -1195,17 +1294,31 @@ class LevelOverviewWindow(tk.Toplevel):
             self.canvas.create_text(x0 + w / 2, y0 + h / 2, text="!", fill="#ff5555")
             blocks = []
 
+        # Every thumbnail box is the same fixed (w, h) shape so the THUMB_COLS grid stays uniform
+        # regardless of level -- a Mini-Bloecke level's own (bigger) grid is scaled INTO that same
+        # box instead of enlarging the box, so its blocks land at their real relative positions
+        # instead of being clipped to the normal grid's smaller bounds.
+        mini = is_mini_block_level_slot(n)
+        cols = MINI_BOARD_COLS if mini else BOARD_COLS
+        rows = MINI_MAX_PLAYABLE_ROWS if mini else MAX_PLAYABLE_ROWS
+        cell_px_x = w / cols
+        cell_px_y = h / rows
+
         for b in blocks:
             bx, by, value = b.get("x"), b.get("y"), b.get("value")
             if bx is None or by is None or value is None:
                 continue
-            if not (0 <= bx < BOARD_COLS) or not (0 <= by < MAX_PLAYABLE_ROWS):
+            if not (0 <= bx < cols) or not (0 <= by < rows):
                 continue
-            cx0 = x0 + bx * self.CELL_PX
-            cy0 = y0 + by * self.CELL_PX
+            cx0 = x0 + bx * cell_px_x
+            cy0 = y0 + by * cell_px_y
             self.canvas.create_rectangle(
-                cx0, cy0, cx0 + self.CELL_PX, cy0 + self.CELL_PX,
+                cx0, cy0, cx0 + cell_px_x, cy0 + cell_px_y,
                 outline="", fill=effective_block_color(value, b.get("color")))
+
+        if mini:
+            self.canvas.create_text(x0 + 2, y0 + 2, text="Mini", fill="#5aaa96", anchor="nw",
+                                     font=("TkDefaultFont", 6, "bold"))
 
         self._thumb_rects.append((idx, path, x0, y0, x0 + w, y0 + h))
 
@@ -1291,6 +1404,7 @@ class LevelOverviewWindow(tk.Toplevel):
         # permuted (list.insert semantics: remove the dragged item, insert it at the target index,
         # everything between the two positions shifts by one). All source content is read up front
         # so overwriting slot i can't clobber content still needed for slot i+1.
+        numbers = [n for n, _ in self._levels]
         paths = [p for _, p in self._levels]
         contents = [p.read_text(encoding="utf-8") for p in paths]
 
@@ -1299,6 +1413,31 @@ class LevelOverviewWindow(tk.Toplevel):
         order.insert(to_idx, moved)
 
         lo, hi = min(from_idx, to_idx), max(from_idx, to_idx)
+
+        # A slot's grid size (normal vs Mini-Bloecke) is fixed by its level NUMBER, not by whatever
+        # content currently lives there (see is_mini_block_level_slot()) -- permuting content across
+        # slots of different sizes could silently drop blocks that don't fit the destination's
+        # smaller grid. Checked as a separate pass, before any file is written, so a rejected
+        # reorder never leaves some slots rewritten and others not.
+        for i in range(lo, hi + 1):
+            if order[i] == i:
+                continue
+            dest_n = numbers[i]
+            dest_mini = is_mini_block_level_slot(dest_n)
+            dest_cols = MINI_BOARD_COLS if dest_mini else BOARD_COLS
+            dest_rows = MINI_MAX_PLAYABLE_ROWS if dest_mini else MAX_PLAYABLE_ROWS
+            try:
+                moved_blocks = json.loads(contents[order[i]]).get("blocks", [])
+            except Exception:
+                moved_blocks = []
+            if any(b.get("x", 0) >= dest_cols or b.get("y", 0) >= dest_rows for b in moved_blocks):
+                messagebox.showinfo(
+                    "Reorder",
+                    f"Level {numbers[order[i]]}'s content doesn't fit level {dest_n}'s grid "
+                    f"({dest_cols}x{dest_rows}, {'Mini-Bloecke' if dest_mini else 'normal'}) -- "
+                    "reorder cancelled.")
+                return
+
         touched = set()
         for i in range(lo, hi + 1):
             if order[i] != i:
@@ -1339,6 +1478,17 @@ class LevelEditorApp:
         self.current_path = None
         self.dirty = False
         self._overview_window = None  # the one live LevelOverviewWindow, if any -- see show_level_overview()
+
+        # Active grid config -- normal (BOARD_COLS/EDITOR_ROWS/MAX_PLAYABLE_ROWS) by default, or
+        # GameBoard's Mini-Bloecke dimensions while current_path targets a Mini-Bloecke level slot
+        # (see is_mini_block_level_slot()/_configure_grid_for_level()). self.tool_radios is
+        # populated by _build_layout() so _update_tool_palette_for_mini() can grey out the triangle
+        # tools -- Mini-Bloecke levels stay square-only, same as the in-app Level-Editor.
+        self.cols = BOARD_COLS
+        self.max_playable_rows = MAX_PLAYABLE_ROWS
+        self.editor_rows = EDITOR_ROWS
+        self.mini_blocks = False
+        self.tool_radios = {}
 
         # Undo/redo: each entry is a full snapshot of self.grid taken right before a mutation, so
         # undo/redo just swaps the whole grid back and forth -- see _push_undo()/_undo()/_redo().
@@ -1422,7 +1572,7 @@ class LevelEditorApp:
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True)
 
-        self.canvas = tk.Canvas(main, width=BOARD_COLS * CELL_SIZE, height=EDITOR_ROWS * CELL_SIZE,
+        self.canvas = tk.Canvas(main, width=self.cols * CELL_SIZE, height=self.editor_rows * CELL_SIZE,
                                  background="#1e1e1e", highlightthickness=1, highlightbackground="#666666")
         self.canvas.grid(row=0, column=0, padx=8, pady=8)
         self.canvas.bind("<Button-1>", self._on_canvas_press)
@@ -1477,7 +1627,9 @@ class LevelEditorApp:
             ("colorpicker", "🎨 Color Picker"), ("clone", "📋 Clone Stamp"),
         ]
         for value, label in tools:
-            ttk.Radiobutton(sidebar, text=label, value=value, variable=self.tool_var).pack(anchor="w")
+            radio = ttk.Radiobutton(sidebar, text=label, value=value, variable=self.tool_var)
+            radio.pack(anchor="w")
+            self.tool_radios[value] = radio
         self.clone_status_var = tk.StringVar(value="")
         ttk.Label(sidebar, textvariable=self.clone_status_var, foreground="#888888",
                   font=("TkDefaultFont", 8), wraplength=140, justify="left").pack(anchor="w", pady=(0, 4))
@@ -1487,8 +1639,9 @@ class LevelEditorApp:
 
         ttk.Label(sidebar, text="Value", font=("TkDefaultFont", 9, "bold")).pack(anchor="w")
         self.current_value = tk.IntVar(value=5)
-        spin = ttk.Spinbox(sidebar, from_=1, to=99, textvariable=self.current_value, width=6, command=self._update_swatch)
-        spin.pack(anchor="w", pady=(0, 4))
+        self.value_spin = ttk.Spinbox(sidebar, from_=1, to=99, textvariable=self.current_value, width=6,
+                                       command=self._update_swatch)
+        self.value_spin.pack(anchor="w", pady=(0, 4))
         self.current_value.trace_add("write", lambda *args: self._update_swatch())
 
         # None = color derived from value, the default; else an explicit "#RRGGBB" override (see
@@ -1605,18 +1758,53 @@ class LevelEditorApp:
             self._redraw()
         self._update_swatch()
 
+    # -- grid config (normal vs Mini-Bloecke) ------------------------------
+
+    def _configure_grid_for_level(self, level_number):
+        """Switches self.cols/max_playable_rows/editor_rows (and the canvas widget's actual size)
+        to GameBoard's Mini-Bloecke dimensions if level_number is a Mini-Bloecke slot (see
+        is_mini_block_level_slot()), or back to normal otherwise (including level_number=None, e.g.
+        a brand new unsaved level with no target number chosen yet). Called whenever current_path
+        changes to a level whose number is known -- see _load_level_file()/save_as()/
+        export_to_assets()/_new_level_for()."""
+        mini = level_number is not None and is_mini_block_level_slot(level_number)
+        self.mini_blocks = mini
+        self.cols = MINI_BOARD_COLS if mini else BOARD_COLS
+        self.max_playable_rows = MINI_MAX_PLAYABLE_ROWS if mini else MAX_PLAYABLE_ROWS
+        self.editor_rows = MINI_EDITOR_ROWS if mini else EDITOR_ROWS
+        self.canvas.config(width=self.cols * CELL_SIZE, height=self.editor_rows * CELL_SIZE)
+        self._update_tool_palette_for_mini()
+        self.value_spin.configure(to=self._max_value())
+        if self.current_value.get() > self._max_value():
+            self.current_value.set(self._max_value())
+
+    def _update_tool_palette_for_mini(self):
+        for value, radio in self.tool_radios.items():
+            disabled = self.mini_blocks and value in TRIANGLE_TYPES
+            radio.configure(state="disabled" if disabled else "normal")
+        if self.mini_blocks and self.tool_var.get() in TRIANGLE_TYPES:
+            self.tool_var.set("square")
+
+    def _max_value(self):
+        # Mini-Bloecke levels keep block values single-digit (see GameBoard.MINI_MAX_VALUE) so the
+        # number painted on a block stays legible at this finer grid's smaller cell size.
+        return MINI_MAX_VALUE if self.mini_blocks else 99
+
+    def _blocks_exceed_grid(self, cols, rows):
+        return any(x >= cols or y >= rows for (x, y) in self.grid)
+
     # -- drawing -------------------------------------------------------
 
     def _redraw(self):
         self.canvas.delete("all")
-        for gy in range(EDITOR_ROWS):
-            for gx in range(BOARD_COLS):
+        for gy in range(self.editor_rows):
+            for gx in range(self.cols):
                 left, top = gx * CELL_SIZE, gy * CELL_SIZE
                 self.canvas.create_rectangle(left, top, left + CELL_SIZE, top + CELL_SIZE, outline="#444444")
 
-        if EDITOR_ROWS > MAX_PLAYABLE_ROWS:
-            boundary_y = MAX_PLAYABLE_ROWS * CELL_SIZE
-            self.canvas.create_line(0, boundary_y, BOARD_COLS * CELL_SIZE, boundary_y, fill="#e05555", width=2, dash=(6, 3))
+        if self.editor_rows > self.max_playable_rows:
+            boundary_y = self.max_playable_rows * CELL_SIZE
+            self.canvas.create_line(0, boundary_y, self.cols * CELL_SIZE, boundary_y, fill="#e05555", width=2, dash=(6, 3))
             self.canvas.create_text(4, boundary_y + 2, text="not loaded in-game below this line", anchor="nw",
                                      fill="#e05555", font=("TkDefaultFont", 7))
 
@@ -1650,7 +1838,7 @@ class LevelEditorApp:
 
     def _cell_at(self, event):
         gx, gy = event.x // CELL_SIZE, event.y // CELL_SIZE
-        if 0 <= gx < BOARD_COLS and 0 <= gy < EDITOR_ROWS:
+        if 0 <= gx < self.cols and 0 <= gy < self.editor_rows:
             return gx, gy
         return None
 
@@ -1827,7 +2015,7 @@ class LevelEditorApp:
         dx, dy = self._clone_offset
         source_cell = (dest_cell[0] - dx, dest_cell[1] - dy)
         self.selected = source_cell
-        if not (0 <= source_cell[0] < BOARD_COLS and 0 <= source_cell[1] < EDITOR_ROWS):
+        if not (0 <= source_cell[0] < self.cols and 0 <= source_cell[1] < self.editor_rows):
             self._redraw()
             return
         info = self.grid.get(source_cell)
@@ -1863,8 +2051,8 @@ class LevelEditorApp:
             self.selected = (0, 0)
         else:
             x, y = self.selected
-            x = max(0, min(BOARD_COLS - 1, x + dx))
-            y = max(0, min(EDITOR_ROWS - 1, y + dy))
+            x = max(0, min(self.cols - 1, x + dx))
+            y = max(0, min(self.editor_rows - 1, y + dy))
             self.selected = (x, y)
         self._redraw()
         return "break"
@@ -1887,7 +2075,7 @@ class LevelEditorApp:
         if self.selected is None or self.selected not in self.grid:
             return "break"
         info = self.grid[self.selected]
-        value = max(0, min(99, info["value"] + delta))
+        value = max(0, min(self._max_value(), info["value"] + delta))
         self._push_undo()
         if value == 0:
             del self.grid[self.selected]
@@ -1902,7 +2090,7 @@ class LevelEditorApp:
             return "break"
         x, y = self.selected
         nx, ny = x + dx, y + dy
-        if not (0 <= nx < BOARD_COLS and 0 <= ny < EDITOR_ROWS):
+        if not (0 <= nx < self.cols and 0 <= ny < self.editor_rows):
             return "break"
         if (nx, ny) in self.grid:
             return "break"
@@ -1983,7 +2171,7 @@ class LevelEditorApp:
         if cell is None:
             return
         if cell in self.grid:
-            value = max(0, min(99, self.grid[cell]["value"] + direction))
+            value = max(0, min(self._max_value(), self.grid[cell]["value"] + direction))
             self._push_undo()
             if value == 0:
                 del self.grid[cell]
@@ -1996,7 +2184,7 @@ class LevelEditorApp:
                 value = self.current_value.get()
             except tk.TclError:
                 value = 5
-            self.current_value.set(max(1, min(99, value + direction)))
+            self.current_value.set(max(1, min(self._max_value(), value + direction)))
 
     def _on_motion(self, event):
         cell = self._cell_at(event)
@@ -2060,7 +2248,8 @@ class LevelEditorApp:
     def _update_title(self):
         name = self.current_path.name if self.current_path else "Untitled"
         star = "*" if self.dirty else ""
-        self.root.title(f"BlockPong Level Editor - {name}{star}")
+        mini = " [Mini-Bloecke]" if self.mini_blocks else ""
+        self.root.title(f"BlockPong Level Editor - {name}{star}{mini}")
         self._refresh_level_selection()
 
     # Reserved random-level slots (see is_random_level_slot()) never get a file, so they'd simply
@@ -2069,6 +2258,10 @@ class LevelEditorApp:
     # Combobox can't style individual popup rows, so "greyed out" is approximated by a distinct
     # label plus outright rejecting the selection in _on_level_selected().
     RANDOM_SLOT_SUFFIX = "  (Zufalls-Level, gesperrt)"
+    # Mini-Bloecke slots (see is_mini_block_level_slot()) are NOT locked like random slots -- they
+    # just may not have a file yet. Picking one of these opens a blank grid already targeted at
+    # that level number (see _new_level_for()) instead of erroring like the random-slot suffix.
+    MINI_SLOT_SUFFIX = "  (Mini-Bloecke, noch leer)"
 
     def _refresh_level_list(self):
         files = sorted(ASSETS_LEVELS_DIR.glob("level*.json"), key=_level_sort_key) if ASSETS_LEVELS_DIR.exists() else []
@@ -2088,6 +2281,8 @@ class LevelEditorApp:
                 values.append(f"level{n}.json{self.RANDOM_SLOT_SUFFIX}")
             elif n in real_by_num:
                 values.append(real_by_num[n])
+            elif is_mini_block_level_slot(n):
+                values.append(f"level{n}.json{self.MINI_SLOT_SUFFIX}")
         self.level_combo["values"] = values
         self._refresh_level_selection()
 
@@ -2109,6 +2304,14 @@ class LevelEditorApp:
             )
             self._refresh_level_selection()
             return
+        if name.endswith(self.MINI_SLOT_SUFFIX):
+            if not self._confirm_discard():
+                self._refresh_level_selection()
+                return
+            base_name = name[:-len(self.MINI_SLOT_SUFFIX)]
+            m = LEVEL_FILE_RE.match(base_name)
+            self._new_level_for(int(m.group(1)))
+            return
         if not self._confirm_discard():
             self._refresh_level_selection()
             return
@@ -2129,7 +2332,7 @@ class LevelEditorApp:
         self.grid.clear()
         for b in blocks:
             x, y, block_type, value = b["x"], b["y"], b["type"], b["value"]
-            if not (0 <= x < BOARD_COLS) or not (0 <= y < EDITOR_ROWS):
+            if not (0 <= x < self.cols) or not (0 <= y < self.editor_rows):
                 print(f"Skipping out-of-range block at ({x},{y})", file=sys.stderr)
                 continue
             if block_type not in BLOCK_TYPES:
@@ -2142,6 +2345,11 @@ class LevelEditorApp:
             self.grid[(x, y)] = info
 
     def _load_level_file(self, path):
+        # Reconfigure the grid for this file's level number BEFORE parsing its blocks, so
+        # _load_blocks()'s bounds check (and the canvas itself) already matches a Mini-Bloecke
+        # level's bigger grid instead of clipping it to the normal board's smaller one.
+        m = LEVEL_FILE_RE.match(path.name)
+        self._configure_grid_for_level(int(m.group(1)) if m else None)
         try:
             data = json.loads(path.read_text())
             self._load_blocks(data["blocks"])
@@ -2156,7 +2364,8 @@ class LevelEditorApp:
 
     def _import_image_path(self, path):
         try:
-            blocks, _preview, _rows = convert(str(path), BOARD_COLS, None, "avg", 1, 20, 0, None, 24.0)
+            blocks, _preview, _rows = convert(str(path), self.cols, None, "avg", 1, 20, 0, None, 24.0,
+                                               max_playable_rows=self.max_playable_rows)
         except Exception as e:
             messagebox.showerror("Import Image", f"Conversion failed:\n{e}")
             return
@@ -2169,15 +2378,31 @@ class LevelEditorApp:
     def new_level(self):
         # Returns whether a (blank) level actually became the current one, e.g. for
         # LevelOverviewWindow._new_level() to decide whether to switch to the editor window.
+        # No target level number is known yet (chosen later via Save As/Export to assets), so this
+        # always starts on the normal grid -- see _configure_grid_for_level(None).
         if not self._confirm_discard():
             return False
         self._reset_undo_history()
         self.grid.clear()
         self.current_path = None
         self.dirty = False
+        self._configure_grid_for_level(None)
         self._redraw()
         self._update_title()
         return True
+
+    def _new_level_for(self, level_number):
+        """Like new_level(), but the target level number IS already known (picking an empty
+        Mini-Bloecke slot from the dropdown, see _on_level_selected()/MINI_SLOT_SUFFIX) -- starts a
+        blank grid sized for it and points current_path straight at it, so Ctrl+S/Save writes there
+        directly instead of popping the generic Save As... dialog."""
+        self._reset_undo_history()
+        self.grid.clear()
+        self.current_path = ASSETS_LEVELS_DIR / f"level{level_number}.json"
+        self.dirty = False
+        self._configure_grid_for_level(level_number)
+        self._redraw()
+        self._update_title()
 
     def open_level(self):
         if not self._confirm_discard():
@@ -2191,7 +2416,11 @@ class LevelEditorApp:
     def import_image(self):
         if not self._confirm_discard():
             return False
-        dialog = ImageImportWindow(self.root)
+        default_cols = MINI_BOARD_COLS if self.mini_blocks else ImageImportWindow.DEFAULT_COLS
+        default_rows = (MINI_MAX_PLAYABLE_ROWS + 1) if self.mini_blocks else ImageImportWindow.DEFAULT_ROWS
+        dialog = ImageImportWindow(self.root, max_cols=self.cols, max_rows=self.editor_rows,
+                                    default_cols=default_cols, default_rows=default_rows,
+                                    max_value=self._max_value())
         self.root.wait_window(dialog)
         if dialog.result is None:
             return False
@@ -2245,7 +2474,7 @@ class LevelEditorApp:
             return
         for (x, y) in self.grid:
             nx, ny = x + dx, y + dy
-            if not (0 <= nx < BOARD_COLS and 0 <= ny < EDITOR_ROWS):
+            if not (0 <= nx < self.cols and 0 <= ny < self.editor_rows):
                 messagebox.showinfo("Shift All", "Cannot shift: a block would move outside the board.")
                 return
         self._push_undo()
@@ -2259,9 +2488,10 @@ class LevelEditorApp:
     def bump_all_values(self, delta):
         if not self.grid:
             return
-        new_values = {cell: max(1, min(99, info["value"] + delta)) for cell, info in self.grid.items()}
+        max_value = self._max_value()
+        new_values = {cell: max(1, min(max_value, info["value"] + delta)) for cell, info in self.grid.items()}
         if all(new_values[cell] == info["value"] for cell, info in self.grid.items()):
-            return  # every block already clamped at the 1/99 boundary -- nothing to do or undo
+            return  # every block already clamped at the 1/max_value boundary -- nothing to do or undo
         self._push_undo()
         for cell, info in self.grid.items():
             info["value"] = new_values[cell]
@@ -2307,13 +2537,29 @@ class LevelEditorApp:
             return False
         target = Path(path)
         m = LEVEL_FILE_RE.match(target.name)
-        if m and target.parent == ASSETS_LEVELS_DIR and is_random_level_slot(int(m.group(1))):
+        target_number = int(m.group(1)) if m else None
+        if target_number is not None and target.parent == ASSETS_LEVELS_DIR and is_random_level_slot(target_number):
             messagebox.showerror("Save As", f"{target.name} is a random-level slot (every 10th level) and can't be authored.")
             return False
+        # A slot's grid size is fixed by its level number (is_mini_block_level_slot()), not by
+        # whatever's currently open -- e.g. Save As-ing a Mini-Bloecke level's content to a normal
+        # slot would otherwise silently drop every block past column 11 / row 16 the moment it's
+        # reconfigured below.
+        target_mini = target_number is not None and is_mini_block_level_slot(target_number)
+        target_cols = MINI_BOARD_COLS if target_mini else BOARD_COLS
+        target_rows = MINI_EDITOR_ROWS if target_mini else EDITOR_ROWS
+        if self._blocks_exceed_grid(target_cols, target_rows):
+            messagebox.showerror(
+                "Save As",
+                f"This level has blocks outside {target.name}'s grid ({target_cols}x{target_rows}"
+                f"{', Mini-Bloecke' if target_mini else ''}) -- move/remove them first.")
+            return False
         self.current_path = target
+        self._configure_grid_for_level(target_number)
         self._write_json(self.current_path)
         self.dirty = False
         self._refresh_level_list()
+        self._redraw()
         self._update_title()
         self._refresh_overview_if_open()
         return True
@@ -2325,13 +2571,24 @@ class LevelEditorApp:
         if is_random_level_slot(n):
             messagebox.showerror("Export to assets", f"Level {n} is a random-level slot (every 10th level) and can't be authored.")
             return
+        target_mini = is_mini_block_level_slot(n)
+        target_cols = MINI_BOARD_COLS if target_mini else BOARD_COLS
+        target_rows = MINI_EDITOR_ROWS if target_mini else EDITOR_ROWS
+        if self._blocks_exceed_grid(target_cols, target_rows):
+            messagebox.showerror(
+                "Export to assets",
+                f"This level has blocks outside level{n}.json's grid ({target_cols}x{target_rows}"
+                f"{', Mini-Bloecke' if target_mini else ''}) -- move/remove them first.")
+            return
         path = ASSETS_LEVELS_DIR / f"level{n}.json"
         if path.exists() and not messagebox.askyesno("Export to assets", f"{path.name} already exists. Overwrite?"):
             return
         self._write_json(path)
         self.current_path = path
+        self._configure_grid_for_level(n)
         self.dirty = False
         self._refresh_level_list()
+        self._redraw()
         self._update_title()
         self._refresh_overview_if_open()
         messagebox.showinfo("Export to assets", f"Wrote {len(self.grid)} blocks to {path}")
@@ -2365,11 +2622,16 @@ def main():
     parser.add_argument("output", nargs="?", help="Output level JSON path (headless batch conversion only)")
     parser.add_argument("--gui", action="store_true", help="Force the GUI editor to open, even if output/--level is given")
     parser.add_argument("--level", type=int, help="Headless mode: write directly to assets/levels/level<N>.json instead of an explicit output path")
-    parser.add_argument("--cols", type=int, default=BOARD_COLS, help=f"Grid columns (default {BOARD_COLS}, matches the board width)")
+    parser.add_argument("--cols", type=int, default=None,
+                         help=f"Grid columns (default {BOARD_COLS}, or {MINI_BOARD_COLS} if --level targets "
+                              "a Mini-Bloecke slot -- see is_mini_block_level_slot())")
     parser.add_argument("--rows", type=int, default=None, help="Grid rows (default: derived from the image's aspect ratio)")
     parser.add_argument("--method", choices=["avg", "max"], default="avg", help="How to merge each cell's pixels into one color (default avg)")
     parser.add_argument("--value-min", type=int, default=1, help="Block value for the darkest cells (default 1)")
-    parser.add_argument("--value-max", type=int, default=20, help="Block value for the brightest cells (default 20)")
+    parser.add_argument("--value-max", type=int, default=None,
+                         help="Block value for the brightest cells (default 20, or "
+                              f"{MINI_MAX_VALUE} if --level targets a Mini-Bloecke slot, "
+                              "for on-screen legibility at that grid's smaller cells)")
     parser.add_argument("--frame", type=int, default=0, help="Which frame of an animated image to use (default 0)")
     parser.add_argument("--bg-color", default=None, help="Background color to key out as hex RRGGBB (default: auto-detect from image corners, or use alpha if present)")
     parser.add_argument("--bg-tolerance", type=float, default=24.0, help="Color-distance tolerance for background detection (default 24)")
@@ -2381,17 +2643,23 @@ def main():
         launch_gui(args.image)
         return
 
+    target_mini = args.level is not None and is_mini_block_level_slot(args.level)
+    cols = args.cols if args.cols is not None else (MINI_BOARD_COLS if target_mini else BOARD_COLS)
+    max_playable_rows = MINI_MAX_PLAYABLE_ROWS if target_mini else MAX_PLAYABLE_ROWS
+    value_max = args.value_max if args.value_max is not None else (MINI_MAX_VALUE if target_mini else 20)
+
     output_path = resolve_output_path(args)
     blocks, grid, rows = convert(
-        args.image, args.cols, args.rows, args.method,
-        args.value_min, args.value_max, args.frame, args.bg_color, args.bg_tolerance,
+        args.image, cols, args.rows, args.method,
+        args.value_min, value_max, args.frame, args.bg_color, args.bg_tolerance,
+        max_playable_rows=max_playable_rows,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump({"blocks": blocks}, f, indent=2)
 
-    print(f"Wrote {len(blocks)} blocks ({args.cols}x{rows} grid) to {output_path}")
+    print(f"Wrote {len(blocks)} blocks ({cols}x{rows} grid) to {output_path}")
     print("Preview (digit = value mod 10, blank = empty):")
     for row in grid:
         print("  " + row)

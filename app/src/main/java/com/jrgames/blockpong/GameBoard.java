@@ -42,6 +42,15 @@ public class GameBoard {
         // row (decrementing each one's count and clearing the armed state), returning them (empty
         // if none were armed) so GameBoard can apply each one's one-off effect.
         List<Bonus> consumeArmedBonuses();
+        // Whether the level about to be loaded is a "Mini-Blöcke" slot (see
+        // Game.isMiniBlockLevelSlot()): GameBoard.applyBoardConfig() reads this in initBoard() to
+        // switch to a much finer grid and smaller ball for that one level. Defaulted to false so
+        // every existing GameCallbacks implementer (tests included) keeps the normal board without
+        // having to know about this.
+        default boolean isMiniBlockLevel() { return false; }
+        // Gives back one charge of a bonus that was spent but never took effect (e.g. a
+        // MOVE_STOPPER still pending when the level gets cleared). No-op by default.
+        default void refundBonus(Bonus bonus) {}
     }
 
     private static final float EPSILON = 1e-6f;
@@ -71,8 +80,11 @@ public class GameBoard {
     // across all of them -- set in fire() (not applyConsumedBonus(), since it needs numBalls,
     // which EXTRA_BALLS may still be about to change) and decremented in the collision check below.
     // No dragging, no per-position hit test -- it's the whole baseline, not a paddle.
+    // Stackable mid-shot: every further tap while the balls roll adds another numBalls (see
+    // armBaselineBounceMidShot()); the remaining count is drawn next to the highlighted line.
     private int baselineBounceReflectionsRemaining;
     private Paint baselineBouncePaint;
+    private Paint baselineBounceCountPaint;
 
     private final float dirLineLength;
     private final Paint frozenBallPaint;
@@ -245,14 +257,14 @@ public class GameBoard {
 
     }
 
-    private final int numInitBalls;
+    private int numInitBalls;
     private final RectF debugRect;
     private final Paint debugRectPaint;
-    private final float section1;
-    private final float section2;
-    private final float section3;
-    private final float section4;
-    private final float radiusSquare;
+    private float section1;
+    private float section2;
+    private float section3;
+    private float section4;
+    private float radiusSquare;
     private float width;
     private float height;
     private float offsetX;
@@ -274,11 +286,6 @@ public class GameBoard {
     private boolean fire;
     private int fireCounter;
     private int nextFireBall;
-    // How many balls of the current shot have already flown back below the start line (firePosY)
-    // and come to rest there -- reset in fire(), incremented in the "ball back on start line"
-    // branch of update(). Used by ballsRemainingToFire() so the launch HUD counts back up as balls
-    // return, instead of jumping straight back to numBalls the instant the last ball is dispatched.
-    private int ballsReturnedThisShot;
     private float firePosX;
     private float newFirePosX;
     private float firePosY;
@@ -332,6 +339,34 @@ public class GameBoard {
     private int yDim;
     private float blockWidth;
     private float blockHeight;
+
+    // Board-size/ball-size presets applied by applyBoardConfig() -- see GameCallbacks.isMiniBlockLevel().
+    // "Mini-Blöcke" levels (Game.isMiniBlockLevelSlot()) use a much finer grid and a smaller ball;
+    // both column count and ball/speed are scaled down by the same ~11/27 factor so the
+    // ballRadius-vs-blockWidth and normSpeed-vs-blockWidth safety margins (see the asserts in
+    // applyBoardConfig()) stay in the same proportion as the normal board -- collision detection
+    // relies on the ball never covering more than roughly one block per tick. Pushed a further
+    // notch finer than the original 19-column size once block values were capped at a single
+    // digit there (see MINI_MAX_VALUE) -- the block's on-screen text, not collision safety, was
+    // the actual limit on how small the grid could go before "17" stopped fitting legibly.
+    private static final int NORMAL_X_DIM = 11;
+    private static final int NORMAL_Y_DIM = 18;
+    private static final float NORMAL_BALL_RADIUS = 22;
+    private static final float NORMAL_NORM_SPEED = 50;
+    private static final int NORMAL_NUM_INIT_BALLS = 10;
+    private static final int MINI_X_DIM = 27;
+    private static final int MINI_Y_DIM = 44;
+    private static final float MINI_BALL_RADIUS = 9;
+    private static final float MINI_NORM_SPEED = 20;
+    // Requested default: more balls per shot on the finer grid, same idea as more (smaller) blocks.
+    private static final int MINI_NUM_INIT_BALLS = 20;
+    // Mini-Blöcke block values are capped at a single digit (1-9, see randomBoard()) so their text
+    // stays legible at this finer grid's smaller cell size -- GameBoard itself doesn't enforce this
+    // on loaded/authored content (same "restrict new edits, don't rewrite existing" approach as the
+    // square-only rule), but randomBoard()'s fallback generation and the level-editor tooling both
+    // respect it.
+    static final int MINI_MAX_VALUE = 9;
+    private boolean miniBlockMode;
 
     private Random rand;
     private boolean freeze;
@@ -387,7 +422,9 @@ public class GameBoard {
     private static final float FINE_BUTTON_GAP = 16f;
     // Fixed angular step each tap of the nudge buttons rotates the previewed aim by -- same
     // convention as clampAimVector() (0 = straight up, positive = tilted right).
-    private static final float FINE_AIM_NUDGE_DEG = 0.4f;
+    // 0.02° (was 0.1°, before that 0.4°): on long bank shots even a tiny change can completely
+    // change the result.
+    private static final float FINE_AIM_NUDGE_DEG = 0.02f;
 
     private boolean debugSupport;
 
@@ -466,24 +503,11 @@ public class GameBoard {
         this.offsetX = offsetX;
         this.offsetY = offsetY;
         maxNumBalls = 100;
-        normSpeed = 50;
-        numInitBalls = 10;
-        xDim = 11; //11
-        yDim = 18; // game-over row moved further down so blocks have more room before it triggers
-        ballRadius = 22; // 20
         dirLineLength = 1.3f*width;
         // Keep production gameplay clean; debug overlays can be enabled explicitly.
         debugSupport = false;
         autoPlayMode = false;
-        radiusSquare = ballRadius * ballRadius;
-
-        blockWidth = width / (float)xDim;
-        blockHeight = blockWidth;
-
-        assert (ballRadius<blockWidth);
-        assert (ballRadius<blockHeight);
-        assert (normSpeed<blockWidth);
-        assert (normSpeed<blockHeight);
+        applyBoardConfig(false);
 
         balls = new Ball[maxNumBalls];
         dispatchedFirePosX = new float[maxNumBalls];
@@ -509,6 +533,13 @@ public class GameBoard {
         baselineBouncePaint.setStrokeWidth(6f);
         baselineBouncePaint.setAntiAlias(true);
 
+        baselineBounceCountPaint = new Paint();
+        baselineBounceCountPaint.setColor(Color.rgb(0, 188, 212));
+        baselineBounceCountPaint.setTextSize(32);
+        baselineBounceCountPaint.setTextAlign(Paint.Align.RIGHT);
+        baselineBounceCountPaint.setFakeBoldText(true);
+        baselineBounceCountPaint.setAntiAlias(true);
+
         debugTextPaint = new Paint();
         debugTextPaint.setColor(Color.WHITE);
         debugTextPaint.setTextSize(50);
@@ -524,17 +555,6 @@ public class GameBoard {
         firePosY=height-2*ballRadius;
         aimCancelY = firePosY;
         newFirePosX = firePosX;
-
-        double rad = Math.toRadians(12.125);
-
-        section1 = (float)(Math.sin(1*rad)*ballRadius);
-        section2 = (float)(Math.sin(3*rad)*ballRadius);
-        section3 = (float)(Math.sin(5*rad)*ballRadius);
-        section4 = ballRadius;
-
-        increment1 = (float)(Math.sin(2*rad)*ballRadius);
-        increment2 = (float)(Math.sin(4*rad)*ballRadius);
-        increment3 = (float)(Math.sin(6*rad)*ballRadius);
 
         rand = new Random();
         blocks = new Block[xDim][yDim];
@@ -603,7 +623,55 @@ public class GameBoard {
 
     }
 
+    // Sets xDim/yDim/ballRadius/normSpeed (and everything derived from them: blockWidth/Height,
+    // radiusSquare, the triangle-collision trig constants) to either the normal board's fixed
+    // dimensions or the "Mini-Blöcke" preset -- see the NORMAL_*/MINI_* constants next to
+    // miniBlockMode. Called once from the constructor (always normal, before any level is known)
+    // and again as the first thing initBoard() does every time a level (re)loads, so switching
+    // between a mini-block level and a normal one mid-session takes effect immediately.
+    private void applyBoardConfig(boolean miniBlocks) {
+        miniBlockMode = miniBlocks;
+        xDim = miniBlocks ? MINI_X_DIM : NORMAL_X_DIM;
+        yDim = miniBlocks ? MINI_Y_DIM : NORMAL_Y_DIM;
+        ballRadius = miniBlocks ? MINI_BALL_RADIUS : NORMAL_BALL_RADIUS;
+        normSpeed = miniBlocks ? MINI_NORM_SPEED : NORMAL_NORM_SPEED;
+        numInitBalls = miniBlocks ? MINI_NUM_INIT_BALLS : NORMAL_NUM_INIT_BALLS;
+
+        blockWidth = width / (float) xDim;
+        blockHeight = blockWidth;
+        radiusSquare = ballRadius * ballRadius;
+
+        assert (ballRadius<blockWidth);
+        assert (ballRadius<blockHeight);
+        assert (normSpeed<blockWidth);
+        assert (normSpeed<blockHeight);
+
+        double rad = Math.toRadians(12.125);
+        section1 = (float)(Math.sin(1*rad)*ballRadius);
+        section2 = (float)(Math.sin(3*rad)*ballRadius);
+        section3 = (float)(Math.sin(5*rad)*ballRadius);
+        section4 = ballRadius;
+        increment1 = (float)(Math.sin(2*rad)*ballRadius);
+        increment2 = (float)(Math.sin(4*rad)*ballRadius);
+        increment3 = (float)(Math.sin(6*rad)*ballRadius);
+    }
+
+    // Reconfigures just the board-size/ball-size geometry (xDim/yDim/blockWidth/blockHeight/
+    // ballRadius/normSpeed and their derived constants), without touching blocks/balls -- for
+    // LevelEditor's dedicated geometry-only GameBoard instance (see LevelEditor.editorGeometry),
+    // which exists purely so newly constructed Block4/Block3 objects bake in the right pixel
+    // geometry (see their gb.getBlockX/Y/Width/Height() calls) for whichever level is being edited,
+    // independent of whatever level happens to be live-playing on the real, shared GameBoard.
+    public void configureGeometryOnly(boolean miniBlocks) {
+        applyBoardConfig(miniBlocks);
+    }
+
     public void initBoard() {
+        applyBoardConfig(game.isMiniBlockLevel());
+        // Freshly allocated every time (instead of reused + null-filled) since xDim/yDim can now
+        // differ from the previous level's -- a stale-sized array here would silently clip or
+        // misplace blocks the moment a level switches between normal and Mini-Blöcke.
+        blocks = new Block[xDim][yDim];
         if (game.getLevel() == -1 ) {
             for ( int y = 4; y < yDim; y++) {
                 for ( int x = 4; x < xDim-3; x++ ) {
@@ -611,11 +679,6 @@ public class GameBoard {
                 }
             }
         } else {
-            for ( int y = 0; y < yDim; y++) {
-                for (int x = 0; x < xDim; x++) {
-                    blocks[x][y] = null;
-                }
-            }
             String levelJson = game.loadLevelJson(game.getLevel());
             if (levelJson != null) {
                 loadBlocksFromJson(levelJson);
@@ -650,6 +713,9 @@ public class GameBoard {
             addBall(i);
         };
         extraBallsAppliedCount = 0;
+        // Otherwise only reset in fire() -- don't carry the previous shot's dispatch position
+        // (possibly beyond the new, smaller numBalls) into the fresh board.
+        nextFireBall = 0;
         endOfRollingPhase = true;
         newFirePosSet = false;
         freezeBall = 0;
@@ -729,6 +795,12 @@ public class GameBoard {
             double rowDensity = Math.max(0.0, Math.min(densityAtTop, targetDensity + densityJitter));
             int rowMaxValueInt = Math.max(1, (int) Math.round(
                     Math.max(1.0, Math.min(maxValueAtTop, targetValue + valueJitter))));
+            // Mini-Blöcke levels keep block values single-digit -- see MINI_MAX_VALUE -- so the
+            // usual level-scaled difficulty curve (which can reach into the dozens by higher
+            // levels) doesn't make the on-screen number unreadable at this grid's smaller cells.
+            if (miniBlockMode) {
+                rowMaxValueInt = Math.min(rowMaxValueInt, MINI_MAX_VALUE);
+            }
 
             boolean inGateBand = frac >= GATE_BAND_START_FRAC && frac <= GATE_BAND_END_FRAC;
             if (inGateBand) {
@@ -744,7 +816,9 @@ public class GameBoard {
                 }
                 if (rand.nextDouble() < density) {
                     int v = rand.nextInt(rowMaxValueInt) + 1;
-                    if (rand.nextBoolean()) {
+                    // Mini-Blöcke levels stay square-only (see Game.isMiniBlockLevelSlot()): the
+                    // grid is fine enough already without triangle geometry adding to it.
+                    if (miniBlockMode || rand.nextBoolean()) {
                         blocks[x][y] = new Block4(this, x, y, v);
                     } else {
                         Block3.tTriangle type = Block3.tTriangle.BL;
@@ -941,6 +1015,9 @@ public class GameBoard {
         // left, so it's visually obvious why balls are bouncing back up instead of settling.
         if (baselineBounceReflectionsRemaining > 0) {
             c.drawLine(offsetX, firePosY, offsetX + width, firePosY, baselineBouncePaint);
+            // Small count of reflections still left, just above the right end of the line.
+            c.drawText(String.valueOf(baselineBounceReflectionsRemaining),
+                    offsetX + width - 8f, firePosY - 12f, baselineBounceCountPaint);
         }
 
         // Speed-up overlay: see shouldOfferSpeedUp()/fastForwardToNextBlockHit(). Drawn on top of
@@ -1197,10 +1274,17 @@ public class GameBoard {
     // move), wired to a no-op GameCallbacks so nothing it does (block hits, score, animations,
     // level-complete) leaks into the real game.
     private GameBoard pathSimulationBoard;
+    // Which board config pathSimulationBoard was last built with -- compared against this board's
+    // own current miniBlockMode on every call so a Mini-Blöcke level's preview doesn't silently run
+    // physics against a stale normal-sized (or vice versa) scratch board: restoreBlocksFromJson()
+    // bounds-checks x/y against the SCRATCH board's own xDim/yDim, so a mismatch would silently drop
+    // out-of-range blocks and simulate with the wrong ball radius.
+    private boolean pathSimulationBoardMiniBlocks;
 
     private GameBoard pathSimulationBoard() {
-        if (pathSimulationBoard == null) {
-            pathSimulationBoard = new GameBoard(new NoOpGameCallbacks(), width, height, offsetX, offsetY);
+        if (pathSimulationBoard == null || pathSimulationBoardMiniBlocks != miniBlockMode) {
+            pathSimulationBoard = new GameBoard(new NoOpGameCallbacks(miniBlockMode), width, height, offsetX, offsetY);
+            pathSimulationBoardMiniBlocks = miniBlockMode;
         }
         return pathSimulationBoard;
     }
@@ -1268,6 +1352,10 @@ public class GameBoard {
     // like a real shot would (block hits scoring points, animations spawning, a level completing),
     // all of which must be swallowed since it's only a throwaway preview, never a real move.
     private static final class NoOpGameCallbacks implements GameCallbacks {
+        // Mirrors the real board's current miniBlockMode so pathSimulationBoard() builds a scratch
+        // board with matching grid/ball dimensions -- see the field's comment.
+        private final boolean miniBlocks;
+        NoOpGameCallbacks(boolean miniBlocks) { this.miniBlocks = miniBlocks; }
         @Override public int getLevel() { return 1; }
         @Override public void addAnimation(Animation animation) {}
         @Override public void increaselevel() {}
@@ -1279,13 +1367,17 @@ public class GameBoard {
         @Override public void onRoundEnd(int blocksCleared, int ballsUsed) {}
         @Override public boolean isBonusArmed(Bonus bonus) { return false; }
         @Override public List<Bonus> consumeArmedBonuses() { return Collections.emptyList(); }
+        @Override public boolean isMiniBlockLevel() { return miniBlocks; }
     }
 
-    // (numBalls - nextFireBall) is how many balls of the current shot are still queued up at the
-    // launch point waiting to go; ballsReturnedThisShot is how many already flew back below the
-    // start line and are resting again. Their sum starts at numBalls before any shot, counts down
-    // to 0 as balls are dispatched, then counts back up to numBalls as fired balls return -- rather
-    // than jumping straight back to numBalls the instant the last ball is dispatched.
+    // Every ball not currently in flight is resting at the launch point: either still queued up
+    // (index >= nextFireBall) or already back and stopped. So the count starts at numBalls before
+    // any shot, counts down to 0 as balls are dispatched, then counts back up to numBalls as fired
+    // balls return -- rather than jumping straight back to numBalls the instant the last ball is
+    // dispatched. Derived from the balls' actual state instead of a separate "returned" counter:
+    // that counter missed balls brought back by the swipe-down recall (BallDropAnimation, during
+    // which update() doesn't run at all) and survived into a new game after game over, so the HUD
+    // showed e.g. "x20" or "x-4" next to 10 real balls (reported bugs).
     private int ballsRemainingToFire() {
         // While aiming (nothing fired yet this shot) with EXTRA_BALLS armed, preview the ball
         // count the bonus will grant on release rather than the still-current numBalls -- reported
@@ -1295,7 +1387,11 @@ public class GameBoard {
                 && game.isBonusArmed(Bonus.EXTRA_BALLS)) {
             return Math.min(EXTRA_BALLS_TARGETS[extraBallsAppliedCount], maxNumBalls);
         }
-        return (numBalls - nextFireBall) + ballsReturnedThisShot;
+        int inFlight = 0;
+        for (int b = 0; b < numBalls; b++) {
+            if (!balls[b].isStill()) inFlight++;
+        }
+        return numBalls - inFlight;
     }
 
     // Placed to the right of the start ball by default, but the ball's start position is
@@ -1486,7 +1582,6 @@ public class GameBoard {
                     }
                     currBall.setPos(newFirePosX, firePosY);
                     currBall.setSpeed(0,0);
-                    ballsReturnedThisShot++;
                 }
                 ballAfterMoving.copy(currBall);
 
@@ -2800,6 +2895,12 @@ return false;
 
         // check for game win
         if (gameBoardEmpty()) {
+            // MOVE_STOPPER still pending but there's no board drop left to skip -- don't let it
+            // carry over into the next level, give the charge back instead.
+            if (skipNextBoardDrop) {
+                skipNextBoardDrop = false;
+                game.refundBonus(Bonus.MOVE_STOPPER);
+            }
             // Curtain-close/open transition (see LevelCompleteAnimation) -- it calls
             // game.increaselevel()/initBoard() itself once fully closed, so the swap happens
             // hidden behind the curtain instead of popping instantly.
@@ -3010,7 +3111,6 @@ return false;
         fireCounter = 0;
         fire = true;
         nextFireBall = 0;
-        ballsReturnedThisShot = 0;
         newFirePosSet = false;
         blocksClearedThisMove = 0;
         // EXTENDED_PATH bonus: clear the aimed-shot preview so drawLaunchHud() switches from the
@@ -3095,6 +3195,33 @@ return false;
         if (skipNextBoardDrop) return false;
         skipNextBoardDrop = true;
         return true;
+    }
+
+    // Undo for a MOVE_STOPPER that's pending but not yet applied (applied = consumed in
+    // actionAfterBallRolling() once the move ends) -- lets a second tap mid-shot take it back.
+    // Returns false if nothing was pending.
+    public boolean disarmMoveStopperMidShot() {
+        if (!skipNextBoardDrop) return false;
+        skipNextBoardDrop = false;
+        return true;
+    }
+
+    // True while a MOVE_STOPPER is pending for the move in progress -- Game outlines its button.
+    public boolean isMoveStopperPending() {
+        return skipNextBoardDrop;
+    }
+
+    // BASELINE_BOUNCE bonus, mid-shot path -- same idea as armMoveStopperMidShot() just above: lets
+    // the player tap it while the current shot's balls are already rolling instead of only before
+    // firing. Stackable: each tap adds one reflection per ball in the CURRENT shot (numBalls) on
+    // top of whatever is still left, exactly like the pre-fire path in fire().
+    public boolean armBaselineBounceMidShot() {
+        baselineBounceReflectionsRemaining += numBalls;
+        return true;
+    }
+
+    public int getBaselineBounceReflectionsRemaining() {
+        return baselineBounceReflectionsRemaining;
     }
 
     // EXTRA_BALLS bonus: true once all 4 stacked applications have been spent for this level (see
@@ -3395,37 +3522,51 @@ return false;
     }
 
     // LINE_DELETE bonus: fires immediately when armed (see Game.toggleArmedBonus()), not on the
-    // next shot. Picks one of the (up to) 3 rows with the highest total block value at random and
-    // removes it; rows above are untouched, rows below slide up to fill the gap. No-op if the
-    // board is empty.
-    public void triggerLineDeleteBonus() {
-        int lastPlayableRow = yDim - 3;
-        List<Integer> candidates = new ArrayList<>();
-        for (int y = 0; y <= lastPlayableRow; y++) {
-            if (hasBlocksInRow(y)) candidates.add(y);
-        }
-        if (candidates.isEmpty()) return;
-        candidates.sort((a, b) -> Integer.compare(rowValueSum(b), rowValueSum(a)));
-        List<Integer> topRows = candidates.subList(0, Math.min(3, candidates.size()));
-        int rowToDelete = topRows.get(rand.nextInt(topRows.size()));
+    // next shot. Picks a random row, weighted by how many blocks it holds (a row with 6 blocks is
+    // twice as likely as one with 3; empty rows never), and removes it; rows above are untouched,
+    // rows below slide up to fill the gap. Every row counts,
+    // including the bottom two right in front of the game-over line -- previously those were
+    // excluded, so with blocks only down there (exactly when the bonus is needed most) nothing got
+    // deleted and the charge was still spent (reported bug). Returns false (no-op) if the board is
+    // empty, so the caller doesn't spend the charge.
+    public boolean triggerLineDeleteBonus() {
+        int totalBlocks = countBlocks();
+        if (totalBlocks == 0) return false;
+        int rowToDelete = pickLineDeleteRow(rand.nextInt(totalBlocks));
         game.addAnimation(new LineDeleteAnimation(this, 30, rowToDelete));
+        return true;
     }
 
-    private int rowValueSum(int y) {
-        int sum = 0;
-        for (int x = 0; x < xDim; x++) {
-            Block b = blocks[x][y];
-            if (b != null) sum += b.getValue();
+    // Maps r (0 <= r < total block count) onto the row holding the r-th block in row order, i.e.
+    // each row is picked with probability blocksInRow / totalBlocks. -1 if r is out of range.
+    int pickLineDeleteRow(int r) {
+        for (int y = 0; y < yDim; y++) {
+            int n = rowBlockCount(y);
+            if (r < n) return y;
+            r -= n;
         }
-        return sum;
+        return -1;
+    }
+
+    private int rowBlockCount(int y) {
+        int n = 0;
+        for (int x = 0; x < xDim; x++) {
+            if (blocks[x][y] != null) n++;
+        }
+        return n;
+    }
+
+    private int countBlocks() {
+        int n = 0;
+        for (int y = 0; y < yDim; y++) n += rowBlockCount(y);
+        return n;
     }
 
     // Removes rowToDelete and shifts every row below it up by one cell (the inverse of
     // dropAllBlocksByOneCell()), clearing the bottom row that's now vacated. Must cover the same
-    // row range as moveBlocksFromRow() (all the way to yDim-1) even though rowToDelete itself is
-    // never chosen from the bottom two rows (see triggerLineDeleteBonus()) -- otherwise blocks
-    // sitting in those rows get their pixel position slid up by the animation without their
-    // model row index following, leaving a stale row that still counts for collisions/game-over.
+    // row range as moveBlocksFromRow() (all the way to yDim-1) -- otherwise blocks sitting in the
+    // bottom rows get their pixel position slid up by the animation without their model row index
+    // following, leaving a stale row that still counts for collisions/game-over.
     public void deleteLineAndShiftUp(int rowToDelete) {
         for (int y = rowToDelete; y < yDim - 1; y++) {
             for (int x = 0; x < xDim; x++) {
@@ -3672,9 +3813,10 @@ return false;
         }
     }
 
-    // Real shots default to numInitBalls (10) balls, not 1 -- tests that need to track a single
-    // ball deterministically (e.g. counting exact paddle reflections) should call this first so
-    // the other 9 pre-existing balls don't also launch and contribute untracked events.
+    // Real shots default to numInitBalls (10, or 20 on a Mini-Blöcke board -- see
+    // applyBoardConfig()) balls, not 1 -- tests that need to track a single ball deterministically
+    // (e.g. counting exact paddle reflections) should call this first so the other pre-existing
+    // balls don't also launch and contribute untracked events.
     void setNumBallsForTests(int n) {
         numBalls = n;
     }
@@ -3729,6 +3871,18 @@ return false;
 
     float getBallRadiusForTests() {
         return ballRadius;
+    }
+
+    float getNormSpeedForTests() {
+        return normSpeed;
+    }
+
+    int getXDimForTests() {
+        return xDim;
+    }
+
+    int getYDimForTests() {
+        return yDim;
     }
 
     float getFirePosXForTests() {

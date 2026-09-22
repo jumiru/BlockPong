@@ -142,6 +142,88 @@ public class BaselineBounceBonusTest {
                 0, gb.getBaselineBounceReflectionsRemainingForTests());
     }
 
+    // GameBoard.armBaselineBounceMidShot(): lets the player spend BASELINE_BOUNCE once the current
+    // shot's balls are already rolling instead of only before firing (see
+    // Game.toggleArmedBonus()'s BASELINE_BOUNCE branch) -- same idea as armMoveStopperMidShot().
+
+    @Test
+    public void armBaselineBounceMidShot_grantsFreshBudgetMatchingNumBalls() {
+        GameBoard gb = new GameBoard(new TestGameCallbacks(null), 660f, 900f, 0f, 0f);
+        gb.clearBoardForTests();
+        gb.setNumBallsForTests(4);
+
+        float firePosY = gb.getFirePosYForTests();
+        float startX = gb.getFirePosXForTests();
+        gb.touchDown(startX, firePosY);
+        gb.touchRelease(startX, firePosY - 400f); // fires without BASELINE_BOUNCE armed
+
+        assertEquals("no bonus armed pre-shot -- budget starts at 0",
+                0, gb.getBaselineBounceReflectionsRemainingForTests());
+
+        assertTrue("arming mid-shot should succeed the first time", gb.armBaselineBounceMidShot());
+        assertEquals("mid-shot budget should equal the number of balls actually fired this shot",
+                4, gb.getBaselineBounceReflectionsRemainingForTests());
+    }
+
+    @Test
+    public void armBaselineBounceMidShot_stacksOnTopOfPreFireBudget() {
+        GameBoard gb = new GameBoard(new TestGameCallbacks(Bonus.BASELINE_BOUNCE), 660f, 900f, 0f, 0f);
+        gb.clearBoardForTests();
+        gb.setNumBallsForTests(3);
+
+        float firePosY = gb.getFirePosYForTests();
+        float startX = gb.getFirePosXForTests();
+        gb.touchDown(startX, firePosY);
+        gb.touchRelease(startX, firePosY - 400f); // arms + fires with BASELINE_BOUNCE already
+
+        assertEquals(3, gb.getBaselineBounceReflectionsRemainingForTests());
+        assertTrue(gb.armBaselineBounceMidShot());
+        assertEquals("each mid-shot tap adds another numBalls reflections",
+                6, gb.getBaselineBounceReflectionsRemainingForTests());
+        assertTrue(gb.armBaselineBounceMidShot());
+        assertEquals(9, gb.getBaselineBounceReflectionsRemainingForTests());
+    }
+
+    @Test
+    public void armBaselineBounceMidShot_rechargesAfterBudgetRunsOut() {
+        GameBoard gb = new GameBoard(new TestGameCallbacks(Bonus.BASELINE_BOUNCE), 660f, 900f, 0f, 0f);
+        gb.clearBoardForTests();
+        gb.setNumBallsForTests(1);
+
+        float firePosY = gb.getFirePosYForTests();
+        float startX = gb.getFirePosXForTests();
+        gb.touchDown(startX, firePosY);
+        gb.touchRelease(startX, firePosY - 400f);
+
+        for (int i = 0; i < 5000 && gb.getBaselineBounceReflectionsRemainingForTests() > 0; i++) gb.update();
+        assertEquals("budget should have been exhausted by now",
+                0, gb.getBaselineBounceReflectionsRemainingForTests());
+
+        assertTrue(gb.armBaselineBounceMidShot());
+        assertEquals(1, gb.getBaselineBounceReflectionsRemainingForTests());
+    }
+
+    // MOVE_STOPPER still pending when the level gets cleared: nothing left to skip, so it must not
+    // carry over into the next level -- the charge goes back to the player instead.
+    @Test
+    public void pendingMoveStopper_isRefundedWhenLevelIsCleared() {
+        TestGameCallbacks cb = new TestGameCallbacks(Bonus.MOVE_STOPPER);
+        GameBoard gb = new GameBoard(cb, 660f, 900f, 0f, 0f);
+        gb.clearBoardForTests();
+        gb.setNumBallsForTests(1);
+
+        float firePosY = gb.getFirePosYForTests();
+        float startX = gb.getFirePosXForTests();
+        gb.touchDown(startX, firePosY);
+        gb.touchRelease(startX, firePosY - 400f);
+        assertTrue(gb.isMoveStopperPending());
+
+        for (int i = 0; i < 5000 && !gb.hasLastMoveRecording(); i++) gb.update();
+        assertTrue("shot should have completed", gb.hasLastMoveRecording());
+        assertFalse("must not carry over into the next level", gb.isMoveStopperPending());
+        assertEquals(Collections.singletonList(Bonus.MOVE_STOPPER), cb.refunded);
+    }
+
     private static final class TestGameCallbacks implements GameBoard.GameCallbacks {
         private final Bonus bonusToConsume;
         private boolean consumed;
@@ -160,6 +242,8 @@ public class BaselineBounceBonusTest {
         @Override public String loadLevelJson(int level) { return null; }
         @Override public void onRoundEnd(int blocksCleared, int ballsUsed) {}
         @Override public boolean isBonusArmed(Bonus bonus) { return false; }
+        final List<Bonus> refunded = new java.util.ArrayList<>();
+        @Override public void refundBonus(Bonus bonus) { refunded.add(bonus); }
 
         @Override
         public List<Bonus> consumeArmedBonuses() {

@@ -1,364 +1,274 @@
 {
   "blocks": [
     {
+      "x": 5,
+      "y": 0,
+      "type": "tr",
+      "value": 20
+    },
+    {
       "x": 6,
       "y": 0,
-      "value": 20,
-      "type": "square"
+      "type": "tr",
+      "value": 20
+    },
+    {
+      "x": 3,
+      "y": 1,
+      "type": "square",
+      "value": 15
+    },
+    {
+      "x": 4,
+      "y": 1,
+      "type": "square",
+      "value": 15
     },
     {
       "x": 5,
       "y": 1,
-      "value": 20,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 6,
       "y": 1,
-      "value": 20,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 7,
       "y": 1,
-      "value": 20,
-      "type": "square"
+      "type": "square",
+      "value": 15
+    },
+    {
+      "x": 2,
+      "y": 2,
+      "type": "square",
+      "value": 15
+    },
+    {
+      "x": 3,
+      "y": 2,
+      "type": "square",
+      "value": 15
     },
     {
       "x": 4,
       "y": 2,
-      "value": 20,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 5,
       "y": 2,
-      "value": 20,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 6,
       "y": 2,
-      "value": 20,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 7,
       "y": 2,
-      "value": 20,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 8,
       "y": 2,
-      "value": 20,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 1,
       "y": 3,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 2,
       "y": 3,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 3,
       "y": 3,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 4,
       "y": 3,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 5,
       "y": 3,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 6,
       "y": 3,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 7,
       "y": 3,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 8,
       "y": 3,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 9,
       "y": 3,
-      "value": 10,
-      "type": "square"
-    },
-    {
-      "x": 0,
-      "y": 4,
-      "value": 10,
-      "type": "tr"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 1,
       "y": 4,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 2,
       "y": 4,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 3,
       "y": 4,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 4,
       "y": 4,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 5,
       "y": 4,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 6,
       "y": 4,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 7,
       "y": 4,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 8,
       "y": 4,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 9,
       "y": 4,
-      "value": 10,
-      "type": "square"
-    },
-    {
-      "x": 10,
-      "y": 4,
-      "value": 10,
-      "type": "tl"
-    },
-    {
-      "x": 1,
-      "y": 5,
-      "value": 10,
-      "type": "tr"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 2,
       "y": 5,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 3,
       "y": 5,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 4,
       "y": 5,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 5,
       "y": 5,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 6,
       "y": 5,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 7,
       "y": 5,
-      "value": 10,
-      "type": "square"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 8,
       "y": 5,
-      "value": 10,
-      "type": "square"
-    },
-    {
-      "x": 9,
-      "y": 5,
-      "value": 10,
-      "type": "tl"
-    },
-    {
-      "x": 0,
-      "y": 6,
-      "value": 7,
-      "type": "br"
-    },
-    {
-      "x": 1,
-      "y": 6,
-      "value": 6,
-      "type": "bl"
-    },
-    {
-      "x": 2,
-      "y": 6,
-      "value": 7,
-      "type": "br"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 3,
       "y": 6,
-      "value": 6,
-      "type": "bl"
+      "type": "tl",
+      "value": 15
     },
     {
       "x": 4,
       "y": 6,
-      "value": 7,
-      "type": "br"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 5,
       "y": 6,
-      "value": 6,
-      "type": "bl"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 6,
       "y": 6,
-      "value": 7,
-      "type": "br"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 7,
       "y": 6,
-      "value": 6,
-      "type": "bl"
+      "type": "square",
+      "value": 15
     },
     {
       "x": 8,
       "y": 6,
-      "value": 7,
-      "type": "br"
-    },
-    {
-      "x": 9,
-      "y": 6,
-      "value": 6,
-      "type": "bl"
-    },
-    {
-      "x": 10,
-      "y": 6,
-      "value": 7,
-      "type": "br"
-    },
-    {
-      "x": 0,
-      "y": 7,
-      "value": 7,
-      "type": "square"
-    },
-    {
-      "x": 1,
-      "y": 7,
-      "value": 6,
-      "type": "br"
-    },
-    {
-      "x": 2,
-      "y": 7,
-      "value": 7,
-      "type": "square"
-    },
-    {
-      "x": 3,
-      "y": 7,
-      "value": 6,
-      "type": "br"
-    },
-    {
-      "x": 4,
-      "y": 7,
-      "value": 7,
-      "type": "square"
-    },
-    {
-      "x": 5,
-      "y": 7,
-      "value": 6,
-      "type": "br"
-    },
-    {
-      "x": 6,
-      "y": 7,
-      "value": 7,
-      "type": "square"
-    },
-    {
-      "x": 7,
-      "y": 7,
-      "value": 6,
-      "type": "br"
-    },
-    {
-      "x": 8,
-      "y": 7,
-      "value": 7,
-      "type": "square"
-    },
-    {
-      "x": 9,
-      "y": 7,
-      "value": 6,
-      "type": "br"
-    },
-    {
-      "x": 10,
-      "y": 7,
-      "value": 7,
-      "type": "square"
+      "type": "square",
+      "value": 15
     }
   ]
 }

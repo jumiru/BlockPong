@@ -134,6 +134,46 @@ public class LevelEditorTest {
         assertEquals(LevelEditor.BlockShape.BR, editor.getSelectedShape());
     }
 
+    // Mini-Blöcke levels (Game.isMiniBlockLevelSlot()) stay square-only -- easier to reason about
+    // collision without triangle geometry at that scale (see GameBoard's Mini-Blöcke fuzz coverage).
+    @Test
+    public void miniBlockLevel_shapePaletteStaysSquareOnly() {
+        callbacks.miniBlockLevels.add(5);
+        editor.openNew(5, false);
+        assertEquals(LevelEditor.BlockShape.SQUARE, editor.getSelectedShape());
+
+        selectShape(LevelEditor.BlockShape.TL); // tap on a disabled swatch -- must be ignored
+        assertEquals(LevelEditor.BlockShape.SQUARE, editor.getSelectedShape());
+    }
+
+    // Mini-Blöcke levels use GameBoard's finer Mini-Blöcke grid (27 columns) instead of the normal
+    // 11 -- placing a block at column 20 (out of range on the normal grid) must land there.
+    @Test
+    public void miniBlockLevel_usesFinerGrid() {
+        callbacks.miniBlockLevels.add(5);
+        editor.openNew(5, false);
+
+        float miniCellSize = 660f / 27f; // square cells, matches GameBoard.MINI_X_DIM
+        float x = miniCellSize * 20 + miniCellSize / 2f;
+        float y = miniCellSize * 5 + miniCellSize / 2f;
+        editor.handleTouch(x, y);
+
+        Block b = editor.getBlockForTests(20, 5);
+        assertNotNull(b);
+        assertTrue(b instanceof Block4);
+    }
+
+    // Mini-Blöcke levels keep block values single-digit (see GameBoard.MINI_MAX_VALUE) so the
+    // number painted on a block stays legible at this finer grid's smaller cell size.
+    @Test
+    public void miniBlockLevel_valueStepperCapsAtNine() {
+        callbacks.miniBlockLevels.add(5);
+        editor.openNew(5, false);
+
+        for (int i = 0; i < 20; i++) incrementValue();
+        assertEquals(9, editor.getSelectedValue());
+    }
+
     @Test
     public void valueStepper_incrementsAndDecrementsAndClamps() {
         int initial = editor.getSelectedValue();
@@ -347,6 +387,7 @@ public class LevelEditorTest {
         final List<String> exportedJson = new ArrayList<>();
         final List<String> testPlayJson = new ArrayList<>();
         final List<Integer> testPlayLevels = new ArrayList<>();
+        final java.util.Set<Integer> miniBlockLevels = new java.util.HashSet<>();
         boolean closed;
 
         @Override public List<Integer> listKnownLevels() { return Collections.emptyList(); }
@@ -360,5 +401,6 @@ public class LevelEditorTest {
             testPlayJson.add(json);
             testPlayLevels.add(targetLevel);
         }
+        @Override public boolean isMiniBlockLevel(int level) { return miniBlockLevels.contains(level); }
     }
 }

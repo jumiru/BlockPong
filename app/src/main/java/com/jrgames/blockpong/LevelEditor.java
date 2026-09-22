@@ -46,26 +46,69 @@ public class LevelEditor {
         // gameplay, targetLevel purely for cosmetic display (LEVEL stat box, debug exports) while
         // testing -- see Game.startTestPlay()/endTestPlay().
         void startTestPlay(String json, int targetLevel);
+        // Whether the given level number is a "Mini-Blöcke" slot (see Game.isMiniBlockLevelSlot()):
+        // switches the editing grid to GameBoard's finer Mini-Blöcke dimensions and restricts the
+        // shape palette to squares only (see configureGridForLevel()).
+        boolean isMiniBlockLevel(int level);
+    }
+
+    // No-op GameCallbacks for editorGeometry (see its field comment) -- it's never drawn, updated,
+    // or fired at, so every callback beyond the bare minimum GameBoard's constructor/initBoard()
+    // touch is irrelevant; isMiniBlockLevel() defaults to false (see GameCallbacks) since
+    // configureGridForLevel() reconfigures the real grid explicitly right after construction anyway.
+    private static final class NoOpGeometryCallbacks implements GameBoard.GameCallbacks {
+        @Override public int getLevel() { return 1; }
+        @Override public void addAnimation(Animation animation) {}
+        @Override public void increaselevel() {}
+        @Override public void setGameOver(boolean win) {}
+        @Override public boolean isGameOver() { return false; }
+        @Override public void resetGameOver() {}
+        @Override public void addScore(int points) {}
+        @Override public String loadLevelJson(int level) { return null; }
+        @Override public void onRoundEnd(int blocksCleared, int ballsUsed) {}
+        @Override public boolean isBonusArmed(Bonus bonus) { return false; }
+        @Override public java.util.List<Bonus> consumeArmedBonuses() { return java.util.Collections.emptyList(); }
     }
 
     // Matches GameBoard's xDim (11 columns) and yDim-2 (18-2=16 editable rows) -- authored level
     // files never populate the bottom two rows, same convention GameBoard.loadBlocksFromJson()
     // documents. Not read from a live GameBoard instance since it exposes no public getter for
-    // xDim/yDim; keep in sync by hand if those ever change.
-    static final int GRID_COLS = 11;
-    static final int GRID_ROWS = 16;
+    // xDim/yDim; keep in sync by hand if those ever change. MINI_* mirrors GameBoard's
+    // MINI_X_DIM/MINI_Y_DIM the same way (MINI_Y_DIM-2 editable rows) for a Mini-Blöcke level.
+    private static final int NORMAL_GRID_COLS = 11;
+    private static final int NORMAL_GRID_ROWS = 16;
+    private static final int MINI_GRID_COLS = 27;
+    private static final int MINI_GRID_ROWS = 42;
+    private int gridCols = NORMAL_GRID_COLS;
+    private int gridRows = NORMAL_GRID_ROWS;
+    // True while editing/creating a Mini-Blöcke level -- restricts the shape palette to SQUARE
+    // (see handleTouch()/drawShapePalette()) since those levels stay triangle-free by design, and
+    // caps values at MINI_MAX_VALUE (see clampValue()) so the on-screen number stays legible at
+    // this finer grid's smaller cell size.
+    private boolean squareOnly;
 
     private static final int MIN_VALUE = 1;
     private static final int MAX_VALUE = 99;
+    private static final int MINI_MAX_VALUE = 9;
 
     private static final float PALETTE_TOP_MARGIN = 30f;
     private static final float ROW_HEIGHT = 110f;
     private static final float ROW_GAP = 15f;
 
     private final GameBoard geometry;
+    // Dedicated GameBoard instance used ONLY as a geometry source for newly constructed Block4/
+    // Block3 objects (see createBlock()) -- those bake in gb.getBlockX/Y/Width/Height() once at
+    // construction time (see Block4's rect field), so they need a board whose xDim/yDim/blockWidth
+    // always match the level currently open in THIS editor. "geometry" (the real, shared, live
+    // GameBoard) can't be reused for that: its own xDim/yDim now switch with whatever level is
+    // actually playing underneath (see GameBoard.applyBoardConfig()), which can be a different
+    // level -- and a different grid size -- than the one being edited. Never drawn, updated, or
+    // fired at; its blocks/balls arrays are simply never touched, only its geometry accessors are
+    // (see configureGridForLevel()/GameBoard.configureGeometryOnly()).
+    private final GameBoard editorGeometry;
     private final EditorCallbacks callbacks;
 
-    private final Block[][] blocks = new Block[GRID_COLS][GRID_ROWS];
+    private Block[][] blocks = new Block[NORMAL_GRID_COLS][NORMAL_GRID_ROWS];
     private BlockShape selectedShape = BlockShape.SQUARE;
     private int selectedValue = 5;
 
@@ -94,6 +137,8 @@ public class LevelEditor {
 
     public LevelEditor(GameBoard geometry, EditorCallbacks callbacks) {
         this.geometry = geometry;
+        this.editorGeometry = new GameBoard(new NoOpGeometryCallbacks(),
+                geometry.getWidth(), geometry.getHeight(), geometry.getXOffset(), geometry.getYOffset());
         this.callbacks = callbacks;
 
         titlePaint = new Paint();
@@ -151,7 +196,7 @@ public class LevelEditor {
     public void openForEdit(int level) {
         mode = Mode.EDIT_EXISTING;
         targetLevel = level;
-        clearGrid();
+        configureGridForLevel(level);
         String json = callbacks.loadLevelJsonForEdit(level);
         if (json != null && !loadFromJson(json)) {
             callbacks.showToast("Level " + level + " konnte nicht geladen werden.");
@@ -162,16 +207,22 @@ public class LevelEditor {
     public void openNew(int level, boolean insert) {
         mode = insert ? Mode.INSERT : Mode.APPEND;
         targetLevel = level;
-        clearGrid();
+        configureGridForLevel(level);
         dirty = false;
     }
 
-    private void clearGrid() {
-        for (int x = 0; x < GRID_COLS; x++) {
-            for (int y = 0; y < GRID_ROWS; y++) {
-                blocks[x][y] = null;
-            }
-        }
+    // Sizes the editing grid for the level about to be opened -- GameBoard's normal dimensions, or
+    // its finer Mini-Blöcke ones for a Mini-Blöcke slot (see Game.isMiniBlockLevelSlot()) -- and
+    // starts from a blank board. Reallocating (rather than reusing + null-filling) also means a
+    // stale differently-sized array from the previously edited level can never leak through.
+    private void configureGridForLevel(int level) {
+        squareOnly = callbacks.isMiniBlockLevel(level);
+        gridCols = squareOnly ? MINI_GRID_COLS : NORMAL_GRID_COLS;
+        gridRows = squareOnly ? MINI_GRID_ROWS : NORMAL_GRID_ROWS;
+        blocks = new Block[gridCols][gridRows];
+        editorGeometry.configureGeometryOnly(squareOnly);
+        if (squareOnly) selectedShape = BlockShape.SQUARE;
+        selectedValue = clampValue(selectedValue);
     }
 
     // ---- JSON (mirrors GameBoard.exportBlocksJson()/loadBlocksFromJson()'s shape, kept as its own
@@ -182,8 +233,8 @@ public class LevelEditor {
     public String toJson() {
         try {
             JSONArray blockArray = new JSONArray();
-            for (int y = 0; y < GRID_ROWS; y++) {
-                for (int x = 0; x < GRID_COLS; x++) {
+            for (int y = 0; y < gridRows; y++) {
+                for (int x = 0; x < gridCols; x++) {
                     Block b = blocks[x][y];
                     if (b == null) continue;
                     JSONObject o = new JSONObject();
@@ -206,18 +257,18 @@ public class LevelEditor {
         try {
             JSONObject root = new JSONObject(json);
             JSONArray blockArray = root.getJSONArray("blocks");
-            Block[][] parsed = new Block[GRID_COLS][GRID_ROWS];
+            Block[][] parsed = new Block[gridCols][gridRows];
             for (int i = 0; i < blockArray.length(); i++) {
                 JSONObject b = blockArray.getJSONObject(i);
                 int x = b.getInt("x");
                 int y = b.getInt("y");
                 int value = b.getInt("value");
                 String type = b.getString("type");
-                if (x < 0 || x >= GRID_COLS || y < 0 || y >= GRID_ROWS) continue;
+                if (x < 0 || x >= gridCols || y < 0 || y >= gridRows) continue;
                 parsed[x][y] = createBlock(x, y, type, value);
             }
-            for (int x = 0; x < GRID_COLS; x++) {
-                System.arraycopy(parsed[x], 0, blocks[x], 0, GRID_ROWS);
+            for (int x = 0; x < gridCols; x++) {
+                System.arraycopy(parsed[x], 0, blocks[x], 0, gridRows);
             }
             return true;
         } catch (JSONException | IllegalArgumentException e) {
@@ -231,10 +282,10 @@ public class LevelEditor {
 
     private Block createBlock(int x, int y, String type, int value) {
         if ("square".equals(type)) {
-            return new Block4(geometry, x, y, value);
+            return new Block4(editorGeometry, x, y, value);
         }
         Block3.tTriangle triangleType = Block3.tTriangle.valueOf(type.toUpperCase());
-        return new Block3(geometry, x, y, triangleType, value);
+        return new Block3(editorGeometry, x, y, triangleType, value);
     }
 
     private Block createSelectedBlock(int x, int y) {
@@ -310,7 +361,11 @@ public class LevelEditor {
         BlockShape[] shapes = BlockShape.values();
         for (int i = 0; i < shapes.length; i++) {
             if (shapeSwatchRect(i).contains(x, y)) {
-                selectedShape = shapes[i];
+                // Mini-Blöcke levels stay square-only (see configureGridForLevel()) -- a tap on a
+                // triangle swatch there is simply ignored rather than selecting it.
+                if (!squareOnly || shapes[i] == BlockShape.SQUARE) {
+                    selectedShape = shapes[i];
+                }
                 return;
             }
         }
@@ -378,7 +433,8 @@ public class LevelEditor {
     }
 
     private int clampValue(int v) {
-        return Math.max(MIN_VALUE, Math.min(MAX_VALUE, v));
+        int max = squareOnly ? MINI_MAX_VALUE : MAX_VALUE;
+        return Math.max(MIN_VALUE, Math.min(max, v));
     }
 
     // "Alle Werte vergroessern/verkleinern": rescales every placed block's value by +-1 in one tap
@@ -388,8 +444,8 @@ public class LevelEditor {
     // directly since Block exposes no public setter (only hit(), which only ever decrements by 1).
     private void adjustAllValues(int delta) {
         boolean changed = false;
-        for (int x = 0; x < GRID_COLS; x++) {
-            for (int y = 0; y < GRID_ROWS; y++) {
+        for (int x = 0; x < gridCols; x++) {
+            for (int y = 0; y < gridRows; y++) {
                 Block b = blocks[x][y];
                 if (b == null) continue;
                 int newValue = clampValue(b.getValue() + delta);
@@ -407,26 +463,26 @@ public class LevelEditor {
     // dropping the offending blocks. A uniform shift can never make two blocks collide, so unlike
     // adjustAllValues() there's no need to guard against overwriting an existing block.
     private void shiftAll(int dx, int dy) {
-        for (int x = 0; x < GRID_COLS; x++) {
-            for (int y = 0; y < GRID_ROWS; y++) {
+        for (int x = 0; x < gridCols; x++) {
+            for (int y = 0; y < gridRows; y++) {
                 if (blocks[x][y] == null) continue;
                 int nx = x + dx, ny = y + dy;
-                if (nx < 0 || nx >= GRID_COLS || ny < 0 || ny >= GRID_ROWS) {
+                if (nx < 0 || nx >= gridCols || ny < 0 || ny >= gridRows) {
                     callbacks.showToast("Verschieben nicht moeglich: Block wuerde das Feld verlassen.");
                     return;
                 }
             }
         }
-        Block[][] shifted = new Block[GRID_COLS][GRID_ROWS];
-        for (int x = 0; x < GRID_COLS; x++) {
-            for (int y = 0; y < GRID_ROWS; y++) {
+        Block[][] shifted = new Block[gridCols][gridRows];
+        for (int x = 0; x < gridCols; x++) {
+            for (int y = 0; y < gridRows; y++) {
                 Block b = blocks[x][y];
                 if (b == null) continue;
                 shifted[x + dx][y + dy] = createBlock(x + dx, y + dy, blockJsonType(b), b.getValue());
             }
         }
-        for (int x = 0; x < GRID_COLS; x++) {
-            System.arraycopy(shifted[x], 0, blocks[x], 0, GRID_ROWS);
+        for (int x = 0; x < gridCols; x++) {
+            System.arraycopy(shifted[x], 0, blocks[x], 0, gridRows);
         }
         dirty = true;
     }
@@ -463,11 +519,31 @@ public class LevelEditor {
 
     // ---- geometry ----
 
-    // No inverse of GameBoard.getBlockX/Y() is exposed, so this just scans the (small, fixed)
-    // column/row count -- cheap enough to do on every touch.
+    // Delegates to editorGeometry (see its field comment), NOT "geometry" (the real, shared, live
+    // GameBoard): that one's xDim/yDim/blockWidth now switch with whatever level is actually
+    // playing underneath (see GameBoard.applyBoardConfig()), which can be a different level -- and
+    // a different grid size -- than the one currently open in this editor.
+    private float blockWidth() {
+        return editorGeometry.getBlockWidth();
+    }
+
+    private float blockHeight() {
+        return editorGeometry.getBlockHeight();
+    }
+
+    private float blockX(int x) {
+        return editorGeometry.getBlockX(x);
+    }
+
+    private float blockY(int y) {
+        return editorGeometry.getBlockY(y);
+    }
+
+    // No inverse of blockX/Y() is exposed, so this just scans the (small, fixed) column/row count
+    // -- cheap enough to do on every touch.
     private int cellXAt(float touchX) {
-        for (int x = 0; x < GRID_COLS; x++) {
-            if (touchX >= geometry.getBlockX(x) && touchX < geometry.getBlockX(x + 1)) {
+        for (int x = 0; x < gridCols; x++) {
+            if (touchX >= blockX(x) && touchX < blockX(x + 1)) {
                 return x;
             }
         }
@@ -475,8 +551,8 @@ public class LevelEditor {
     }
 
     private int cellYAt(float touchY) {
-        for (int y = 0; y < GRID_ROWS; y++) {
-            if (touchY >= geometry.getBlockY(y) && touchY < geometry.getBlockY(y + 1)) {
+        for (int y = 0; y < gridRows; y++) {
+            if (touchY >= blockY(y) && touchY < blockY(y + 1)) {
                 return y;
             }
         }
@@ -484,15 +560,15 @@ public class LevelEditor {
     }
 
     private float gridBottom() {
-        return geometry.getBlockY(GRID_ROWS);
+        return blockY(gridRows);
     }
 
     private float gridLeft() {
-        return geometry.getBlockX(0);
+        return blockX(0);
     }
 
     private float gridRight() {
-        return geometry.getBlockX(GRID_COLS);
+        return blockX(gridCols);
     }
 
     RectF paletteRowRect() {
@@ -592,37 +668,41 @@ public class LevelEditor {
     }
 
     private String titleText() {
+        String miniSuffix = squareOnly ? " [Mini-Blöcke]" : "";
         switch (mode) {
             case APPEND:
-                return "Level-Editor - neues Level " + targetLevel + " (anhaengen)";
+                return "Level-Editor - neues Level " + targetLevel + " (anhaengen)" + miniSuffix;
             case INSERT:
-                return "Level-Editor - neues Level " + targetLevel + " (einfuegen)";
+                return "Level-Editor - neues Level " + targetLevel + " (einfuegen)" + miniSuffix;
             default:
-                return "Level-Editor - Level " + targetLevel + " bearbeiten";
+                return "Level-Editor - Level " + targetLevel + " bearbeiten" + miniSuffix;
         }
     }
 
     private void drawGrid(Canvas c) {
-        for (int y = 0; y < GRID_ROWS; y++) {
-            for (int x = 0; x < GRID_COLS; x++) {
+        for (int y = 0; y < gridRows; y++) {
+            for (int x = 0; x < gridCols; x++) {
                 Block b = blocks[x][y];
                 if (b != null) {
                     b.draw(c);
                 } else {
-                    float left = geometry.getBlockX(x);
-                    float top = geometry.getBlockY(y);
-                    c.drawRect(left, top, left + geometry.getBlockWidth(), top + geometry.getBlockHeight(), emptyCellPaint);
+                    float left = blockX(x);
+                    float top = blockY(y);
+                    c.drawRect(left, top, left + blockWidth(), top + blockHeight(), emptyCellPaint);
                 }
             }
         }
     }
+
+    private static final int DISABLED_SWATCH_COLOR = Color.rgb(55, 55, 62);
 
     private void drawShapePalette(Canvas c) {
         BlockShape[] shapes = BlockShape.values();
         int previewColor = previewColor(selectedValue);
         for (int i = 0; i < shapes.length; i++) {
             RectF box = shapeSwatchRect(i);
-            drawShapeGlyph(c, shapes[i], box, previewColor);
+            boolean disabled = squareOnly && shapes[i] != BlockShape.SQUARE;
+            drawShapeGlyph(c, shapes[i], box, disabled ? DISABLED_SWATCH_COLOR : previewColor);
             if (shapes[i] == selectedShape) {
                 c.drawRect(box, selectedBorderPaint);
             }
