@@ -13,3 +13,9 @@
 .externalNativeBuild
 .cxx
 local.properties
+/.idea/AndroidProjectSystem.xml
+/.idea/copilotDiffState.xml
+/.idea/markdown.xml
+__pycache__/
+/Screenshot*.png
+/screen-*.mp4
